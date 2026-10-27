@@ -1,0 +1,40 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ glslang-tools \
+            libvulkan-dev libegl1-mesa-dev libgl1-mesa-dev \
+            mesa-vulkan-drivers libgl1-mesa-dri
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: python
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install numpy pillow pytest ruff
+      - name: ruff
+        run: ruff check src tests bench
+      - name: pytest
+        run: PYTHONPATH=src pytest -q
+      - name: cmake
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - name: shader hosts
+        env:
+          DISPLAY: ""
+          LIBGL_ALWAYS_SOFTWARE: "1"
+        run: |
+          ./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
+          ./build/ntc_gl tests/fixtures/tiny.ntc shaders

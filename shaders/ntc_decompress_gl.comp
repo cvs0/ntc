@@ -1,0 +1,18 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#define NTC_GL 1
+#include "ntc_decode.glsl"
+
+void main() {
+    uvec4 h0 = g_desc[0];
+    uint mip = g_pc.x;
+    uint W = max(h0.x >> mip, 1u);
+    uint H = max(h0.y >> mip, 1u);
+    if (gl_GlobalInvocationID.x >= W || gl_GlobalInvocationID.y >= H) return;
+    vec2 uv = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) / vec2(float(W), float(H));
+    ntc_eval(uv, int(mip));
+    uint ch = h0.z;
+    uint idx = (gl_GlobalInvocationID.y * W + gl_GlobalInvocationID.x) * ch;
+    for (uint i = 0u; i < ch; ++i) g_outimg[idx + i] = g_y[i];
+}

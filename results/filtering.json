@@ -1,0 +1,15 @@
+{
+  "stochastic_mean_vs_color_bilinear_max_abs": 9.774463251233101e-06,
+  "stochastic_frames": 400,
+  "trilinear_vs_lerp_max_abs": 0.0,
+  "aniso_vs_mean_of_taps_max_abs": 0.0,
+  "aniso_taps": 5,
+  "stochastic_aniso_mean_vs_color_bilinear_max_abs": 2.466491423547268e-06,
+  "stochastic_aniso_frames": 300,
+  "choice_rate_minus_weight": [
+    -0.00453849742595433,
+    -0.001395908072259533,
+    0.005656845337238481,
+    0.00027756016097532643
+  ]
+}

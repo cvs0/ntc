@@ -1,0 +1,930 @@
+{
+  "rows": [
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 28.37206495246277,
+      "psnr_u8_trained": 28.479058348220534,
+      "seed": 0,
+      "seed_probe": [
+        {
+          "psnr_u8": 28.479058348220534,
+          "seed": 0,
+          "ssim": 0.773660785622067,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.394603051570165,
+          "seed": 1,
+          "ssim": 0.7681799398528205,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.249709317440328,
+          "seed": 2,
+          "ssim": 0.7618545757399665,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.249090926470338,
+          "seed": 3,
+          "ssim": 0.7634656561745538,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 4.07568359375,
+      "psnr_u8": 28.479058348220534,
+      "ssim": 0.773660785622067,
+      "psnr_u8_albedo": 33.6236081645595,
+      "psnr_u8_normal": 28.648593752210093,
+      "psnr_u8_roughness": 27.022896817187757,
+      "psnr_u8_metalness": 23.481854396025824,
+      "psnr_u8_ao": 30.426537357836768,
+      "normal_angle_deg": 4.87140125565632,
+      "channel_psnr_u8": [
+        33.999054908329846,
+        33.721178638373004,
+        33.1898503514023,
+        27.25425443074814,
+        26.740763055491197,
+        40.20991524160295,
+        27.022896817187757,
+        23.481854396025824,
+        30.426537357836768
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          2,
+          8
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 416,
+      "flops": 978,
+      "latent_bytes_upper": 16,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 580,
+      "weight_bytes_shared_64": 9.0625,
+      "tile_unique_bytes_per_texel": 1.25,
+      "tile_upper_bytes_per_texel": 16.0,
+      "seconds_train": 0.6382923480005047,
+      "mip2_psnr": 25.45190157600934,
+      "mip_bytes": {
+        "stored_latent_bytes": 32800,
+        "derived_mip_bytes": 10936
+      },
+      "probe": [],
+      "tag": "auto_h32_s40_b4",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.26620934247903,
+      "psnr_u8_trained": 31.574122680211453,
+      "seed": 0,
+      "seed_probe": [
+        {
+          "psnr_u8": 31.574122680211453,
+          "seed": 0,
+          "ssim": 0.852256351047092,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.400459928853902,
+          "seed": 1,
+          "ssim": 0.8346260521146986,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.289544314139732,
+          "seed": 2,
+          "ssim": 0.8303353587786356,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.28487840527779,
+          "seed": 3,
+          "ssim": 0.8348795705371432,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 8.07958984375,
+      "psnr_u8": 31.574122680211453,
+      "ssim": 0.852256351047092,
+      "psnr_u8_albedo": 36.14296917326454,
+      "psnr_u8_normal": 28.969093635799574,
+      "psnr_u8_roughness": 35.86986336105492,
+      "psnr_u8_metalness": 31.522744580891636,
+      "psnr_u8_ao": 31.148081086266973,
+      "normal_angle_deg": 4.7481154320716135,
+      "channel_psnr_u8": [
+        37.10577871643471,
+        37.76144386628779,
+        34.353354473938865,
+        27.71810449852741,
+        26.930207431043364,
+        40.70659861776352,
+        35.86986336105492,
+        31.522744580891636,
+        31.148081086266973
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          4
+        ]
+      ],
+      "macs": 416,
+      "flops": 978,
+      "latent_bytes_upper": 16,
+      "latent_bytes_shared_x": 8,
+      "weight_bytes_cold": 580,
+      "weight_bytes_shared_64": 9.0625,
+      "tile_unique_bytes_per_texel": 1.53125,
+      "tile_upper_bytes_per_texel": 16.0,
+      "seconds_train": 0.4218690019997666,
+      "mip2_psnr": 32.22701902128165,
+      "mip_bytes": {
+        "stored_latent_bytes": 65600,
+        "derived_mip_bytes": 21866
+      },
+      "probe": [],
+      "tag": "auto_h32_s40_b8",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.02485935826187,
+      "psnr_u8_trained": 32.173511962670474,
+      "seed": 1,
+      "seed_probe": [
+        {
+          "psnr_u8": 32.173511962670474,
+          "seed": 1,
+          "ssim": 0.8532408409648471,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 32.16798882919413,
+          "seed": 2,
+          "ssim": 0.8605970475408766,
+          "checkpoint": "init"
+        },
+        {
+          "psnr_u8": 32.106481819010696,
+          "seed": 3,
+          "ssim": 0.8586061861779954,
+          "checkpoint": "init"
+        },
+        {
+          "psnr_u8": 32.09733992522505,
+          "seed": 0,
+          "ssim": 0.8550631337695651,
+          "checkpoint": "init"
+        }
+      ],
+      "total_bpp": 10.080078125,
+      "psnr_u8": 32.173511962670474,
+      "ssim": 0.8532408409648471,
+      "psnr_u8_albedo": 36.13989957751551,
+      "psnr_u8_normal": 29.660262182670113,
+      "psnr_u8_roughness": 38.3679817030175,
+      "psnr_u8_metalness": 32.20691224262919,
+      "psnr_u8_ao": 31.335862252811665,
+      "normal_angle_deg": 4.508334610260313,
+      "channel_psnr_u8": [
+        37.23141648730871,
+        36.77483028851547,
+        34.81010656438337,
+        28.48146682460452,
+        27.66609784080291,
+        39.43189557312805,
+        38.3679817030175,
+        32.20691224262919,
+        31.335862252811665
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "macs": 480,
+      "flops": 1122,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 20,
+      "weight_bytes_cold": 644,
+      "weight_bytes_shared_64": 10.0625,
+      "tile_unique_bytes_per_texel": 2.40625,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.5103522110002814,
+      "mip2_psnr": 27.72123848615632,
+      "mip_bytes": {
+        "stored_latent_bytes": 81920,
+        "derived_mip_bytes": 27304
+      },
+      "probe": [],
+      "tag": "auto_h32_s40_b10",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.01035256757167,
+      "psnr_u8_trained": 32.26034624629635,
+      "seed": 0,
+      "seed_probe": [
+        {
+          "psnr_u8": 32.26034624629635,
+          "seed": 0,
+          "ssim": 0.8645464711719089,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 32.18612596881507,
+          "seed": 3,
+          "ssim": 0.8669862945874532,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.95390031207807,
+          "seed": 2,
+          "ssim": 0.8587900069024827,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.89565220071623,
+          "seed": 1,
+          "ssim": 0.8536511990759108,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 12.07177734375,
+      "psnr_u8": 32.26034624629635,
+      "ssim": 0.8645464711719089,
+      "psnr_u8_albedo": 35.614605139916826,
+      "psnr_u8_normal": 29.436827772057722,
+      "psnr_u8_roughness": 35.76679042953628,
+      "psnr_u8_metalness": 35.216461796169725,
+      "psnr_u8_ao": 32.648529175120174,
+      "normal_angle_deg": 4.616417106798985,
+      "channel_psnr_u8": [
+        36.59137088097956,
+        36.97540323670172,
+        33.94023225113551,
+        28.261553560048203,
+        27.460558710989083,
+        38.90717181145445,
+        35.76679042953628,
+        35.216461796169725,
+        32.648529175120174
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          128,
+          128,
+          2,
+          8
+        ]
+      ],
+      "macs": 416,
+      "flops": 978,
+      "latent_bytes_upper": 16,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 580,
+      "weight_bytes_shared_64": 9.0625,
+      "tile_unique_bytes_per_texel": 2.53125,
+      "tile_upper_bytes_per_texel": 16.0,
+      "seconds_train": 0.41178026600027806,
+      "mip2_psnr": 27.073168466492458,
+      "mip_bytes": {
+        "stored_latent_bytes": 98304,
+        "derived_mip_bytes": 32766
+      },
+      "probe": [],
+      "tag": "auto_h32_s40_b12",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.749193955843445,
+      "seed": 3,
+      "seed_probe": [
+        {
+          "psnr_u8": 35.749193955843445,
+          "seed": 3,
+          "ssim": 0.9474357631471422,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 35.30600455886293,
+          "seed": 1,
+          "ssim": 0.9433271288871765,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 35.2865038013323,
+          "seed": 2,
+          "ssim": 0.9375042915344238,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 35.239707851115135,
+          "seed": 0,
+          "ssim": 0.9330952366193136,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 16.083984375,
+      "psnr_u8": 35.749193955843445,
+      "ssim": 0.9474357631471422,
+      "psnr_u8_albedo": 37.018055525610194,
+      "psnr_u8_normal": 39.459492229051754,
+      "psnr_u8_roughness": 37.52491971303802,
+      "psnr_u8_metalness": 31.595266182262513,
+      "psnr_u8_ao": 32.29261411130351,
+      "normal_angle_deg": 1.769091566110173,
+      "channel_psnr_u8": [
+        36.92452240350035,
+        36.963003003072615,
+        37.17065592653591,
+        37.49880930783107,
+        39.20416330442955,
+        43.79115943073582,
+        37.52491971303802,
+        31.595266182262513,
+        32.29261411130351
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 480,
+      "flops": 1122,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 644,
+      "weight_bytes_shared_64": 10.0625,
+      "tile_unique_bytes_per_texel": 2.9375,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.46818276700014394,
+      "mip2_psnr": 33.91982100517977,
+      "mip_bytes": {
+        "stored_latent_bytes": 131104,
+        "derived_mip_bytes": 43702
+      },
+      "probe": [],
+      "tag": "auto_h32_s40_b16",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 80,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.51332032546344,
+      "psnr_u8_trained": 35.35409167515433,
+      "seed": 0,
+      "seed_probe": [],
+      "total_bpp": 16.083984375,
+      "psnr_u8": 35.35409167515433,
+      "ssim": 0.9369975725809733,
+      "psnr_u8_albedo": 37.66257208093907,
+      "psnr_u8_normal": 39.558140152438895,
+      "psnr_u8_roughness": 37.371945847185046,
+      "psnr_u8_metalness": 30.79008591044863,
+      "psnr_u8_ao": 31.189661426098425,
+      "normal_angle_deg": 1.6778228560304955,
+      "channel_psnr_u8": [
+        37.491719768628464,
+        38.52337927695484,
+        37.09475560459561,
+        38.25034060876764,
+        39.367367659025994,
+        41.749883363609,
+        37.371945847185046,
+        30.79008591044863,
+        31.189661426098425
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 480,
+      "flops": 1122,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 644,
+      "weight_bytes_shared_64": 10.0625,
+      "tile_unique_bytes_per_texel": 2.9375,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.9329545569999027,
+      "mip2_psnr": 34.08315990146449,
+      "mip_bytes": {
+        "stored_latent_bytes": 131104,
+        "derived_mip_bytes": 43702
+      },
+      "probe": [],
+      "tag": "locked_h32_s80",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": true,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.51332032546344,
+      "psnr_u8_trained": 34.61404409752121,
+      "seed": 0,
+      "seed_probe": [],
+      "total_bpp": 16.083984375,
+      "psnr_u8": 34.61404409752121,
+      "ssim": 0.9254455036587186,
+      "psnr_u8_albedo": 37.56914176609426,
+      "psnr_u8_normal": 38.392857960784085,
+      "psnr_u8_roughness": 34.43791244296091,
+      "psnr_u8_metalness": 31.073503412906042,
+      "psnr_u8_ao": 29.95578310000285,
+      "normal_angle_deg": 1.932032828469519,
+      "channel_psnr_u8": [
+        37.45802260274603,
+        38.30303816467452,
+        37.04003751689727,
+        38.29670160475422,
+        37.3121921482373,
+        39.97247840038958,
+        34.43791244296091,
+        31.073503412906042,
+        29.95578310000285
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 480,
+      "flops": 1122,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 644,
+      "weight_bytes_shared_64": 10.0625,
+      "tile_unique_bytes_per_texel": 2.9375,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.5677496389998851,
+      "mip2_psnr": 34.31364209604517,
+      "mip_bytes": {
+        "stored_latent_bytes": 131104,
+        "derived_mip_bytes": 43702
+      },
+      "probe": [],
+      "tag": "locked_h32_s40_weight",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 8,
+      "checkpoint": "init",
+      "psnr_u8_init": 34.390648633221005,
+      "psnr_u8_trained": 34.34791021385583,
+      "seed": 0,
+      "seed_probe": [],
+      "total_bpp": 16.016357421875,
+      "psnr_u8": 34.390648633221005,
+      "ssim": 0.9181350005997552,
+      "psnr_u8_albedo": 36.61148900942825,
+      "psnr_u8_normal": 38.320773394463025,
+      "psnr_u8_roughness": 36.602198428446556,
+      "psnr_u8_metalness": 30.46416959107953,
+      "psnr_u8_ao": 29.741877216161512,
+      "normal_angle_deg": 1.9062153763601755,
+      "channel_psnr_u8": [
+        36.82378021614638,
+        36.4843506937401,
+        36.534015601167944,
+        37.08771007341112,
+        38.32295192488535,
+        40.04597938841573,
+        36.602198428446556,
+        30.46416959107953,
+        29.741877216161512
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 54,
+      "flops": 174,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 90,
+      "weight_bytes_shared_64": 1.40625,
+      "tile_unique_bytes_per_texel": 2.9375,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.44536838499971054,
+      "mip2_psnr": 33.77895424830977,
+      "mip_bytes": {
+        "stored_latent_bytes": 131104,
+        "derived_mip_bytes": 43702
+      },
+      "probe": [
+        {
+          "psnr_u8": 34.390648633221005,
+          "grids": [
+            [
+              256,
+              256,
+              4,
+              4
+            ],
+            [
+              8,
+              8,
+              2,
+              2
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 33.27584208761182,
+          "grids": [
+            [
+              256,
+              256,
+              2,
+              4
+            ],
+            [
+              128,
+              128,
+              4,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 31.699320642050033,
+          "grids": [
+            [
+              256,
+              256,
+              4,
+              2
+            ],
+            [
+              128,
+              128,
+              4,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 31.209624875984133,
+          "grids": [
+            [
+              256,
+              256,
+              2,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              2
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 30.49278547549981,
+          "grids": [
+            [
+              256,
+              256,
+              4,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 30.078155986505703,
+          "grids": [
+            [
+              128,
+              128,
+              8,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 28.839538822072278,
+          "grids": [
+            [
+              256,
+              256,
+              2,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 28.22849558390077,
+          "grids": [
+            [
+              256,
+              256,
+              8,
+              2
+            ]
+          ]
+        }
+      ],
+      "tag": "auto_linear_s40_b16",
+      "material": "metal_plate"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 27.99020423768119,
+      "psnr_u8_trained": 28.10949372212738,
+      "seed": 1,
+      "seed_probe": [
+        {
+          "psnr_u8": 28.10949372212738,
+          "seed": 1,
+          "ssim": 0.8242276774512397,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.09005871448972,
+          "seed": 0,
+          "ssim": 0.8266916076342264,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.061395307211182,
+          "seed": 2,
+          "ssim": 0.8229455418056912,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 28.049725878787683,
+          "seed": 3,
+          "ssim": 0.8190765480200449,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 8.07568359375,
+      "psnr_u8": 28.10949372212738,
+      "ssim": 0.8242276774512397,
+      "psnr_u8_albedo": 30.088054449738415,
+      "psnr_u8_normal": 25.724555852422995,
+      "psnr_u8_roughness": 33.566028804178366,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 30.73199809521821,
+      "normal_angle_deg": 8.767828585280778,
+      "channel_psnr_u8": [
+        31.339179787513327,
+        30.58998238338839,
+        28.75443899724352,
+        22.670588745810637,
+        28.327351992020763,
+        29.38379620439481,
+        33.566028804178366,
+        30.73199809521821,
+        27.81146099325488
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 416,
+      "flops": 978,
+      "latent_bytes_upper": 16,
+      "latent_bytes_shared_x": 8,
+      "weight_bytes_cold": 580,
+      "weight_bytes_shared_64": 9.0625,
+      "tile_unique_bytes_per_texel": 1.53125,
+      "tile_upper_bytes_per_texel": 16.0,
+      "seconds_train": 0.54971267000019,
+      "mip2_psnr": 29.294037735298936,
+      "mip_bytes": {
+        "stored_latent_bytes": 65568,
+        "derived_mip_bytes": 21858
+      },
+      "probe": [],
+      "tag": "paving_auto_h32_s40_b8",
+      "material": "PavingStones070"
+    },
+    {
+      "hidden": [
+        32
+      ],
+      "steps": 40,
+      "weighting": false,
+      "adaptive_pool": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.32940680583325,
+      "psnr_u8_trained": 31.687678902829933,
+      "seed": 3,
+      "seed_probe": [
+        {
+          "psnr_u8": 31.687678902829933,
+          "seed": 3,
+          "ssim": 0.9117135405540466,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.549455602885796,
+          "seed": 0,
+          "ssim": 0.9086113373438517,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.49057009403435,
+          "seed": 1,
+          "ssim": 0.9094491137398614,
+          "checkpoint": "trained"
+        },
+        {
+          "psnr_u8": 31.329091830263284,
+          "seed": 2,
+          "ssim": 0.9098519351747301,
+          "checkpoint": "trained"
+        }
+      ],
+      "total_bpp": 16.083984375,
+      "psnr_u8": 31.687678902829933,
+      "ssim": 0.9117135405540466,
+      "psnr_u8_albedo": 31.44885880798766,
+      "psnr_u8_normal": 32.29842999932013,
+      "psnr_u8_roughness": 33.38158205362969,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 32.89681768323698,
+      "normal_angle_deg": 3.486126167418674,
+      "channel_psnr_u8": [
+        31.86191645730306,
+        31.252342565911697,
+        31.26003128576285,
+        35.58231707153998,
+        32.85368175311846,
+        30.12216374109578,
+        33.38158205362969,
+        32.89681768323698,
+        29.159239617146593
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "macs": 480,
+      "flops": 1122,
+      "latent_bytes_upper": 24,
+      "latent_bytes_shared_x": 12,
+      "weight_bytes_cold": 644,
+      "weight_bytes_shared_64": 10.0625,
+      "tile_unique_bytes_per_texel": 2.9375,
+      "tile_upper_bytes_per_texel": 24.0,
+      "seconds_train": 0.6116397300002063,
+      "mip2_psnr": 31.286434833029713,
+      "mip_bytes": {
+        "stored_latent_bytes": 131104,
+        "derived_mip_bytes": 43702
+      },
+      "probe": [],
+      "tag": "paving_auto_h32_s40_b16",
+      "material": "PavingStones070"
+    }
+  ]
+}

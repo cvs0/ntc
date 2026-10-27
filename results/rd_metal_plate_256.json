@@ -1,0 +1,817 @@
+{
+  "device": {
+    "device": "cpu",
+    "torch": "2.14.1+cpu",
+    "backend": "cpu",
+    "name": "cpu"
+  },
+  "size": 256,
+  "steps": 40,
+  "adaptive_pool": 4,
+  "rows": [
+    {
+      "bpp_target": 2,
+      "total_bpp": 2.0634765625,
+      "nominal_bpp": 2.0634765625,
+      "psnr_u8": 27.653761759701545,
+      "ssim": 0.7242031958368089,
+      "psnr_u8_albedo": 32.44491955629957,
+      "psnr_u8_normal": 28.653436884863183,
+      "psnr_u8_roughness": 24.732898741595125,
+      "psnr_u8_metalness": 23.24029284939637,
+      "psnr_u8_ao": 28.11422637543107,
+      "normal_angle_deg": 4.785576447715809,
+      "channel_psnr_u8": [
+        32.07530577525004,
+        32.94856673067551,
+        32.35609177784598,
+        27.081948502451173,
+        27.784189321182275,
+        33.30771215422631,
+        24.732898741595125,
+        23.24029284939637,
+        28.11422637543107
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          2,
+          4
+        ]
+      ],
+      "seconds_train": 0.6718910370000231,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 25.984243003934445,
+          "ssim": 0.661530527803633
+        },
+        "m2": {
+          "psnr_u8": 24.42864731308878,
+          "ssim": 0.6088636914889017
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 352,
+        "flops": 834,
+        "latent_bytes_upper": 8,
+        "latent_bytes_shared_x": 4,
+        "weight_bytes_cold": 516,
+        "weight_bytes_per_invocation_if_shared_64": 8.0625,
+        "latent_channels": 2,
+        "pe_features": 0,
+        "input_features": 2,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 48,
+        "tap_bytes_upper": 512,
+        "bytes_per_texel_unique": 0.75,
+        "bytes_per_texel_upper": 8.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 27.089525626576037,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 24.62164344213857,
+          "grids": [
+            [
+              64,
+              64,
+              12,
+              2
+            ],
+            [
+              16,
+              16,
+              12,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 24.617410923550878,
+          "grids": [
+            [
+              64,
+              64,
+              12,
+              2
+            ],
+            [
+              32,
+              32,
+              12,
+              2
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 22.75308737713077,
+          "grids": [
+            [
+              32,
+              32,
+              12,
+              8
+            ],
+            [
+              16,
+              16,
+              12,
+              8
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "bpp_target": 4,
+      "total_bpp": 4.07568359375,
+      "nominal_bpp": 4.07568359375,
+      "psnr_u8": 28.236589776560614,
+      "ssim": 0.7636447019047208,
+      "psnr_u8_albedo": 33.403069544563685,
+      "psnr_u8_normal": 28.601773979247433,
+      "psnr_u8_roughness": 26.66591544127547,
+      "psnr_u8_metalness": 23.20039901098943,
+      "psnr_u8_ao": 29.75785251863863,
+      "normal_angle_deg": 4.988958913111587,
+      "channel_psnr_u8": [
+        33.67290709952411,
+        33.59058450795202,
+        32.97928512397087,
+        27.337485163392138,
+        26.63804352913228,
+        39.0414533135641,
+        26.66591544127547,
+        23.20039901098943,
+        29.75785251863863
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          2,
+          8
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "seconds_train": 0.552142449999792,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 26.757219477029892,
+          "ssim": 0.6980850762791104
+        },
+        "m2": {
+          "psnr_u8": 25.72382810431234,
+          "ssim": 0.6576794187227885
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 416,
+        "flops": 978,
+        "latent_bytes_upper": 16,
+        "latent_bytes_shared_x": 12,
+        "weight_bytes_cold": 580,
+        "weight_bytes_per_invocation_if_shared_64": 9.0625,
+        "latent_channels": 4,
+        "pe_features": 0,
+        "input_features": 4,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 80,
+        "tap_bytes_upper": 1024,
+        "bytes_per_texel_unique": 1.25,
+        "bytes_per_texel_upper": 16.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 28.37206495246277,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              2
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 28.12707511634926,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 27.83521626826435,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 25.753512673833963,
+          "grids": [
+            [
+              64,
+              64,
+              12,
+              4
+            ],
+            [
+              32,
+              32,
+              12,
+              4
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "bpp_target": 6,
+      "total_bpp": 6.08837890625,
+      "nominal_bpp": 6.08837890625,
+      "psnr_u8": 30.168038796492628,
+      "ssim": 0.8628514872656928,
+      "psnr_u8_albedo": 34.15360457435925,
+      "psnr_u8_normal": 34.24356500227345,
+      "psnr_u8_roughness": 27.29710022728923,
+      "psnr_u8_metalness": 24.10123390367252,
+      "psnr_u8_ao": 32.04996216831856,
+      "normal_angle_deg": 2.8998886126396606,
+      "channel_psnr_u8": [
+        33.85028526832522,
+        34.221001302220145,
+        34.40820995989506,
+        32.52793091093751,
+        33.249162123780074,
+        40.12310407003237,
+        27.29710022728923,
+        24.10123390367252,
+        32.04996216831856
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          4,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "seconds_train": 0.7077230019999661,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 25.584279667053718,
+          "ssim": 0.6921704709529877
+        },
+        "m2": {
+          "psnr_u8": 25.00318088611097,
+          "ssim": 0.6024599704477522
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 544,
+        "flops": 1266,
+        "latent_bytes_upper": 32,
+        "latent_bytes_shared_x": 24,
+        "weight_bytes_cold": 708,
+        "weight_bytes_per_invocation_if_shared_64": 11.0625,
+        "latent_channels": 8,
+        "pe_features": 0,
+        "input_features": 8,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 160,
+        "tap_bytes_upper": 2048,
+        "bytes_per_texel_unique": 2.5,
+        "bytes_per_texel_upper": 32.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 29.808228467557136,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              4
+            ],
+            [
+              64,
+              64,
+              4,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.311853888407246,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              4
+            ],
+            [
+              64,
+              64,
+              8,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.09994038426146,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ],
+            [
+              64,
+              64,
+              4,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.046124543165227,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ],
+            [
+              128,
+              128,
+              2,
+              4
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "bpp_target": 8,
+      "total_bpp": 8.080078125,
+      "nominal_bpp": 8.080078125,
+      "psnr_u8": 30.297721939300878,
+      "ssim": 0.8715257048606873,
+      "psnr_u8_albedo": 34.259439771137224,
+      "psnr_u8_normal": 33.98235243195337,
+      "psnr_u8_roughness": 26.669885276725402,
+      "psnr_u8_metalness": 24.66665505950448,
+      "psnr_u8_ao": 32.90687286172525,
+      "normal_angle_deg": 3.0083393431416345,
+      "channel_psnr_u8": [
+        34.36558674902693,
+        33.55645280728411,
+        34.97323312946453,
+        32.255682689417625,
+        32.93016931211748,
+        40.223209122949925,
+        26.669885276725402,
+        24.66665505950448,
+        32.90687286172525
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          2,
+          8
+        ],
+        [
+          128,
+          128,
+          4,
+          4
+        ]
+      ],
+      "seconds_train": 0.6155187330000444,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 27.3378930343815,
+          "ssim": 0.7709709935718112
+        },
+        "m2": {
+          "psnr_u8": 25.881414542862615,
+          "ssim": 0.6732990245024363
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 480,
+        "flops": 1122,
+        "latent_bytes_upper": 24,
+        "latent_bytes_shared_x": 16,
+        "weight_bytes_cold": 644,
+        "weight_bytes_per_invocation_if_shared_64": 10.0625,
+        "latent_channels": 6,
+        "pe_features": 0,
+        "input_features": 6,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 168,
+        "tap_bytes_upper": 1536,
+        "bytes_per_texel_unique": 2.625,
+        "bytes_per_texel_upper": 24.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 30.16715927084357,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ],
+            [
+              128,
+              128,
+              4,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.446457327157614,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.330900558927517,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              2
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.022191138985015,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "bpp_target": 12,
+      "total_bpp": 12.0966796875,
+      "nominal_bpp": 12.0966796875,
+      "psnr_u8": 30.67980466979938,
+      "ssim": 0.8878500329123603,
+      "psnr_u8_albedo": 34.79320369720785,
+      "psnr_u8_normal": 34.50364561389045,
+      "psnr_u8_roughness": 27.17793490961833,
+      "psnr_u8_metalness": 24.65187505708814,
+      "psnr_u8_ao": 35.28582555279516,
+      "normal_angle_deg": 2.855684250417702,
+      "channel_psnr_u8": [
+        36.258266177946226,
+        32.48509488317674,
+        37.12224925071065,
+        32.907099705615586,
+        33.131921504582,
+        41.84878632777835,
+        27.17793490961833,
+        24.65187505708814,
+        35.28582555279516
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          2,
+          8
+        ],
+        [
+          128,
+          128,
+          8,
+          4
+        ]
+      ],
+      "seconds_train": 0.7782883780000702,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 27.10797618548466,
+          "ssim": 0.7859658400217692
+        },
+        "m2": {
+          "psnr_u8": 25.68349174152933,
+          "ssim": 0.6735322674115499
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 608,
+        "flops": 1410,
+        "latent_bytes_upper": 40,
+        "latent_bytes_shared_x": 24,
+        "weight_bytes_cold": 772,
+        "weight_bytes_per_invocation_if_shared_64": 12.0625,
+        "latent_channels": 10,
+        "pe_features": 0,
+        "input_features": 10,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 264,
+        "tap_bytes_upper": 2560,
+        "bytes_per_texel_unique": 4.125,
+        "bytes_per_texel_upper": 40.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 30.624604115258368,
+          "grids": [
+            [
+              128,
+              128,
+              2,
+              8
+            ],
+            [
+              128,
+              128,
+              8,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 30.620024282264776,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ],
+            [
+              128,
+              128,
+              4,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 30.32419202553576,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ],
+            [
+              64,
+              64,
+              8,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 28.957329013532537,
+          "grids": [
+            [
+              128,
+              128,
+              12,
+              4
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "bpp_target": 16,
+      "total_bpp": 16.10498046875,
+      "nominal_bpp": 16.10498046875,
+      "psnr_u8": 30.734097670759468,
+      "ssim": 0.8960213793648614,
+      "psnr_u8_albedo": 35.93610736433031,
+      "psnr_u8_normal": 34.37856097305978,
+      "psnr_u8_roughness": 27.417763236581685,
+      "psnr_u8_metalness": 24.40397155824886,
+      "psnr_u8_ao": 35.21085299515088,
+      "normal_angle_deg": 2.913905966111594,
+      "channel_psnr_u8": [
+        36.64586310142944,
+        36.45236424545304,
+        34.92258694606562,
+        33.10829406924191,
+        32.620021792375866,
+        42.308670530303054,
+        27.417763236581685,
+        24.40397155824886,
+        35.21085299515088
+      ],
+      "grids": [
+        [
+          128,
+          128,
+          4,
+          8
+        ],
+        [
+          128,
+          128,
+          8,
+          4
+        ]
+      ],
+      "seconds_train": 0.8309587799999463,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 27.02748964727851,
+          "ssim": 0.7742791109614902
+        },
+        "m2": {
+          "psnr_u8": 25.83902976978418,
+          "ssim": 0.673396133714252
+        }
+      },
+      "cost": {
+        "mlp_evals": 1,
+        "macs": 672,
+        "flops": 1554,
+        "latent_bytes_upper": 48,
+        "latent_bytes_shared_x": 32,
+        "weight_bytes_cold": 836,
+        "weight_bytes_per_invocation_if_shared_64": 13.0625,
+        "latent_channels": 12,
+        "pe_features": 0,
+        "input_features": 12,
+        "hidden_units": 32,
+        "activation_flops_per_hidden": 1
+      },
+      "tile": {
+        "group": 8,
+        "texels": 64,
+        "unique_bytes": 336,
+        "tap_bytes_upper": 3072,
+        "bytes_per_texel_unique": 5.25,
+        "bytes_per_texel_upper": 48.0
+      },
+      "probe": [
+        {
+          "psnr_u8": 30.36250277587574,
+          "grids": [
+            [
+              128,
+              128,
+              4,
+              8
+            ],
+            [
+              128,
+              128,
+              8,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 30.129503872051416,
+          "grids": [
+            [
+              128,
+              128,
+              8,
+              8
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.63994562621874,
+          "grids": [
+            [
+              128,
+              128,
+              8,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              4
+            ]
+          ]
+        },
+        {
+          "psnr_u8": 29.516685430991064,
+          "grids": [
+            [
+              128,
+              128,
+              8,
+              8
+            ],
+            [
+              8,
+              8,
+              2,
+              2
+            ]
+          ]
+        }
+      ]
+    }
+  ]
+}
