@@ -1,0 +1,10 @@
+.venv/
+build/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.pyc
+data/
+results/*.ntc
+results/*.png.tmp
+.DS_Store

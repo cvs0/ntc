@@ -1,0 +1,7 @@
+#version 450
+#extension GL_KHR_shader_subgroup_basic : require
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+layout(std430, set = 0, binding = 0) writeonly buffer Out { uint g_size; };
+void main() {
+    if (gl_LocalInvocationIndex == 0u) g_size = gl_SubgroupSize;
+}

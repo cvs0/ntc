@@ -1,0 +1,56 @@
+{
+  "rows": [
+    {
+      "seed": 0,
+      "psnr_u8": 35.239707851115135,
+      "ssim": 0.9330952366193136,
+      "psnr_u8_init": 34.51332032546344,
+      "psnr_u8_trained": 35.239707851115135,
+      "checkpoint": "trained",
+      "psnr_u8_normal": 39.23339351104901,
+      "psnr_u8_albedo": 37.63881732130556,
+      "normal_angle_deg": 1.7336602543441166,
+      "seconds_train": 0.6254156739996688,
+      "total_bpp": 16.083984375
+    },
+    {
+      "seed": 1,
+      "psnr_u8": 35.30600455886293,
+      "ssim": 0.9433271288871765,
+      "psnr_u8_init": 34.96884184565682,
+      "psnr_u8_trained": 35.30600455886293,
+      "checkpoint": "trained",
+      "psnr_u8_normal": 39.04810193222393,
+      "psnr_u8_albedo": 36.74288867592723,
+      "normal_angle_deg": 1.799143870667613,
+      "seconds_train": 0.4775699639994855,
+      "total_bpp": 16.083984375
+    },
+    {
+      "seed": 2,
+      "psnr_u8": 35.2865038013323,
+      "ssim": 0.9375042915344238,
+      "psnr_u8_init": 34.62071100247541,
+      "psnr_u8_trained": 35.2865038013323,
+      "checkpoint": "trained",
+      "psnr_u8_normal": 39.10710197561872,
+      "psnr_u8_albedo": 36.98700824585743,
+      "normal_angle_deg": 1.7912970430413968,
+      "seconds_train": 0.4703905599999416,
+      "total_bpp": 16.083984375
+    },
+    {
+      "seed": 3,
+      "psnr_u8": 35.749193955843445,
+      "ssim": 0.9474357631471422,
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.749193955843445,
+      "checkpoint": "trained",
+      "psnr_u8_normal": 39.459492229051754,
+      "psnr_u8_albedo": 37.018055525610194,
+      "normal_angle_deg": 1.769091566110173,
+      "seconds_train": 0.47633108800073387,
+      "total_bpp": 16.083984375
+    }
+  ]
+}
