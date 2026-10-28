@@ -97,7 +97,9 @@ NTC_GL_API(void, glFramebufferRenderbuffer, GLenum, GLenum, GLenum, GLuint);
 NTC_GL_API(GLenum, glCheckFramebufferStatus, GLenum);
 NTC_GL_API(void, glGenVertexArrays, GLsizei, GLuint*);
 NTC_GL_API(void, glBindVertexArray, GLuint);
-NTC_GL_API(void, glDrawArrays, GLenum, GLint, GLsizei);
+// glDrawArrays is OpenGL 1.1. Windows gl.h declares it and opengl32.dll
+// exports it. A function-pointer redefinition fails on clang++ (MSVC ABI)
+// and on cl.exe. Do not load it with wglGetProcAddress.
 NTC_GL_API(const GLubyte*, glGetStringi, GLenum, GLuint);
 NTC_GL_API(void, glGenQueries, GLsizei, GLuint*);
 NTC_GL_API(void, glBeginQuery, GLenum, GLuint);
@@ -136,7 +138,6 @@ static void load_gl() {
     LOAD(glCheckFramebufferStatus);
     LOAD(glGenVertexArrays);
     LOAD(glBindVertexArray);
-    LOAD(glDrawArrays);
     LOAD(glGetStringi);
     LOAD(glGenQueries);
     LOAD(glBeginQuery);

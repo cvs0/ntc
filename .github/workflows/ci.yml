@@ -49,3 +49,17 @@ jobs:
           cmake -S . -B build -G "Visual Studio 17 2022" -A x64
           cmake --build build --config Release --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
           ctest --test-dir build -C Release -R test_ntc --output-on-failure
+
+  windows-clang:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: ntc_gl with clang++
+        shell: pwsh
+        run: |
+          clang++ --version
+          cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-clang --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
