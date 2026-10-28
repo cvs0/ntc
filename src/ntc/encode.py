@@ -21,8 +21,7 @@ from ntc.container import (
     ChannelRec,
     build_texture_set,
     parse_texture_set,
-    payload_bytes,
-    total_bpp,
+    rate_report,
 )
 from ntc.decode_ref import decode_mip
 from ntc.device import device_report, pick_device
@@ -84,6 +83,9 @@ class TrainConfig:
     tile_size: int = 0
     layer_bits: tuple = ()
     mip_loss: str = "footprint"
+    # ``payload`` matches historical total_bpp. ``latent`` matches ntc-cli
+    # --bitsPerPixel (codes + latent scales, mip 0, no MLP weights).
+    rate: str = "payload"
     mip_curriculum: bool = False
     warmup_steps: int = 0
     schedule: str = "cosine"
@@ -330,6 +332,7 @@ def encode_arrays(
             cfg.weight_bits,
             cfg.group_size,
             adaptive_pool=max(1, cfg.adaptive_pool),
+            rate=cfg.rate,
         )
         if cfg.adaptive_pool > 1 and cfg.steps > 0 and len(choices) > 1:
             for candidate in choices:
@@ -636,9 +639,8 @@ def encode_arrays(
         "seconds_decode_ref": decode_s,
         "steps": cfg.steps,
         "nominal_bpp": nominal,
-        "total_bpp": total_bpp(ts),
-        "payload_bytes": payload_bytes(ts),
-        "file_bytes": len(blob),
+        "rate": cfg.rate,
+        **rate_report(ts),
         "grids": [list(g) for g in grids],
         "hidden": hidden,
         "activation": cfg.activation,

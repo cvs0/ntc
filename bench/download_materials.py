@@ -49,6 +49,9 @@ def ambient(root: Path, name: str, size: str = "1K") -> None:
     normal = next(d.glob("*NormalGL.jpg"))
     rough = next(d.glob("*Roughness.jpg"))
     ao = next(d.glob("*AmbientOcclusion.jpg"))
+    metal = next(d.glob("*Metalness.jpg"), None)
+    if metal is None:
+        metal = next(d.glob("*Metallic.jpg"), None)
     height = next(d.glob("*Displacement.jpg"), None)
     manifest = {
         "albedo": color.name,
@@ -59,20 +62,41 @@ def ambient(root: Path, name: str, size: str = "1K") -> None:
         "license": "CC0",
         "normal_convention": "opengl",
     }
+    if metal:
+        manifest["metalness"] = metal.name
     if height:
         manifest["height"] = height.name
     (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
+    return d
 
 
 _MAPS_METAL = {"albedo": "diff", "normal": "nor_gl", "roughness": "rough", "metalness": "metal", "ao": "ao"}
 _MAPS = {"albedo": "diff", "normal": "nor_gl", "roughness": "rough", "ao": "ao"}
 
 
+def sdk_materials(root: Path) -> None:
+    """ambientCG 2048 sets used by the RTXNTC SDK samples, with a full mip chain.
+
+    The zip is ``https://ambientcg.com/get?file=<Name>_2K-JPG.zip``. The
+    request sends a browser User-Agent. Mips are a 2x2 box filter, the same
+    crop the trainer uses, written for ``ntc-cli --loadMips``.
+    """
+    from ntc.materials import export_reference_mips
+
+    for name in ("MetalPlates013", "PavingStones070", "Tiles135D"):
+        src = ambient(root, name, size="2K")
+        export_reference_mips(src, src / "reference")
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dest", type=Path, default=Path("data/materials"))
-    p.add_argument("--preset", choices=("base", "max"), default="base")
+    p.add_argument("--preset", choices=("base", "max", "rtxntc"), default="base")
     args = p.parse_args()
+    if args.preset == "rtxntc":
+        sdk_materials(args.dest)
+        print(args.dest)
+        return
     polyhaven(args.dest, "metal_plate", _MAPS_METAL)
     ambient(args.dest, "PavingStones070")
     if args.preset == "max":
@@ -88,6 +112,7 @@ def main() -> None:
         # Two 2K sets. The directory name is ``{asset}_2k``.
         polyhaven(args.dest, "wood_floor", _MAPS, size="2k")
         polyhaven(args.dest, "aerial_rocks_01", _MAPS, size="2k")
+        sdk_materials(args.dest)
     print(args.dest)
 
 

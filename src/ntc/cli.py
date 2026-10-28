@@ -9,7 +9,7 @@ from pathlib import Path
 
 import numpy as np
 
-from ntc.container import parse_texture_set, total_bpp
+from ntc.container import parse_texture_set, rate_report
 from ntc.decode_ref import decode_mip
 from ntc.encode import TrainConfig, encode_arrays
 from ntc.materials import load_material
@@ -68,8 +68,20 @@ def decode_main(argv: list[str] | None = None) -> None:
     ts = parse_texture_set(blob)
     img = decode_mip(ts, args.mip)
     # npz: image HWC float32
-    np.savez(args.output, image=img.astype(np.float32), bpp=np.float32(total_bpp(ts)))
-    print(f"decoded {img.shape} bpp {total_bpp(ts):.4f}")
+    rates = rate_report(ts)
+    np.savez(
+        args.output,
+        image=img.astype(np.float32),
+        bpp=np.float32(rates["total_bpp"]),
+        latent_bpp_mip0=np.float32(rates["latent_bpp_mip0"]),
+        file_bpp_chain=np.float32(rates["file_bpp_chain"]),
+        bppc=np.float32(rates["bppc"]),
+    )
+    print(
+        f"decoded {img.shape} total_bpp {rates['total_bpp']:.4f} "
+        f"latent_bpp_mip0 {rates['latent_bpp_mip0']:.4f} "
+        f"file_bpp_chain {rates['file_bpp_chain']:.4f} bppc {rates['bppc']:.4f}"
+    )
     if args.reference:
         ref, sems, _info = load_material(args.reference, args.size)
         ref_hwc = np.transpose(ref, (1, 2, 0))

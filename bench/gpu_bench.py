@@ -240,6 +240,9 @@ def main() -> None:
                     "bc_info": bc_info,
                     "psnr_u8": packed["stats"]["metrics"]["psnr_u8"],
                     "total_bpp": packed["stats"]["total_bpp"],
+                    "latent_bpp_mip0": packed["stats"].get("latent_bpp_mip0"),
+                    "file_bpp_chain": packed["stats"].get("file_bpp_chain"),
+                    "bppc": packed["stats"].get("bppc"),
                 }
             )
     for path in args.ntc:
@@ -320,6 +323,9 @@ def main() -> None:
                     "wrote": parsed["wrote"],
                     "psnr_u8": job.get("psnr_u8"),
                     "total_bpp": job.get("total_bpp"),
+                    "latent_bpp_mip0": job.get("latent_bpp_mip0"),
+                    "file_bpp_chain": job.get("file_bpp_chain"),
+                    "bppc": job.get("bppc"),
                     "bc_encoder": (job.get("bc_info") or {}).get("encoder"),
                 }
             )

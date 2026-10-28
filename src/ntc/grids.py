@@ -1,8 +1,14 @@
-"""Latent shape selection at a target total bits per material pixel.
+"""Latent shape selection.
 
-``bpp`` counts latent codes, fp16 latent scales, and quantized MLP
-weights, bias, and scales. It does not count the 96-byte header or the
-descriptor tables. Those are reported separately as file bpp.
+``rate="payload"`` (the default, and the historical ``target_bpp``) counts
+latent codes, fp16 latent scales, and quantized MLP weights, bias, and
+scales, per mip 0 texel. It does not count the header or the descriptor
+tables.
+
+``rate="latent"`` counts only latent codes and fp16 latent scales, per
+mip 0 texel. That is the rate to line up with ``ntc-cli --bitsPerPixel``.
+Weights are still stored. They show up in ``file_bpp_chain`` and ``bppc``,
+not in the selection target.
 """
 
 from __future__ import annotations
@@ -116,12 +122,15 @@ def select_grids(
     weight_bits: int,
     group_size: int,
     adaptive_pool: int = 1,
+    rate: str = "payload",
 ) -> list[list[tuple[int, int, int, int]]]:
     """Return up to ``adaptive_pool`` shapes closest to ``target_bpp``.
 
     The first entry is the default (closest). ``adaptive_pool > 1`` is the
-    short list a rate search trains.
+    short list a rate search trains. ``rate`` is ``payload`` or ``latent``.
     """
+    if rate not in ("payload", "latent"):
+        raise ValueError(rate)
     scored = []
     for grids in _family(width, height):
         in_f = sum(g[2] for g in grids) + pe_feature_count(pe_mode, pe_octaves)
@@ -129,17 +138,20 @@ def select_grids(
             continue
         if any(g[2] > 16 for g in grids):
             continue
-        bpp = shape_bpp(
-            width,
-            height,
-            grids,
-            hidden,
-            out_features,
-            pe_mode,
-            pe_octaves,
-            weight_bits,
-            group_size,
-        )
+        if rate == "latent":
+            bpp = latent_payload_bits(grids) / float(width * height)
+        else:
+            bpp = shape_bpp(
+                width,
+                height,
+                grids,
+                hidden,
+                out_features,
+                pe_mode,
+                pe_octaves,
+                weight_bits,
+                group_size,
+            )
         # prefer shapes that are not far above the target: extra bits are
         # not a free win when the comparison is at matched rate
         err = abs(bpp - target_bpp)

@@ -31,8 +31,11 @@ int main(int argc, char** argv) {
         out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
         out.write(reinterpret_cast<const char*>(img.data()),
                   static_cast<std::streamsize>(img.size() * sizeof(float)));
-        std::cout << "decoded " << w << "x" << h << "x" << c << " mip " << mip << " bpp "
-                  << ntc::total_bpp(ts) << "\n";
+        std::cout << "decoded " << w << "x" << h << "x" << c << " mip " << mip
+                  << " total_bpp " << ntc::total_bpp(ts)
+                  << " latent_bpp_mip0 " << ntc::latent_bpp_mip0(ts)
+                  << " file_bpp_chain " << ntc::file_bpp_chain(ts)
+                  << " bppc " << ntc::bppc(ts) << "\n";
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << "\n";
         return 1;

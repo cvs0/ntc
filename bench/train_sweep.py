@@ -115,6 +115,9 @@ def main() -> None:
             "psnr_u8": stats["metrics"]["psnr_u8"],
             "ssim": stats["metrics"].get("ssim"),
             "total_bpp": stats["total_bpp"],
+            "latent_bpp_mip0": stats.get("latent_bpp_mip0"),
+            "file_bpp_chain": stats.get("file_bpp_chain"),
+            "bppc": stats.get("bppc"),
             "latent_stored_bytes": stats.get("latent_stored_bytes"),
             "latent_plain_bytes": stats.get("latent_plain_bytes"),
             "checkpoint": stats.get("checkpoint"),
@@ -131,7 +134,8 @@ def main() -> None:
         manifest.append(row)
         (args.out / "manifest.json").write_text(json.dumps({"device": info, "jobs": manifest}, indent=2))
         print(
-            f"{job['name']} psnr {row['psnr_u8']:.4f} bpp {row['total_bpp']:.4f} wall {wall:.1f}",
+            f"{job['name']} psnr {row['psnr_u8']:.4f} total_bpp {row['total_bpp']:.4f} "
+            f"latent_bpp_mip0 {row['latent_bpp_mip0']:.4f} bppc {row['bppc']:.4f} wall {wall:.1f}",
             flush=True,
         )
 

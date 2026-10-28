@@ -543,6 +543,38 @@ float total_bpp(const TextureSet& ts) {
            static_cast<float>(ts.width * ts.height);
 }
 
+int mip_chain_texels(const TextureSet& ts) {
+    int total = 0;
+    const uint32_t mips = std::max(1u, ts.num_mips);
+    for (uint32_t m = 0; m < mips; ++m) {
+        total += static_cast<int>(std::max(1u, ts.width >> m) * std::max(1u, ts.height >> m));
+    }
+    return total;
+}
+
+float latent_bpp_mip0(const TextureSet& ts) {
+    uint32_t latent = 0;
+    if (ts.flags & kFlagLatentCompressed) latent = ts.latent_stored_bytes;
+    else {
+        for (const auto& g : ts.grids) latent += g.data_bytes;
+    }
+    uint32_t scales = ts.scale_stored_bytes;
+    if (!scales) {
+        for (const auto& g : ts.grids) scales += static_cast<uint32_t>(g.channels) * 2u;
+    }
+    return 8.f * static_cast<float>(latent + scales) / static_cast<float>(ts.width * ts.height);
+}
+
+float file_bpp_chain(const TextureSet& ts) {
+    return 8.f * static_cast<float>(ts.raw.size()) / static_cast<float>(mip_chain_texels(ts));
+}
+
+float bppc(const TextureSet& ts) {
+    const int ch = std::max(1, ts.num_channels());
+    return 8.f * static_cast<float>(payload_bytes(ts)) /
+           static_cast<float>(mip_chain_texels(ts) * ch);
+}
+
 GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_mode,
                           uint32_t max_aniso) {
     GpuUpload up;

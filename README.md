@@ -61,7 +61,13 @@ Layer record, 32 bytes: `u16 in, u16 out, u32 weight_off, u32 weight_bytes, u32 
 
 Limits: 8 grids, 4 layers, 16 channels, hidden width 64, 160 input features, 8 mips.
 
-`total_bpp = 8 * (packed latent codes + fp16 latent scales + integer weights + fp16 bias + fp16 weight scales) / (width * height)`. The 96-byte header and the descriptor tables are not in `total_bpp`. They are in `file_bytes`.
+Four rates are reported on every encode. `total_bpp` is the historical one and is unchanged: `8 * payload / (width * height)`, where payload is packed latent codes + fp16 latent scales + integer weights + fp16 bias + fp16 weight scales. The header and the descriptor tables are not in it. The denominator is mip 0 only, and the count is not divided by the channel count. Do not put `total_bpp` next to an RTXNTC `--bitsPerPixel` number or a paper bppc number.
+
+`latent_bpp_mip0` is the SDK rate. It is `8 * (stored latent codes + fp16 latent scales) / (width * height)`. Weights, bias, weight scales, the header, and the descriptor tables are excluded. `ntc-cli --bitsPerPixel` selects a latent grid at this kind of rate. `rate="latent"` in `TrainConfig` selects our grids against this number. The default `rate="payload"` still selects against `total_bpp`.
+
+`file_bpp_chain` is `8 * file_bytes / mip_chain_texels`. The numerator is the whole file. The denominator is every mip the header declares (`num_mips`, a full chain is `floor(log2(max(width, height))) + 1` levels down to 1x1). Derived color mips are not stored a second time.
+
+`bppc` is the paper rate: `8 * payload / (mip_chain_texels * channels)`. Payload is the same numerator as `total_bpp`. Vaidyanathan et al. 2023 Table 3 reports bits/pixel/channel including mips and weights, as a 20-material average: 0.23 -> 32.71 dB, 0.56 -> 36.12, 1.13 -> 39.92, 2.51 -> 45.30. Those points are a different material set, not a matched comparison.
 
 ## Network
 
@@ -491,6 +497,15 @@ build\Release\ntc_view.exe --benchmark --shader-dir build\shaders --ntc-dir resu
 ```
 
 A Ninja build puts the executable at `build\ntc_view.exe`.
+
+The SDK materials are ambientCG MetalPlates013, PavingStones070, and Tiles135D at 2048. `bench/download_materials.py --preset rtxntc` fetches `https://ambientcg.com/get?file=<Name>_2K-JPG.zip` with a browser User-Agent and writes a full box-filter chain under `data/materials/<Name>_2K/reference/` (`albedo.png`, `mips/albedo.01.png`, and the same for normal, roughness, metalness when the zip has it, ao, height). `train_max` trains each of those at latent rates 2.5, 5, 10, 15, and 20 for 4000 cosine steps, batch 1024^2, 12 mips, when the directory exists.
+
+`bench/score_mips.py --reference <dir> --decoded <dir>` pools 8-bit MSE over every channel and every mip present on both sides, then reports that PSNR and the same pool per channel group. PNG, JPEG, TGA, and EXR (EXR needs `imageio`) are accepted. `bench/rtxntc_compare.ps1` and `bench/rtxntc_compare.sh` download the three materials, build or locate `ntc-cli` from https://github.com/NVIDIA-RTX/RTXNTC, compress at 2.5, 5, 10, 15, and 20 bpp, decompress with `--vk` and with `--no-coopVec`, score both tools with `score_mips.py`, and write `results/rtxntc_compare/<gpu-slug>/report.json` plus `rd.svg`. The black squares on the bppc panel are Table 3. The orange series is RTXNTC. The blue series is ours. RTXNTC `latent_bpp_mip0` in that report is the requested `--bitsPerPixel`. Its `file_bpp_chain` and `bppc` use the whole `.ntc` file, because the CLI does not print a split of latents and weights.
+
+```text
+powershell -ExecutionPolicy Bypass -File bench\rtxntc_compare.ps1
+sh bench/rtxntc_compare.sh
+```
 
 The 2000-step and 4000-step rows, and every millisecond in `results/hw/`, stay out of this file until those directories are measured.
 

@@ -138,3 +138,61 @@ def load_material(directory: str | Path, size: int | None = None) -> tuple[np.nd
         "semantics": sems,
     }
     return chw, sems, info
+
+
+def box_down_chw(values: np.ndarray) -> np.ndarray | None:
+    """2x2 mean. Same crop as ``_soft_box`` in the trainer."""
+    c, h, w = values.shape
+    if h == 1 and w == 1:
+        return None
+    h2 = max(1, h // 2)
+    w2 = max(1, w // 2)
+    if h >= 2 and w >= 2:
+        src = values[:, : h2 * 2, : w2 * 2]
+        return src.reshape(c, h2, 2, w2, 2).mean(axis=(2, 4)).astype(np.float32)
+    if h >= 2:
+        src = values[:, : h2 * 2, :]
+        return src.reshape(c, h2, 2, w).mean(axis=2).astype(np.float32)
+    if w >= 2:
+        src = values[:, :, : w2 * 2]
+        return src.reshape(c, h, w2, 2).mean(axis=3).astype(np.float32)
+    return None
+
+
+def _save_u8(arr_hwc: np.ndarray, path: Path) -> None:
+    q = np.clip(np.round(np.clip(arr_hwc, 0.0, 1.0) * 255.0), 0, 255).astype(np.uint8)
+    if q.shape[2] == 1:
+        img = Image.fromarray(q[:, :, 0], mode="L")
+    else:
+        img = Image.fromarray(q, mode="RGB")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(path)
+
+
+def export_reference_mips(directory: str | Path, dest: str | Path, size: int | None = None) -> Path:
+    """Write a full box-filter mip chain as PNG.
+
+    Mip 0 is ``<role>.png``. Later mips are ``mips/<role>.NN.png`` with
+    ``NN`` starting at 01. That is the layout ``ntc-cli --loadMips`` reads.
+    The chain stops at 1x1.
+    """
+    images, _sems, info = load_material(directory, size)
+    dest = Path(dest)
+    level = images
+    mip = 0
+    while level is not None:
+        hwc = np.transpose(level, (1, 2, 0))
+        for role, span in info["slices"].items():
+            a, b = span
+            plane = hwc[:, :, a:b]
+            if mip == 0:
+                path = dest / f"{role}.png"
+            else:
+                path = dest / "mips" / f"{role}.{mip:02d}.png"
+            _save_u8(plane, path)
+        mip += 1
+        level = box_down_chw(level)
+    (dest / "chain.json").write_text(
+        json.dumps({"mips": mip, "semantics": info["semantics"], "source": str(directory)}, indent=2)
+    )
+    return dest

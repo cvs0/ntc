@@ -7,6 +7,7 @@ from ntc.container import (
     file_bpp,
     parse_texture_set,
     payload_bytes,
+    rate_report,
     total_bpp,
     unpack_weight_matrix,
 )
@@ -58,6 +59,11 @@ def test_header_size_and_roundtrip():
     assert payload_bytes(ts) > 0
     assert total_bpp(ts) > 0
     assert file_bpp(blob, 8, 8) > total_bpp(ts)
+    rates = rate_report(ts)
+    assert rates["latent_bpp_mip0"] < rates["total_bpp"]
+    assert rates["file_bpp_chain"] < file_bpp(blob, 8, 8)
+    assert rates["bppc"] < rates["file_bpp_chain"]
+    assert rates["mip_chain_texels"] == 8 * 8 + 4 * 4 + 2 * 2 + 1 * 1
 
 
 def test_int4_weight_pack():

@@ -682,8 +682,75 @@ def payload_bytes(ts: TextureSet) -> int:
 
 
 def total_bpp(ts: TextureSet) -> float:
+    """Historical rate. Payload bits over mip 0 texels.
+
+    Payload is compressed latent codes + fp16 latent scales + integer
+    weights + fp16 bias + fp16 weight scales. The 96-byte header and the
+    descriptor tables are not included. The denominator is ``width * height``,
+    not the mip chain, and the count is not divided by the channel count.
+    """
     return 8.0 * payload_bytes(ts) / float(ts.width * ts.height)
 
 
 def file_bpp(blob: bytes, width: int, height: int) -> float:
+    """Whole-file bits over mip 0 texels. Not the paper rate and not the SDK rate."""
     return 8.0 * len(blob) / float(width * height)
+
+
+def mip_chain_texels(width: int, height: int, num_mips: int) -> int:
+    """Texels represented by mips ``0 .. num_mips-1``. A full chain uses
+    ``floor(log2(max(width, height))) + 1`` levels, down to 1x1.
+    """
+    total = 0
+    for mip in range(max(int(num_mips), 1)):
+        total += max(width >> mip, 1) * max(height >> mip, 1)
+    return total
+
+
+def _latent_code_bytes(ts: TextureSet) -> int:
+    if ts.flags & FLAG_LATENT_COMPRESSED:
+        return int(ts.latent_stored_bytes)
+    return int(sum(g.data_bytes for g in ts.grids))
+
+
+def _scale_bytes(ts: TextureSet) -> int:
+    if ts.scale_stored_bytes:
+        return int(ts.scale_stored_bytes)
+    return int(sum(g.channels * 2 for g in ts.grids))
+
+
+def rate_report(ts: TextureSet) -> dict:
+    """Three rates, plus the historical ``total_bpp``.
+
+    ``latent_bpp_mip0`` is the RTXNTC SDK comparison rate: stored latent
+    codes plus the fp16 per-channel latent scales, in bits, divided by mip 0
+    texels. Network weights, bias, weight scales, the header, and the
+    descriptor tables are excluded. ``--bitsPerPixel`` on ``ntc-cli`` is a
+    latent-grid rate of this kind. It is not ``total_bpp``.
+
+    ``file_bpp_chain`` is the whole file (latents + scales + MLP weights +
+    header + descriptor tables) in bits, divided by the texels in every mip
+    the header declares. Derived color mips are not a second copy of those
+    texels in the file. The denominator is the chain the file represents.
+
+    ``bppc`` is the paper rate (Vaidyanathan et al. 2023): the same payload
+    as ``total_bpp`` (latents, scales, and weights, no header), divided by
+    mip-chain texels and by the channel count.
+    """
+    chain = mip_chain_texels(ts.width, ts.height, ts.num_mips)
+    channels = max(len(ts.channels), 1)
+    latent = _latent_code_bytes(ts) + _scale_bytes(ts)
+    payload = payload_bytes(ts)
+    mip0 = float(ts.width * ts.height)
+    return {
+        "latent_bpp_mip0": 8.0 * latent / mip0,
+        "file_bpp_chain": 8.0 * len(ts.raw) / float(chain),
+        "bppc": 8.0 * payload / float(chain * channels),
+        "total_bpp": 8.0 * payload / mip0,
+        "mip_chain_texels": chain,
+        "num_channels": len(ts.channels),
+        "latent_code_bytes": _latent_code_bytes(ts),
+        "latent_scale_bytes": _scale_bytes(ts),
+        "payload_bytes": payload,
+        "file_bytes": len(ts.raw),
+    }

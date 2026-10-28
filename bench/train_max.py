@@ -61,6 +61,7 @@ def _run(job: dict, out: Path, precision: str) -> dict:
         seed_pool=1,
         latent_deflate=True,
         latent_coder="best",
+        rate=str(job.get("rate", "payload")),
         mip_levels=int(job.get("mip_levels", 4)),
         mip_loss="footprint",
         warmup_steps=int(job.get("warmup", 200)),
@@ -86,6 +87,9 @@ def _run(job: dict, out: Path, precision: str) -> dict:
         "psnr_u8": stats["metrics"]["psnr_u8"],
         "ssim": stats["metrics"].get("ssim"),
         "total_bpp": stats["total_bpp"],
+        "latent_bpp_mip0": stats.get("latent_bpp_mip0"),
+        "file_bpp_chain": stats.get("file_bpp_chain"),
+        "bppc": stats.get("bppc"),
         "latent_stored_bytes": stats.get("latent_stored_bytes"),
         "latent_plain_bytes": stats.get("latent_plain_bytes"),
         "flags_coder": stats.get("latent_coder"),
@@ -102,7 +106,9 @@ def _run(job: dict, out: Path, precision: str) -> dict:
     }
     dest.write_text(json.dumps(row, indent=2))
     print(
-        f"{job['name']} psnr {row['psnr_u8']:.4f} bpp {row['total_bpp']:.4f} wall {wall:.1f}",
+        f"{job['name']} psnr {row['psnr_u8']:.4f} total_bpp {row['total_bpp']:.4f} "
+        f"latent_bpp_mip0 {row['latent_bpp_mip0']:.4f} file_bpp_chain {row['file_bpp_chain']:.4f} "
+        f"bppc {row['bppc']:.4f} wall {wall:.1f}",
         flush=True,
     )
     return row
@@ -138,6 +144,7 @@ def main() -> None:
         ("four extra materials, 4 seeds x 1k then 10k", 4 * 13000, 1.0),
         ("wood_floor 1k, 2 seeds x 1k then 4k", 5000, 16.0),
         ("two 2k materials, 2 seeds x 1k, batch 1024^2", 2000, 16.0),
+        ("sdk 2k x3 x5 latent rates, 4k cosine, batch 1024^2", 3 * 5 * 4000, 16.0),
     ]
     est = sum(steps * scale * SEC_PER_STEP_256 for _n, steps, scale in plan)
     print(f"estimate_s {est:.0f} from 118.1 s / 4000 steps, before early stop", flush=True)
@@ -165,6 +172,7 @@ def main() -> None:
             "mip_levels": kw.pop("mip_levels", 4),
             "adaptive_pool": kw.pop("adaptive_pool", 1),
             "grids": kw.pop("grids", G16),
+            "rate": kw.pop("rate", "payload"),
         }
         row.update(kw)
         return row
@@ -263,6 +271,33 @@ def main() -> None:
         batch=1024 * 1024,
         adaptive=2,
     )
+    # SDK materials at 2048. The target is latent_bpp_mip0, the same kind of
+    # number as ntc-cli --bitsPerPixel. Download with
+    # bench/download_materials.py --preset rtxntc. A missing directory is
+    # recorded and skipped.
+    for name in ("MetalPlates013_2K", "PavingStones070_2K", "Tiles135D_2K"):
+        for bpp in (2.5, 5, 10, 15, 20):
+            _run(
+                base(
+                    f"sdk_{name}_b{bpp}",
+                    root / name,
+                    4000,
+                    bpp,
+                    0,
+                    size=2048,
+                    batch_pixels=1024 * 1024,
+                    mip_levels=12,
+                    rate="latent",
+                    adaptive_pool=1,
+                    grids=None,
+                    warmup=400,
+                    schedule="cosine",
+                    eval_every=500,
+                    early_stop=6,
+                ),
+                args.out,
+                precision,
+            )
     print("wrote", args.out, flush=True)
 
 

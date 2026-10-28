@@ -109,6 +109,14 @@ void decode_uv(const TextureSet& ts, float u, float v, int mip, float* out);
 int pe_feature_count(int pe_mode, int pe_octaves);
 uint32_t payload_bytes(const TextureSet& ts);
 float total_bpp(const TextureSet& ts);
+// SDK latent rate: compressed latent codes + fp16 latent scales, per mip 0
+// texel. Excludes MLP weights, the header, and the descriptor tables.
+float latent_bpp_mip0(const TextureSet& ts);
+// Whole file, per texel of every mip declared in the header.
+float file_bpp_chain(const TextureSet& ts);
+// Paper rate: payload bits / (mip-chain texels * channel count).
+float bppc(const TextureSet& ts);
+int mip_chain_texels(const TextureSet& ts);
 
 // GPU descriptor. 84 uvec4s, matching the layout in shaders/ntc_decode.glsl.
 // `blob` is the file bytes followed by packed derived-mip payloads.

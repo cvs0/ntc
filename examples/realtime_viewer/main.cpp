@@ -1058,6 +1058,10 @@ int main(int argc, char** argv) {
             auto up = ntc::make_gpu_upload(ts, 0, ntc::kFilterFeatureTrilinear, 8);
             auto decoded = ntc::decode_mip(ts, 0);
             const int W = int(ts.width), H = int(ts.height), C = ts.num_channels();
+            const float bpp_total = ntc::total_bpp(ts);
+            const float bpp_latent = ntc::latent_bpp_mip0(ts);
+            const float bpp_file = ntc::file_bpp_chain(ts);
+            const float bpp_pc = ntc::bppc(ts);
             uint32_t sem[9];
             for (int i = 0; i < 9; ++i) sem[i] = 255;
             for (int i = 0; i < C && i < 16; ++i) {
@@ -1435,10 +1439,12 @@ int main(int argc, char** argv) {
                     ms_out = double(stamps[1] - stamps[0]) * double(props.limits.timestampPeriod) / 1e6;
                 if (shot || read) {
                     char line[180];
-                    std::snprintf(line, sizeof(line), "%s %dx%d %.2fMS FPS %.0f BPP %.3f VRAM %llu", label.c_str(), t.w,
-                                  t.h, ms_out, ms_out > 0.0 ? 1000.0 / ms_out : 0.0, double(ntc::total_bpp(ts)),
-                                  static_cast<unsigned long long>(vram));
+                    std::snprintf(line, sizeof(line), "%s %dx%d %.2fMS FPS %.0f VRAM %llu", label.c_str(), t.w, t.h,
+                                  ms_out, ms_out > 0.0 ? 1000.0 / ms_out : 0.0, static_cast<unsigned long long>(vram));
                     draw_text(static_cast<uint8_t*>(t.readback.mapped), int(t.w), int(t.h), 8, 8, line);
+                    std::snprintf(line, sizeof(line), "LAT %.2f FILE %.2f BPPC %.3f TOT %.2f", double(bpp_latent),
+                                  double(bpp_file), double(bpp_pc), double(bpp_total));
+                    draw_text(static_cast<uint8_t*>(t.readback.mapped), int(t.w), int(t.h), 8, 18, line);
                     if (shot) {
                         std::string path = shot_dir + "/" + label + ".png";
                         write_png(path, static_cast<uint8_t*>(t.readback.mapped), int(t.w), int(t.h));
@@ -1450,11 +1456,14 @@ int main(int argc, char** argv) {
             std::string path_json = ntcs[fi];
             for (char& ch : path_json)
                 if (ch == '\\') ch = '/';
-            json << "    {\"path\": \"" << path_json << "\", \"bpp\": " << ntc::total_bpp(ts) << ", \"vram_bytes\": " << vram
+            json << "    {\"path\": \"" << path_json << "\", \"total_bpp\": " << bpp_total
+                 << ", \"latent_bpp_mip0\": " << bpp_latent << ", \"file_bpp_chain\": " << bpp_file
+                 << ", \"bppc\": " << bpp_pc << ", \"vram_bytes\": " << vram
                  << ", \"width\": " << W << ", \"height\": " << H << ", \"channels\": " << C;
             if (!benchmark) {
                 json << ", \"interactive\": true}";
-                std::cout << ntcs[fi] << " bpp " << ntc::total_bpp(ts) << " vram " << vram << "\n";
+                std::cout << ntcs[fi] << " total_bpp " << bpp_total << " latent_bpp_mip0 " << bpp_latent
+                          << " file_bpp_chain " << bpp_file << " bppc " << bpp_pc << " vram " << vram << "\n";
                 std::cout << "keys: 1 ntc  2 bc7  3 bc1  4 astc  5 ref  h heatmap  j wipe  esc quit\n";
                 const int vw = 1280, vh = 720;
                 Target live = make_target(vw, vh);
