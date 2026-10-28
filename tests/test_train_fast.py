@@ -791,6 +791,32 @@ def test_recompile_limit_covers_every_mip_sample_count():
         dyn.recompile_limit = previous
 
 
+def test_clip_quantile_is_chosen_per_bit_depth():
+    from ntc.encode import CLIP_QUANTILE_BY_BITS, choose_clip_quantile, clip_quantile
+
+    rows = [
+        (4, 0.99, 24.295, 2.750),
+        (4, 0.995, 24.150, 2.747),
+        (4, 0.999, 24.199, 2.732),
+        (8, 0.99, 24.987, 4.354),
+        (8, 0.995, 24.996, 4.354),
+        (8, 0.999, 25.002, 4.362),
+    ]
+    picked = choose_clip_quantile(rows)
+    assert picked[4] == 0.99
+    assert picked[8] == 0.999
+    assert clip_quantile(4) == CLIP_QUANTILE_BY_BITS[4]
+    assert clip_quantile(8) == CLIP_QUANTILE_BY_BITS[8]
+    values = torch.ones(1, 32, 32)
+    values[0, 0, 0] = 40.0
+    # 0.99 ignores more of the spike than 0.999, so the 4-bit level is smaller.
+    four = _code_scale(values, 4)
+    eight = _code_scale(values, 8)
+    assert float(four[0]) < 40.0 / 7.5
+    assert float(eight[0]) < 40.0 / 127.5
+    assert torch.isfinite(four).all() and torch.isfinite(eight).all()
+
+
 def test_code_scale_uses_a_percentile_not_one_spike():
     values = torch.ones(2, 32, 32)
     values[0, 0, 0] = 50.0

@@ -170,7 +170,36 @@ def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
 
 # One hot texel used to set the whole channel's scale, so the rest of a
 # 2048 grid sat near the bin center and init PSNR stayed around 11 to 14 dB.
+# Per bit depth, chosen on CPU from three 32x32 sets and three seeds,
+# steps 0, grid (16, 16, 4, bits). Score is mean PSNR minus 0.4 dB per bpp,
+# the slope measured for this clip. 4-bit: 0.99 scored 23.195 against
+# 23.051 at 0.995 and 23.106 at 0.999. 8-bit: 0.999 scored 23.257 against
+# 23.254 at 0.995 and 23.245 at 0.99.
 PCA_CLIP_QUANTILE = 0.995
+CLIP_QUANTILE_BY_BITS = {4: 0.99, 8: 0.999}
+
+
+def clip_quantile(bits: int) -> float:
+    """Percentile used to set the latent scale at this code depth."""
+    if int(bits) >= 8:
+        return float(CLIP_QUANTILE_BY_BITS[8])
+    return float(CLIP_QUANTILE_BY_BITS[4])
+
+
+def choose_clip_quantile(rows: list[tuple[int, float, float, float]]) -> dict[int, float]:
+    """Pick a quantile per bit depth.
+
+    Each row is ``(bits, quantile, mean_psnr, mean_bpp)``. The score is
+    PSNR minus 0.4 dB for each bpp, so a point that only slides along the
+    measured slope does not win.
+    """
+    best: dict[int, tuple[float, float]] = {}
+    for bits, quantile, psnr, bpp in rows:
+        score = float(psnr) - 0.4 * float(bpp)
+        current = best.get(int(bits))
+        if current is None or score > current[0]:
+            best[int(bits)] = (score, float(quantile))
+    return {bits: pair[1] for bits, pair in best.items()}
 # The last-layer fit is unregularized lstsq on a random hidden layer. A weak
 # column becomes a huge weight. This ridge is in feature units.
 READOUT_RIDGE = 1e-2
@@ -233,7 +262,7 @@ def _code_scale(values: torch.Tensor, bits: int) -> torch.Tensor:
     """Per-channel scale from a high percentile of ``|values|``."""
     mid = ((1 << int(bits)) - 1) / 2.0
     flat = values.detach().abs().reshape(values.shape[0], -1).float()
-    level = torch.quantile(flat, PCA_CLIP_QUANTILE, dim=1).clamp(min=1e-3)
+    level = torch.quantile(flat, clip_quantile(int(bits)), dim=1).clamp(min=1e-3)
     return (level / mid).clamp(1e-4, 5.0).to(dtype=values.dtype)
 
 
