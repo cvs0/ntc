@@ -16,6 +16,7 @@ bilinear gather.
 
 from __future__ import annotations
 
+import hashlib
 import math
 import time
 from dataclasses import replace
@@ -53,6 +54,15 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
 # finished file: PavingStones b2.5 gained 2.7 dB, plateaued, and was a real
 # low-rate fit. A result is rejected only when trained PSNR is below init.
 NEAR_INIT_DB = 4.0
+
+# Measured stored/plain ratios on the 2K b2.5 grid (5 raw bpp): MetalPlates
+# about 0.28 (1.42 bpp), Tiles about 0.65 (3.24 bpp), PavingStones about
+# 0.78 (3.89 bpp). The search uses label/ratio as the packed target so the
+# file lands near the label. The clamp keeps a constant field from asking
+# for a huge grid and a noise field from asking for an empty one.
+RATE_SCALE_MIN = 0.15
+RATE_SCALE_MAX = 0.95
+_RATE_RATIO: dict[tuple, float] = {}
 
 # A mean loss over a 2048 frame puts per-texel code gradients near 1e-10
 # to 1e-11. Adam's default eps of 1e-8 then keeps only a few percent of the
@@ -1288,6 +1298,64 @@ def _load_resume_into_stack(stacked: StackedTrain, opt: torch.optim.Optimizer, c
     return opt
 
 
+def latent_coder_ratio(images: np.ndarray, semantics: list[int]) -> float:
+    """Stored/plain ratio of a PCA latent, one probe per image.
+
+    The probe grid is the half-resolution 4-bit pair the low-rate jobs use.
+    ``latent_rate_scale`` of 0 asks for this measurement. A positive scale
+    is left alone, which is how a process that already chose 0.5 keeps it.
+    """
+    channels, height, width = images.shape
+    del channels
+    sample = np.ascontiguousarray(images).reshape(-1)
+    step = max(1, sample.size // 4096)
+    digest = hashlib.sha1(sample[::step].tobytes()).hexdigest()
+    key = (images.shape, digest)
+    cached = _RATE_RATIO.get(key)
+    if cached is not None:
+        return cached
+    gw = max(4, (width // 2) // 2 * 2)
+    gh = max(4, (height // 2) // 2 * 2)
+    grids = [(gw, gh, 4, 4), (max(4, gw // 2), max(4, gh // 2), 4, 4)]
+    cfg = TrainConfig(
+        steps=0,
+        grids=grids,
+        target_bpp=1.0,
+        latent_deflate=True,
+        latent_coder="best",
+        rate="latent",
+        latent_rate_scale=1.0,
+        fast=True,
+        compile_step="off",
+        cuda_graph="off",
+        log_every=10**9,
+        mip_levels=1,
+        seed=0,
+        precision="fp32",
+        with_ssim=False,
+        adaptive_pool=1,
+        seed_pool=1,
+        eval_every=0,
+        early_stop=0,
+        pca_init=True,
+        min_latent_bits=0,
+    )
+    try:
+        _blob, stats = encode_arrays_fast(images, semantics, cfg)
+        plain = int(stats.get("latent_plain_bytes") or 0)
+        stored = int(stats.get("latent_stored_bytes") or 0)
+        if plain <= 0 or stored <= 0:
+            ratio = 0.5
+        else:
+            ratio = float(stored) / float(plain)
+    except Exception as exc:
+        print("latent rate probe failed, using 0.5", exc, flush=True)
+        ratio = 0.5
+    ratio = float(min(RATE_SCALE_MAX, max(RATE_SCALE_MIN, ratio)))
+    _RATE_RATIO[key] = ratio
+    return ratio
+
+
 def encode_arrays_fast(
     images: np.ndarray,
     semantics: list[int],
@@ -1315,6 +1383,14 @@ def encode_arrays_fast(
     channels, height, width = images.shape
     hidden = list(cfg.hidden)
     pe_mode = _PE[cfg.pe]
+    if (
+        cfg.grids is None
+        and cfg.rate == "latent"
+        and float(cfg.latent_rate_scale) <= 0
+    ):
+        ratio = latent_coder_ratio(images, semantics)
+        print(f"latent rate scale {ratio:.3f} from PCA codes", flush=True)
+        cfg = replace(cfg, latent_rate_scale=ratio)
     if cfg.grids is None:
         select_bpp = float(cfg.target_bpp)
         if cfg.rate == "latent" and 0 < float(cfg.latent_rate_scale) < 1:
@@ -1671,6 +1747,7 @@ def encode_arrays_fast(
         else 1.0,
         "batch_pixels": int(cfg.batch_pixels or 0),
         "batch_mip": str(cfg.batch_mip),
+        "latent_rate_scale": float(cfg.latent_rate_scale),
         "device": device_report(device),
         "steps": cfg.steps,
         "grids": [list(g) for g in grids],

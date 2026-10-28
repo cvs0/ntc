@@ -127,6 +127,7 @@ class TrainConfig:
     # 1 keeps the raw packed size as the selection target. Below 1, a latent
     # target is divided by this factor before the grid search, because the
     # file stores the deflate or range-coded bytes, not the packed size.
+    # 0 tells the fast path to measure that factor from the PCA codes.
     # encode_arrays does not read this.
     latent_rate_scale: float = 1.0
     # The fields below are read only by the fast path. encode_arrays ignores them.

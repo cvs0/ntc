@@ -94,7 +94,7 @@ def test_job_cost_and_cost_balanced_shards():
     assert sdk["batch_mip"] == "area"
     assert sdk["lr_batch_ref"] == 0
     assert sdk["min_latent_bits"] == 4
-    assert sdk["latent_rate_scale"] == 0.5
+    assert sdk["latent_rate_scale"] == 0.0
     assert job_cost(sdk) == (256 * 1024) * 4000
     assert by_name["wood_floor_2k_b16_s1000"]["batch_pixels"] == 256 * 1024
     assert by_name["wood_floor_2k_b16_s1000"]["min_latent_bits"] == 0

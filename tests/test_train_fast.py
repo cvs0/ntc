@@ -32,6 +32,7 @@ from ntc.train_fast import (
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
+    latent_coder_ratio,
     portable_step_plan,
     preferred_compile_mode,
     refill_sample_indices,
@@ -503,6 +504,76 @@ def test_nonfinite_checkpoint_is_not_resumed(tmp_path: Path):
     assert stats["steps_ran"] == 1
     assert np.isfinite(stats["psnr_u8_init"])
     assert np.isfinite(stats["psnr_u8_trained"])
+    assert np.isfinite(stats["metrics"]["psnr_u8"])
+
+
+def test_pca_code_ratio_aims_each_material_at_its_label():
+    """A smooth field and a noise field must not share the 0.5 scale.
+
+    MetalPlates stored 1.42 bpp at the b2.5 label, Tiles 3.24, and
+    PavingStones 3.89, because one scale sized every grid at 5 raw bpp.
+    The measured stored/plain ratio is the scale, so label/ratio is the
+    packed target and a higher label does not pick a smaller grid.
+    """
+    from ntc.grids import latent_payload_bits, select_grids
+
+    n = 32
+    smooth = np.zeros((3, n, n), np.float32)
+    smooth[0] = np.linspace(0.0, 1.0, n, dtype=np.float32)[None, :]
+    smooth[1] = np.linspace(1.0, 0.0, n, dtype=np.float32)[:, None]
+    smooth[2] = 0.4
+    noise = np.random.default_rng(0).random((3, n, n), dtype=np.float32)
+    sems = [0, 1, 2]
+    smooth_ratio = latent_coder_ratio(smooth, sems)
+    noise_ratio = latent_coder_ratio(noise, sems)
+    assert smooth_ratio < noise_ratio
+    assert 0.15 <= smooth_ratio <= 0.95
+    assert 0.15 <= noise_ratio <= 0.95
+    label = 4.0
+
+    def _picked(ratio: float, bpp: float):
+        return select_grids(
+            n, n, bpp / ratio, [32], 3, 0, 0, 8, 0, rate="latent", min_bits=4
+        )[0]
+
+    def _file_error(ratio: float, raw_target: float) -> float:
+        grids = select_grids(
+            n, n, raw_target, [32], 3, 0, 0, 8, 0, rate="latent", min_bits=4
+        )[0]
+        raw = latent_payload_bits(grids) / float(n * n)
+        return abs(raw * ratio - label)
+
+    for ratio in (smooth_ratio, noise_ratio):
+        calibrated = _file_error(ratio, label / ratio)
+        fixed = _file_error(ratio, label / 0.5)
+        assert calibrated <= fixed + 1e-6
+    low = _picked(smooth_ratio, 2.5)
+    high = _picked(smooth_ratio, 10.0)
+    assert latent_payload_bits(high) >= latent_payload_bits(low)
+    _blob, stats = encode_arrays_fast(
+        smooth,
+        sems,
+        TrainConfig(
+            steps=0,
+            target_bpp=label,
+            grids=None,
+            rate="latent",
+            latent_rate_scale=0.0,
+            latent_deflate=True,
+            latent_coder="best",
+            min_latent_bits=4,
+            fast=True,
+            compile_step="off",
+            cuda_graph="off",
+            log_every=10**9,
+            mip_levels=1,
+            seed=0,
+            with_ssim=False,
+            adaptive_pool=1,
+            seed_pool=1,
+        ),
+    )
+    assert abs(float(stats["latent_rate_scale"]) - smooth_ratio) < 1e-6
     assert np.isfinite(stats["metrics"]["psnr_u8"])
 
 

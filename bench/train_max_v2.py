@@ -483,7 +483,10 @@ def _select_job_grids(job: dict) -> list:
     from ntc.grids import select_grids
 
     bpp = float(job["bpp"])
-    scale = float(job.get("latent_rate_scale") or 1.0)
+    # An unmeasured scale is 0 until the PCA probe. The GPU lock still uses
+    # the historical 0.5 estimate so a b5-sized grid is not treated as small.
+    raw_scale = job.get("latent_rate_scale")
+    scale = 0.5 if raw_scale is None or float(raw_scale) <= 0 else float(raw_scale)
     if str(job.get("rate") or "payload") == "latent" and 0 < scale < 1:
         bpp = bpp / scale
     size = int(job["size"])
@@ -581,14 +584,6 @@ def _run_claimed(
     ckpt: Path,
     stale_s: float = 86400.0,
 ) -> dict:
-    if not job.get("_gpu_held") and is_dense_2k(job):
-        _wait_dense_gpu(out, stale_s)
-        held = dict(job)
-        held["_gpu_held"] = True
-        try:
-            return _run_claimed(held, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
-        finally:
-            release_job(out, GPU_DENSE_LOCK)
     if dest.is_file():
         prev = json.loads(dest.read_text())
         if prev.get("done"):
@@ -600,7 +595,31 @@ def _run_claimed(
         dest.write_text(json.dumps(row, indent=2))
         print("missing", job["name"], mat, flush=True)
         return row
-    images, sems, _info = load_material(mat, int(job["size"]))
+    loaded = job.get("_loaded")
+    if loaded is None:
+        images, sems, _info = load_material(mat, int(job["size"]))
+    else:
+        images, sems, _info = loaded
+    if (
+        str(job.get("rate") or "") == "latent"
+        and job.get("grids") is None
+        and float(job.get("latent_rate_scale") or 0) <= 0
+    ):
+        from ntc.train_fast import latent_coder_ratio
+
+        ratio = latent_coder_ratio(images, sems)
+        job = dict(job)
+        job["latent_rate_scale"] = ratio
+        print(f"latent rate scale {job['name']} {ratio:.3f}", flush=True)
+    if not job.get("_gpu_held") and is_dense_2k(job):
+        _wait_dense_gpu(out, stale_s)
+        held = dict(job)
+        held["_gpu_held"] = True
+        held["_loaded"] = (images, sems, _info)
+        try:
+            return _run_claimed(held, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
+        finally:
+            release_job(out, GPU_DENSE_LOCK)
     job = apply_rate_neighbor(job, out)
     cfg = TrainConfig(
         steps=int(job["steps"]),
@@ -676,7 +695,7 @@ def _run_claimed(
         "lr_batch_ref": int(job.get("lr_batch_ref", 0)),
         "batch_mip": str(stats.get("batch_mip", job.get("batch_mip", "flat"))),
         "target_bpp": float(job["bpp"]),
-        "latent_rate_scale": float(job.get("latent_rate_scale", 1.0)),
+        "latent_rate_scale": float(stats.get("latent_rate_scale", job.get("latent_rate_scale", 1.0))),
         "min_latent_bits": int(job.get("min_latent_bits", 0)),
         "compiled": stats.get("compiled"),
         "compile_mode": stats.get("compile_mode"),
@@ -844,10 +863,11 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
             row["batch_pixels"] = 256 * 1024
             row["batch_mip"] = "area"
         if row.get("rate") == "latent":
-            # Drop 2-bit ties, and aim the packed grid above the label because
-            # the file keeps the coded bytes. 0.5 is the smooth-latent ratio.
+            # Drop 2-bit ties. Scale 0 measures stored/plain on this
+            # material's PCA codes when the job is claimed. A process that
+            # already built this list with 0.5 keeps that list until it exits.
             row["min_latent_bits"] = 4
-            row["latent_rate_scale"] = 0.5
+            row["latent_rate_scale"] = 0.0
     return jobs
 
 
