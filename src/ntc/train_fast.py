@@ -202,18 +202,30 @@ def _mesh_uv(height: int, width: int, device: torch.device) -> torch.Tensor:
     )
 
 
-def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
-    """``codes`` ``[S,C,H,W]``, ``uv`` ``[N,2]`` in ``[0,1]``. Returns ``[S,N,C]``.
+def _segment_add(dest: torch.Tensor, index: torch.Tensor, values: torch.Tensor) -> None:
+    """Add ``values`` ``[S,C,N]`` into ``dest`` ``[S,C,HW]`` at ``index`` ``[N]``.
 
-    Same taps as ``bilinear_codes_torch``: pixel centers at integer + 0.5,
-    wrapped with remainder. CUDA may use a Triton kernel after a numeric check.
+    Indices are sorted and each texel is summed in that order. An atomic
+    scatter-add changes the float result when several samples hit one texel,
+    which made the same seed train to different files.
     """
-    if codes.is_cuda:
-        from ntc.triton_bilinear import try_triton_bilinear
+    if index.numel() == 0:
+        return
+    order = torch.argsort(index, stable=True)
+    index_s = index[order]
+    values_s = values[:, :, order]
+    _unique, counts = torch.unique_consecutive(index_s, return_counts=True)
+    ends = torch.cumsum(counts, 0) - 1
+    csum = torch.cumsum(values_s, dim=2)
+    gathered = csum.index_select(2, ends)
+    prev = ends - counts
+    prev_vals = csum.index_select(2, prev.clamp(min=0))
+    first = (prev < 0).view(1, 1, -1)
+    summed = torch.where(first, gathered, gathered - prev_vals)
+    dest.index_add_(2, index_s[ends], summed)
 
-        fused = try_triton_bilinear(codes, uv)
-        if fused is not None:
-            return fused
+
+def _bilinear_forward(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     _s, _c, height, width = codes.shape
     x = uv[:, 0] * width - 0.5
     y = uv[:, 1] * height - 0.5
@@ -240,6 +252,62 @@ def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     a = c00 + (c01 - c00) * tx
     b = c10 + (c11 - c10) * tx
     return a + (b - a) * ty
+
+
+class _BilinearDeterministic(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(uv)
+        ctx.code_shape = tuple(codes.shape)
+        return _bilinear_forward(codes, uv)
+
+    @staticmethod
+    def backward(ctx, grad_out: torch.Tensor):
+        uv, = ctx.saved_tensors
+        seeds, channels, height, width = ctx.code_shape
+        x = uv[:, 0] * width - 0.5
+        y = uv[:, 1] * height - 0.5
+        x0 = torch.floor(x)
+        y0 = torch.floor(y)
+        tx = (x - x0).view(1, -1, 1)
+        ty = (y - y0).view(1, -1, 1)
+        x0i = torch.remainder(x0.to(torch.long), width)
+        x1i = torch.remainder(x0i + 1, width)
+        y0i = torch.remainder(y0.to(torch.long), height)
+        y1i = torch.remainder(y0i + 1, height)
+        grad = grad_out.new_zeros(seeds, channels, height * width)
+        w00 = (1 - tx) * (1 - ty)
+        w01 = tx * (1 - ty)
+        w10 = (1 - tx) * ty
+        w11 = tx * ty
+
+        def splat(yy: torch.Tensor, xx: torch.Tensor, weight: torch.Tensor) -> None:
+            values = (grad_out * weight).permute(0, 2, 1).contiguous()
+            _segment_add(grad, yy * width + xx, values)
+
+        splat(y0i, x0i, w00)
+        splat(y0i, x1i, w01)
+        splat(y1i, x0i, w10)
+        splat(y1i, x1i, w11)
+        return grad.view(seeds, channels, height, width), None
+
+
+def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
+    """``codes`` ``[S,C,H,W]``, ``uv`` ``[N,2]`` in ``[0,1]``. Returns ``[S,N,C]``.
+
+    Same taps as ``bilinear_codes_torch``: pixel centers at integer + 0.5,
+    wrapped with remainder. The backward sums taps in sorted index order.
+    CUDA may use a Triton kernel after a numeric check.
+    """
+    if codes.is_cuda and not codes.requires_grad:
+        from ntc.triton_bilinear import try_triton_bilinear
+
+        fused = try_triton_bilinear(codes, uv)
+        if fused is not None:
+            return fused
+    if codes.requires_grad or uv.requires_grad:
+        return _BilinearDeterministic.apply(codes, uv)
+    return _bilinear_forward(codes, uv)
 
 
 def _leading_box(values: torch.Tensor, fn) -> torch.Tensor | None:

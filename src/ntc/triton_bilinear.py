@@ -140,10 +140,11 @@ def _eager_backward(codes: torch.Tensor, uv: torch.Tensor, grad_out: torch.Tenso
     w11 = tx * ty
 
     def splat(yy, xx, weight):
-        # grad_out [S,N,C] -> codes [S,C,H,W]
-        g = (grad_out * weight).permute(0, 2, 1)  # [S, C, N]
-        idx = (yy * width + xx).view(1, 1, -1).expand_as(g)
-        grad.view(grad.shape[0], grad.shape[1], -1).scatter_add_(2, idx, g)
+        # Sorted segment sum. Atomic scatter-add is not repeatable.
+        from ntc.train_fast import _segment_add
+
+        values = (grad_out * weight).permute(0, 2, 1).contiguous()
+        _segment_add(grad.view(grad.shape[0], grad.shape[1], -1), yy * width + xx, values)
 
     splat(y0i, x0i, w00)
     splat(y0i, x1i, w01)

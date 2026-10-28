@@ -707,6 +707,48 @@ def test_w8_shaped_runs_do_not_ship_a_collapse():
         assert isinstance(stats["lr_rewinds"], int)
 
 
+def test_same_seed_exports_the_same_bytes():
+    import hashlib
+
+    img = np.linspace(0.0, 1.0, 3 * 16 * 16, dtype=np.float32).reshape(3, 16, 16)
+    cfg = TrainConfig(
+        steps=2,
+        hidden=(8,),
+        grids=[(8, 8, 2, 4)],
+        fast=True,
+        adaptive_pool=1,
+        seed_pool=1,
+        with_ssim=False,
+        log_every=10**9,
+        mip_levels=2,
+        seed=3,
+        compile_step="off",
+        cuda_graph="off",
+        precision="fp32",
+    )
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        first, _stats_a = encode_arrays_fast(img, [0, 1, 2], cfg)
+        second, _stats_b = encode_arrays_fast(img, [0, 1, 2], cfg)
+    finally:
+        torch.set_num_threads(threads)
+    assert hashlib.sha256(first).hexdigest() == hashlib.sha256(second).hexdigest()
+
+
+def test_bilinear_backward_is_repeatable():
+    codes = torch.randn(2, 3, 5, 5, requires_grad=True)
+    uv = torch.rand(11, 2)
+    first = bilinear_batched(codes, uv)
+    first.sum().backward()
+    grad_a = codes.grad.detach().clone()
+    codes.grad = None
+    second = bilinear_batched(codes, uv)
+    second.sum().backward()
+    assert torch.equal(grad_a, codes.grad)
+    assert torch.allclose(first, second)
+
+
 def test_recompile_limit_covers_every_mip_sample_count():
     import torch._dynamo.config as dyn
 
