@@ -496,6 +496,9 @@ def encode_arrays(
     cfg: TrainConfig,
 ) -> tuple[bytes, dict]:
     """``images`` is float32 ``[C,H,W]`` in ``[0,1]``."""
+    images = np.asarray(images)
+    if images.size == 0 or not np.isfinite(images).all():
+        raise ValueError("image has a non-finite value")
     if cfg.target_psnr is not None:
         return _encode_for_psnr(images, semantics, cfg)
     if cfg.fast:

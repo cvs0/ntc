@@ -330,6 +330,30 @@ def test_range_coder_roundtrip_and_truncated():
     assert raised
 
 
+def test_non_finite_image_is_rejected():
+    from ntc.encode import TrainConfig, encode_arrays
+
+    img = np.zeros((1, 4, 4), np.float32)
+    img[0, 0, 0] = np.nan
+    cfg = TrainConfig(
+        steps=1,
+        hidden=(4,),
+        grids=[(4, 4, 1, 4)],
+        seed=0,
+        seed_pool=1,
+        adaptive_pool=1,
+        with_ssim=False,
+        fast=False,
+        log_every=10**9,
+    )
+    try:
+        encode_arrays(img, [0], cfg)
+        raised = False
+    except ValueError as exc:
+        raised = "non-finite" in str(exc)
+    assert raised
+
+
 def test_encode_odd_size_single_channel_is_finite_and_deterministic():
     from ntc.decode_ref import decode_mip
     from ntc.encode import TrainConfig, encode_arrays
