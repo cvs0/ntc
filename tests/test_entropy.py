@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from ntc.entropy import file_rate_bpp, laplace_bits
+from ntc.entropy import blend_file_rate_scale, file_rate_bpp, laplace_bits
 from ntc.range_coder import range_encode
 
 
@@ -35,6 +35,25 @@ def test_file_rate_does_not_penalize_a_coder_that_is_under_the_label():
     assert float(file_rate_bpp(model, 0.55)) < 2.5
     assert float(file_rate_bpp(model, 1.0)) > 2.5
     assert float(file_rate_bpp(model, 0.0)) == pytest.approx(4.0)
+
+
+def test_metal_file_rate_moves_onto_the_label_and_tiles_does_not():
+    """MetalPlates b2.5 landed at 2.79 bpp after the PCA scale stayed 0.40.
+
+    Two updates of a 5 bpp Laplace bring the penalty ratio over 2.5. Tiles
+    at scale 0.511 with a file under the label does not move, so a raw
+    Laplace near 4 bpp is still not penalized.
+    """
+    current = 0.40
+    for _ in range(2):
+        current = blend_file_rate_scale(current, 0.40, 2.79, 5.0)
+    assert current * 5.0 > 2.5
+    assert current < 0.95
+    tiles = blend_file_rate_scale(0.511, 0.511, 2.20, 4.3)
+    assert abs(tiles - 0.511) < 0.01
+    assert float(file_rate_bpp(torch.tensor(4.3), tiles)) < 2.5
+    # No probe: the ratio is not applied.
+    assert blend_file_rate_scale(1.0, 0.0, 2.79, 5.0) == pytest.approx(1.0)
 
 
 def test_trained_laplace_rate_is_within_3_percent_on_three_smooth_sets():

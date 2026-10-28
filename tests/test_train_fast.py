@@ -28,6 +28,7 @@ from ntc.train_fast import (
     _mesh_uv,
     _psnr_from_mse,
     _psnr_per_seed,
+    _quant_phase,
     _reported_best_val,
     _require_finite_stats,
     _rewind_if_below_init,
@@ -251,13 +252,13 @@ def test_fullres_grid_raises_a_sparse_batch():
     )
     assert coarse8 == 256 * 1024
     assert coarse8_mode == "area"
-    # PavingStones b2.5: 12 channels is the finest lattice, so the flat
-    # quarter frame stays.
+    # 12 channels at 512 is quarter resolution. 512^2 texels fit in the
+    # 256K area batch. The flat quarter frame is for half resolution and up.
     paving, paving_mode = fullres_batch_floor(
         2048, 2048, [(512, 512, 12, 4), (256, 256, 12, 4)], 256 * 1024, "area"
     )
-    assert paving == image // 4
-    assert paving_mode == "flat"
+    assert paving == 256 * 1024
+    assert paving_mode == "area"
 
 
 def test_fullres_sparse_batch_trains_above_init():
@@ -807,6 +808,59 @@ def test_quant_schedule_file_stays_near_the_loop():
         ),
     )
     assert abs(float(stats["metrics"]["psnr_u8"]) - float(stats["psnr_u8_loop"])) < 0.1
+
+
+def test_dense_quarter_frame_matches_the_loop():
+    """In-loop PSNR and the decoded file stay together on a flat quarter frame.
+
+    PavingStones b2.5 logged 25.26 dB at batch 1048576 and the file scored
+    10.32. The stand-in is the same ratio: 12-channel quarter-resolution
+    grid, flat batch of image//4, quant schedule, and the file coder.
+    """
+    rng = np.random.default_rng(7)
+    n = 32
+    img = rng.random((3, n, n), dtype=np.float32)
+    img[:, ::2, :] *= 0.25
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=24,
+            hidden=(16,),
+            grids=[(n // 4, n // 4, 12, 4), (n // 8, n // 8, 4, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=6,
+            seed=2,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            quant_schedule=True,
+            entropy_rate=True,
+            target_bpp=2.5,
+            latent_rate_scale=0.65,
+            rate="latent",
+            batch_pixels=(n * n) // 4,
+            batch_mip="flat",
+            eval_every=8,
+            early_stop=2,
+        ),
+    )
+    assert stats["batch_pixels"] == (n * n) // 4
+    assert abs(float(stats["metrics"]["psnr_u8"]) - float(stats["psnr_u8_loop"])) < 0.25
+    assert abs(float(stats["psnr_u8_trained"]) - float(stats["psnr_u8_loop"])) < 0.25
+
+
+def test_quant_phase_changes_at_the_hard_code_window():
+    cfg = TrainConfig(steps=4000, quant_schedule=True, quant_freeze_at=0.95)
+    assert _quant_phase(cfg, 2799) == "noise"
+    assert _quant_phase(cfg, 2800) == "ste"
+    assert _quant_phase(cfg, 3799) == "ste"
+    assert _quant_phase(cfg, 3800) == "frozen"
+    assert _quant_phase(TrainConfig(steps=4000, quant_schedule=False), 3999) == "off"
 
 
 def test_same_seed_exports_the_same_bytes():

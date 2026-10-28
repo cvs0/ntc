@@ -116,10 +116,16 @@ def fullres_batch_floor(
     # 8 channels at 512: the coarse 8 is not that failure, and treating it
     # as one forced a flat quarter frame (20 steps/s) onto the half-res grid.
     finest_ch = int(finest_grid[2])
+    # 1024 on a 2048 image is half resolution. 512 is quarter resolution:
+    # 512^2 texels fit in the 256K area batch. PavingStones b2.5 on 27cbd68
+    # was a 12-channel 512 grid, the channel test raised it to batch
+    # 1048576, the loop reached 25.26 dB, and the file scored 10.32.
+    side = max(int(finest_grid[0]), int(finest_grid[1]))
+    half_or_finer = side * 2 >= max(int(width), int(height))
     wide_or_deep = (
         any(int(g[3]) >= 8 for g in grids)
         or finest >= max(image // 2, 1)
-        or finest_ch >= 8
+        or (finest_ch >= 8 and half_or_finer)
     )
     if not wide_or_deep:
         return int(batch_pixels), str(batch_mip)
@@ -546,6 +552,9 @@ class StackedTrain(nn.Module):
         out.quantize = self.quantize
         out.quantize_weights = self.quantize_weights
         out.allow_weight_qat = self.allow_weight_qat
+        src_scale = getattr(self, "file_rate_scale", None)
+        if src_scale is not None and getattr(out, "file_rate_scale", None) is None:
+            out.register_buffer("file_rate_scale", src_scale.detach().clone())
         with torch.no_grad():
             for dst, src in zip(out.latents, self.latents, strict=True):
                 dst.copy_(src.index_select(0, index))
@@ -1003,7 +1012,11 @@ def _loss_from_mips(
             pixels = max(1, height * width * stacked.n_seeds)
             model_bpp = latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels)
             # The label is file bpp. Scale the model by the coder ratio first.
-            rate_bpp = file_rate_bpp(model_bpp, float(cfg.latent_rate_scale))
+            scale_t = getattr(stacked, "file_rate_scale", None)
+            if scale_t is None:
+                rate_bpp = file_rate_bpp(model_bpp, float(cfg.latent_rate_scale))
+            else:
+                rate_bpp = file_rate_bpp(model_bpp, scale_t)
             excess = (rate_bpp - float(cfg.target_bpp)).clamp(min=0.0)
             weight = 0.002 / max(float(cfg.target_bpp), 0.5)
             distortion = distortion + excess * weight
@@ -1022,16 +1035,32 @@ def _drop_latent_grads(stacked: StackedTrain, opt: torch.optim.Optimizer) -> Non
             param.grad = None
 
 
-def _sync_quant_schedule(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
-    """Noise, then hard codes, then a short MLP-only tail."""
+def _quant_phase(cfg: TrainConfig, step: int) -> str:
+    """``noise``, ``ste``, ``frozen``, or ``off`` when the schedule is disabled.
+
+    A CUDA graph captures the phase of its first step and replays those
+    kernels. The caller drops the graph when this value changes.
+    """
     if not cfg.quant_schedule or int(cfg.steps) <= 0:
-        return
+        return "off"
     frac = float(step + 1) / float(cfg.steps)
     freeze_at = float(getattr(cfg, "quant_freeze_at", 0.95) or 0.95)
     if frac <= 0.70:
+        return "noise"
+    if frac <= freeze_at:
+        return "ste"
+    return "frozen"
+
+
+def _sync_quant_schedule(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
+    """Noise, then hard codes, then a short MLP-only tail."""
+    phase = _quant_phase(cfg, step)
+    if phase == "off":
+        return
+    if phase == "noise":
         stacked.latent_proxy = "noise"
         stacked.freeze_latents = False
-    elif frac <= freeze_at:
+    elif phase == "ste":
         stacked.latent_proxy = "ste"
         stacked.freeze_latents = False
     else:
@@ -1098,6 +1127,49 @@ def _format_eta(seconds: float) -> str:
     return f"{secs}s"
 
 
+def measure_latent_file_bpp(stacked: StackedTrain, pixels: int) -> float:
+    """Stored latent bpp of seed 0, min(deflate, order-1 range), header excluded.
+
+    The PCA ``latent_rate_scale`` is this ratio on the init codes. Trained
+    codes are less peaked, so the same ratio underestimates the file.
+    """
+    if stacked.n_seeds != 1 or int(pixels) <= 0:
+        return float("nan")
+    from ntc.container import deflate_raw, pack_codes
+    from ntc.range_coder import range_encode
+
+    parts = []
+    for lat, bits in zip(stacked.latents, stacked.grid_bits, strict=True):
+        code = torch.round(lat[0].detach().float().cpu()).clamp(0, (1 << int(bits)) - 1)
+        packed, _stride, _plane = pack_codes(code.to(torch.uint8).numpy(), int(bits))
+        parts.append(packed)
+    plain = b"".join(parts)
+    if not plain:
+        return float("nan")
+    stored = min(len(deflate_raw(plain)), len(range_encode(plain)))
+    return (8.0 * stored) / float(pixels)
+
+
+def _refresh_file_rate_scale(stacked: StackedTrain, cfg: TrainConfig, pixels: int) -> None:
+    """Blend the penalty ratio toward the coder ratio of the current codes."""
+    scale_t = getattr(stacked, "file_rate_scale", None)
+    if scale_t is None or stacked.n_seeds != 1 or not cfg.entropy_rate:
+        return
+    if not (0.0 < float(cfg.latent_rate_scale) < 1.0):
+        return
+    from ntc.entropy import blend_file_rate_scale, latent_rate_bits
+
+    model = float(latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels))
+    measured = measure_latent_file_bpp(stacked, pixels)
+    updated = blend_file_rate_scale(
+        float(scale_t.detach().cpu()),
+        float(cfg.latent_rate_scale),
+        measured,
+        model,
+    )
+    scale_t.fill_(updated)
+
+
 def _log_progress(
     cfg: TrainConfig,
     step: int,
@@ -1121,9 +1193,19 @@ def _log_progress(
         raise RuntimeError("non-finite loss")
     psnr_txt = ""
     if images is not None and step % (every * 5) == 0:
+        # Past the noise window the line is the exportable model. A graph
+        # replay does not rerun ``_sync_quant_schedule``, so the proxy can
+        # still say noise at a step that should be hard codes.
+        if _quant_phase(cfg, step - 1) in ("ste", "frozen"):
+            stacked.latent_proxy = "ste"
+            stacked.quantize = True
+            stacked.quantize_weights = True
         device = stacked.latents[0].device
         score = max(_psnr_per_seed(stacked, images, device))
         psnr_txt = f" psnr {score:.2f}"
+        height = int(images.shape[-2])
+        width = int(images.shape[-1])
+        _refresh_file_rate_scale(stacked, cfg, height * width)
     name = cfg.job_name or "train"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(
@@ -1389,12 +1471,26 @@ def _run_loop(
     total_steps = int(cfg.steps) if int(cfg.steps) > start_step else start_step + steps
     t0 = time.perf_counter()
     if graph is not None:
+        phase = _quant_phase(cfg, start_step)
         for step in range(start_step, start_step + steps):
+            # The capture baked the phase of ``start_step``. Replaying it
+            # through the hard-code window keeps the noise kernels while the
+            # log scores a different forward than the file.
+            if _quant_phase(cfg, step) != phase:
+                graph = None
+                for eager_step in range(step, start_step + steps):
+                    loss = one_step(eager_step, replay=False)
+                    _log_progress(
+                        cfg, eager_step + 1, total_steps, loss, t0, start_step, stacked, progress_images
+                    )
+                    _rewind_if_below_init(stacked, rewind, eager_step + 1, int(cfg.steps), int(cfg.seed))
+                break
             # Sample indices and the learning-rate tensor are written before
             # replay. The captured kernels only read them.
             _group_lr(step)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph.replay()
+            _sync_quant_schedule(stacked, cfg, step)
             _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
             if static_loss is not None and step == start_step + steps - 1:
                 _log_progress(cfg, step + 1, total_steps, static_loss, t0, start_step, stacked, progress_images)
@@ -1896,6 +1992,13 @@ def encode_arrays_fast(
         {k: v.detach().cpu().clone() for k, v in net.state_dict().items()} for net in nets
     ]
     stacked = StackedTrain(nets)
+    # Read each step. A Python float is baked into a compiled graph; this
+    # buffer is the storage the kernels load, so a later measurement moves
+    # the penalty without a recompile.
+    stacked.register_buffer(
+        "file_rate_scale",
+        torch.tensor(float(cfg.latent_rate_scale), device=device),
+    )
     amp_dtype = None
     if cfg.precision == "bf16":
         amp_dtype = torch.bfloat16
@@ -2099,6 +2202,12 @@ def encode_arrays_fast(
             with torch.no_grad():
                 for param, src in zip(stacked.parameters(), rewind["last_good"], strict=True):
                     param.copy_(src)
+    # The file is hard-rounded codes. Score that same forward, not a noise
+    # sample left over from a CUDA graph that never left the noise phase.
+    if _quant_phase(cfg, max(int(cfg.steps) - 1, 0)) in ("ste", "frozen", "off"):
+        stacked.latent_proxy = "ste"
+        stacked.quantize = True
+        stacked.quantize_weights = True
     scores = _psnr_per_seed(stacked, images_bank if images_bank.shape[0] == stacked.n_seeds else target, device)
     winner = int(max(range(stacked.n_seeds), key=lambda i: scores[i]))
     # Export through the ordinary writer so the file matches the slow path.
@@ -2110,7 +2219,7 @@ def encode_arrays_fast(
 
     ref = np.transpose(images, (1, 2, 0))
 
-    def _export_current() -> tuple[bytes, np.ndarray, float]:
+    def _export_current(which: str | None = None) -> tuple[bytes, np.ndarray, float]:
         stacked.write_seed(winner, export_net)
         exported = export_network(
             export_net,
@@ -2119,7 +2228,7 @@ def encode_arrays_fast(
             height,
             num_mips,
             latent_deflate=cfg.latent_deflate,
-            latent_coder=coder,
+            latent_coder=which if which is not None else coder,
         )
         parsed = parse_texture_set(exported)
         decoded = _decode(parsed, 0)
@@ -2130,6 +2239,15 @@ def encode_arrays_fast(
     # file was 33.07, so the loop ranking is not the file. Keep whichever
     # of the two decodes higher. A warmup dip must not replace a later file.
     blob, recon, trained_psnr = _export_current()
+    loop_score = float(scores[winner])
+    # A compressed payload that does not round-trip scores far from the live
+    # forward. Raw is the same codes without the coder. Keep it when it is
+    # the closer of the two decodes.
+    if coder != "raw" and abs(loop_score - float(trained_psnr)) > 1.0:
+        blob_r, recon_r, raw_psnr = _export_current("raw")
+        if abs(loop_score - float(raw_psnr)) + 0.05 < abs(loop_score - float(trained_psnr)):
+            blob, recon, trained_psnr = blob_r, recon_r, raw_psnr
+            coder = "raw"
     if best_state is not None:
         final_params = [p.detach().clone() for p in stacked.parameters()]
         with torch.no_grad():
@@ -2155,7 +2273,10 @@ def encode_arrays_fast(
         )
         recon_i = _decode(parse_texture_set(blob_i), 0)
         init_psnr = psnr_u8(recon_i, ref)
-        if _better_psnr(init_psnr, trained_psnr):
+        # PavingStones b2.5 logged 25.26 dB and the file scored 10.32, under
+        # the 23.04 init. Replacing the weights with the init deleted the fit.
+        disagree = abs(loop_score - float(trained_psnr)) > 1.0 and loop_score >= float(init_psnr)
+        if _better_psnr(init_psnr, trained_psnr) and not disagree:
             blob, recon, kept = blob_i, recon_i, "init"
             ts = parse_texture_set(blob)
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
@@ -2205,6 +2326,7 @@ def encode_arrays_fast(
         "psnr_u8_init": init_psnr,
         "psnr_u8_trained": trained_psnr,
         "psnr_u8_loop": float(scores[winner]),
+        "score_gap": abs(float(scores[winner]) - float(trained_psnr)) > 1.0,
         "stopped_early": stopped_early,
         # The loop score is a live quantized forward. The file score is the
         # decoded 8-bit image. On b10 those two were 12.67 and 33.07. Report

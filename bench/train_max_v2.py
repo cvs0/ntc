@@ -94,6 +94,24 @@ def below_init(trained: object, init: object) -> bool:
     return float(trained) < float(init)
 
 
+def score_gap_blocks_collapse(loop: object, trained: object, init: object) -> bool:
+    """True when the live forward still beats the init and the file does not.
+
+    PavingStones b2.5 on 27cbd68 logged 25.26 dB. The file scored 10.32, under
+    the 23.04 init, so the job was collapsed and the checkpoint was deleted.
+    A gap over 1 dB is not that below-init rule.
+    """
+    if not isinstance(loop, (int, float)) or not isinstance(trained, (int, float)):
+        return False
+    if not isinstance(init, (int, float)):
+        return False
+    if not math.isfinite(float(loop)) or not math.isfinite(float(trained)) or not math.isfinite(float(init)):
+        return False
+    if abs(float(loop) - float(trained)) <= 1.0:
+        return False
+    return float(loop) >= float(init) and float(trained) < float(init)
+
+
 def collapse_reason(trained: float, init: float, effective: int, pixels: int) -> str:
     """Why a below-init json is left ``done`` false."""
     if int(effective) >= max(int(pixels) // 4, 1):
@@ -794,6 +812,8 @@ def _run_claimed(
         "steps_ran": stats.get("steps_ran"),
         "psnr_u8_init": stats.get("psnr_u8_init"),
         "psnr_u8_trained": stats.get("psnr_u8_trained"),
+        "psnr_u8_loop": stats.get("psnr_u8_loop"),
+        "score_gap": bool(stats.get("score_gap")),
         "seed": stats.get("seed"),
         "grids": stats.get("grids"),
         "stopped_early": stats.get("stopped_early"),
@@ -823,8 +843,19 @@ def _run_claimed(
     ntc_path.write_bytes(blob)
     trained = row.get("psnr_u8_trained")
     init = row.get("psnr_u8_init")
+    loop = row.get("psnr_u8_loop")
     pixels = int(job["size"]) * int(job["size"])
     effective = int(row.get("batch_pixels") or 0)
+    if score_gap_blocks_collapse(loop, trained, init):
+        row["done"] = False
+        row["collapsed"] = False
+        row["error"] = (
+            f"loop PSNR {float(loop):.2f} and file PSNR {float(trained):.2f} disagree; "
+            f"init {float(init):.2f}; checkpoint kept"
+        )
+        print("score gap", job["name"], row["error"], flush=True)
+        dest.write_text(json.dumps(row, indent=2))
+        return row
     retry_batch = dense_retry_batch(trained, init, effective, pixels, bool(job.get("_fallback")))
     if retry_batch is not None:
         print(

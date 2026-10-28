@@ -25,6 +25,7 @@ from bench.train_max_v2 import (
     parse_shard,
     planned_workers,
     release_job,
+    score_gap_blocks_collapse,
     upper_hull,
 )
 from ntc.grids import grow_grids
@@ -324,6 +325,18 @@ def test_lowest_label_warm_starts_downward(tmp_path: Path):
         tmp_path,
     )
     assert str(job["warm_start"]).endswith("sdk_Metal_b5.pt")
+
+
+def test_loop_above_init_does_not_collapse_on_a_bad_file():
+    """27cbd68 PavingStones: loop 25.26, file 10.32, init 23.04.
+
+    The file was under the init, so the checkpoint was deleted. A live
+    forward that still beats the init is not that collapse.
+    """
+    assert score_gap_blocks_collapse(25.26, 10.32, 23.04)
+    assert not score_gap_blocks_collapse(25.26, 25.10, 23.04)
+    assert not score_gap_blocks_collapse(10.32, 10.32, 23.04)
+    assert not score_gap_blocks_collapse(22.0, 10.32, 23.04)
 
 
 def test_dense_pass_below_init_is_not_retried():

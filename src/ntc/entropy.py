@@ -35,7 +35,7 @@ def laplace_bits(values: torch.Tensor, log_b: torch.Tensor) -> torch.Tensor:
     return discrete + continuous - continuous.detach()
 
 
-def file_rate_bpp(model_bpp: torch.Tensor, latent_rate_scale: float) -> torch.Tensor:
+def file_rate_bpp(model_bpp: torch.Tensor, latent_rate_scale: float | torch.Tensor) -> torch.Tensor:
     """Laplace bits times the stored/plain ratio, in file bpp.
 
     The label is a file rate. A 4-bit grid's Laplace rate is often near 4
@@ -43,11 +43,45 @@ def file_rate_bpp(model_bpp: torch.Tensor, latent_rate_scale: float) -> torch.Te
     raw rate to the label penalizes a file that is already under the label.
     Tiles135D b2.5 on 5a71784 sat at 31.7 dB from step 3000 with a file at
     2.21 bpp. A scale outside (0, 1) leaves the model bpp unchanged.
+    A tensor scale is the running measurement. Values outside (0, 1) still
+    leave the model bpp unchanged, including a zero probe that has not run.
     """
+    if torch.is_tensor(latent_rate_scale):
+        scale = latent_rate_scale.to(dtype=model_bpp.dtype, device=model_bpp.device).reshape(())
+        use = (scale > 0) & (scale < 1)
+        scale = torch.where(use, scale, torch.ones_like(scale))
+        return model_bpp * scale
     scale = float(latent_rate_scale)
     if not (0.0 < scale < 1.0):
         scale = 1.0
     return model_bpp * scale
+
+
+def blend_file_rate_scale(
+    current: float,
+    pca_scale: float,
+    measured_bpp: float,
+    model_bpp: float,
+) -> float:
+    """Move the penalty ratio toward the coder ratio of the current codes.
+
+    The PCA probe on MetalPlates was about 0.40, so ``0.40 * Laplace`` stayed
+    under the 2.5 label while the trained file landed at 2.79 bpp. The probe
+    is a floor: training does not get more compressible than that init. One
+    update moves halfway, so a single noisy measure cannot slam the loss.
+    A scale outside (0, 1) is left alone. Tiles at 0.511 with a file under
+    the label does not move.
+    """
+    if not (0.0 < float(pca_scale) < 1.0):
+        return float(current)
+    if not math.isfinite(float(measured_bpp)) or float(model_bpp) <= 1e-8:
+        return float(current)
+    if not math.isfinite(float(current)):
+        current = float(pca_scale)
+    ratio = float(measured_bpp) / float(model_bpp)
+    target = min(0.95, max(float(pca_scale), ratio))
+    updated = 0.5 * float(current) + 0.5 * target
+    return min(0.95, max(float(pca_scale), updated))
 
 
 def latent_rate_bits(latents: list[torch.Tensor], grid_bits: list[int]) -> torch.Tensor:
