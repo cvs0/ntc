@@ -329,8 +329,8 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         and float(trained) < float(init) + NEAR_INIT_DB
     )
     pixels = int(job["size"]) * int(job["size"])
-    requested = int(job.get("batch_pixels") or 0)
-    if near_init and not job.get("_fallback") and 0 < requested < pixels // 4:
+    effective = int(row.get("batch_pixels") or 0)
+    if near_init and not job.get("_fallback") and 0 < effective < pixels // 4:
         print(
             f"near init {job['name']} trained {float(trained):.2f} init {float(init):.2f}, "
             f"retry flat {pixels // 4}",

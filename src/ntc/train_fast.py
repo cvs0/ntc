@@ -70,7 +70,16 @@ def fullres_batch_floor(
         return int(batch_pixels), str(batch_mip)
     finest = max(int(g[0]) * int(g[1]) for g in grids)
     image = int(height) * int(width)
-    wide_or_deep = any(int(g[3]) >= 8 for g in grids) or finest >= max(image // 2, 1)
+    finest_ch = max(int(g[2]) for g in grids)
+    # 4 channels at 1024 with a 256K area batch reached 31.80 dB (b2.5).
+    # 8 channels at 1024 on that same batch stayed at 11.91 dB against an
+    # init of 10.58 (b5 after the 4-bit ranking). Full-resolution and 8-bit
+    # grids had the same failure mode.
+    wide_or_deep = (
+        any(int(g[3]) >= 8 for g in grids)
+        or finest >= max(image // 2, 1)
+        or finest_ch >= 8
+    )
     if not wide_or_deep:
         return int(batch_pixels), str(batch_mip)
     if int(batch_pixels) <= 0:
@@ -770,6 +779,22 @@ def _psnr_per_seed(
     return out
 
 
+def _reported_best_val(loop_best: float, file_psnr: float) -> float:
+    if loop_best < -1e8:
+        return file_psnr
+    if abs(float(loop_best) - float(file_psnr)) > 1.0:
+        return float(file_psnr)
+    return float(loop_best)
+
+
+def _loop_best_if_different(loop_best: float, file_psnr: float):
+    if loop_best < -1e8:
+        return None
+    if abs(float(loop_best) - float(file_psnr)) > 1.0:
+        return float(loop_best)
+    return None
+
+
 def _halving_rung(cfg: TrainConfig) -> int:
     if cfg.halve_steps > 0:
         return int(cfg.halve_steps)
@@ -915,7 +940,7 @@ def encode_arrays_fast(
     )
     if batch_pixels != int(cfg.batch_pixels or 0) or batch_mip != str(cfg.batch_mip):
         print(
-            f"fullres batch {cfg.batch_pixels} {cfg.batch_mip} -> {batch_pixels} {batch_mip}",
+            f"dense batch {cfg.batch_pixels} {cfg.batch_mip} -> {batch_pixels} {batch_mip}",
             flush=True,
         )
         cfg = replace(cfg, batch_pixels=int(batch_pixels), batch_mip=str(batch_mip))
@@ -1184,7 +1209,11 @@ def encode_arrays_fast(
         "psnr_u8_init": init_psnr,
         "psnr_u8_trained": trained_psnr,
         "stopped_early": stopped_early,
-        "best_val_psnr": None if best_val < -1e8 else best_val,
+        # The loop score is a live quantized forward. The file score is the
+        # decoded 8-bit image. On b10 those two were 12.67 and 33.07. Report
+        # the file score, and keep the loop value when they disagree.
+        "best_val_psnr": _reported_best_val(best_val, float(metrics["psnr_u8"])),
+        "best_val_psnr_loop": _loop_best_if_different(best_val, float(metrics["psnr_u8"])),
         "latent_coder": coder,
         "latent_stored_bytes": ts.latent_stored_bytes,
         "latent_plain_bytes": ts.latent_plain_bytes,

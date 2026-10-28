@@ -124,6 +124,18 @@ def test_fullres_grid_raises_a_sparse_batch():
     )
     assert deep == image // 4
     assert deep_mode == "flat"
+    # b5 after the 4-bit ranking: 8 channels at 1024. The 256K area batch
+    # stayed at 11.91 dB against an init of 10.58. 4 channels at 1024 did not.
+    wide, wide_mode = fullres_batch_floor(
+        2048, 2048, [(1024, 1024, 8, 4), (512, 512, 8, 4)], 256 * 1024, "area"
+    )
+    assert wide == image // 4
+    assert wide_mode == "flat"
+    narrow, narrow_mode = fullres_batch_floor(
+        2048, 2048, [(1024, 1024, 4, 4), (512, 512, 4, 4)], 256 * 1024, "area"
+    )
+    assert narrow == 256 * 1024
+    assert narrow_mode == "area"
 
 
 def test_fullres_sparse_batch_trains_above_init():
