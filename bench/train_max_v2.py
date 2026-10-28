@@ -19,11 +19,14 @@ os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
+import faulthandler
 import json
 import math
 import os
+import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -457,6 +460,51 @@ def cloud_latent_setups(
     return table
 
 
+def install_fault_hooks() -> None:
+    """``kill -USR1 <pid>`` dumps every thread into the shard log."""
+    faulthandler.enable(file=sys.stderr, all_threads=True)
+    if hasattr(signal, "SIGUSR1"):
+        faulthandler.register(signal.SIGUSR1, file=sys.stderr, all_threads=True)
+
+
+def step_watch_timeout() -> float:
+    raw = os.environ.get("NTC_STEP_WATCH_S", "300")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 300.0
+
+
+def watch_first_step(job_name: str, timeout_s: float | None = None) -> threading.Event:
+    """Dump stacks if this job prints no step line before ``timeout_s``.
+
+    The hang after ``latent rate scale`` never reaches the step printer, so
+    the line itself cannot report it. Default timeout is 5 minutes.
+    """
+    import ntc.train_fast as train_fast
+
+    timeout = step_watch_timeout() if timeout_s is None else float(timeout_s)
+    baseline = float(train_fast.last_step_at)
+    stop = threading.Event()
+
+    def run() -> None:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if stop.is_set() or float(train_fast.last_step_at) > baseline:
+                return
+            stop.wait(0.25)
+        if stop.is_set() or float(train_fast.last_step_at) > baseline:
+            return
+        print(
+            f"watchdog: no step line within {timeout:.0f}s of {job_name}; dumping stacks",
+            flush=True,
+        )
+        faulthandler.dump_traceback(file=sys.stderr, all_threads=True)
+
+    threading.Thread(target=run, name=f"step-watch-{job_name}", daemon=True).start()
+    return stop
+
+
 def cloud_queue_gpu_hours(jobs: list[dict] | None = None) -> float:
     """GPU-hours for the cloud queue on the 30 steps/s budget."""
     if jobs is None:
@@ -846,7 +894,11 @@ def _run_claimed(
         f"steps {job['steps']} batch {job.get('batch_pixels')} {job.get('batch_mip')}",
         flush=True,
     )
-    blob, stats = encode_arrays_fast(images, sems, cfg)
+    stop_watch = watch_first_step(str(job["name"]))
+    try:
+        blob, stats = encode_arrays_fast(images, sems, cfg)
+    finally:
+        stop_watch.set()
     wall = time.perf_counter() - t0
     row = {
         "name": job["name"],
@@ -1538,6 +1590,7 @@ def _run_packed(jobs: list[dict], out: Path, precision: str, shard_label: str, s
 
 
 def main() -> None:
+    install_fault_hooks()
     p = argparse.ArgumentParser()
     p.add_argument("--profile", choices=("laptop", "cloud5090"), default="laptop")
     p.add_argument("--out", type=Path, default=Path("results/train_max_v2"))
@@ -1597,6 +1650,10 @@ def main() -> None:
     if args.shard:
         shard_i, shard_n = parse_shard(args.shard)
         shard_label = args.shard
+    from ntc.train_fast import configure_inductor_process
+
+    os.environ["NTC_SHARD"] = shard_label or str(os.getpid())
+    configure_inductor_process(os.environ["NTC_SHARD"])
     if not args.dry_run:
         if args.profile == "cloud5090":
             from bench.download_materials import cloud_materials

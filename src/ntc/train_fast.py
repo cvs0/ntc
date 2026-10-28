@@ -19,6 +19,7 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+import tempfile
 import time
 from dataclasses import replace
 
@@ -76,6 +77,8 @@ COARSE_LOSS_FRACTION = 0.25
 _RATE_RATIO: dict[tuple, float] = {}
 _GRID_RATIO: dict[tuple, float] = {}
 _FIT_CACHE: dict[tuple, tuple] = {}
+# Advanced by every progress line. The queue watchdog reads it.
+last_step_at: float = 0.0
 # Packed bytes fed to the coder during a rate probe. The full latent of a
 # 1024x12 grid is about 6 MB, and the Python range coder on that buffer is
 # what held a 5090 at 0% for 8 to 14 minutes between jobs.
@@ -1111,6 +1114,41 @@ def portable_step_plan(
     return compile_step, schedule == "constant"
 
 
+def configure_inductor_process(shard: str | None = None) -> str:
+    """Private Inductor and Triton caches, and no compile-worker pool.
+
+    ``TORCHINDUCTOR_COMPILE_THREADS`` defaults to ``min(32, cpu_count)``.
+    On a 128-core pod each shard forks that pool after the rate probe has
+    initialized CUDA, and every shard shares ``/tmp/torchinductor_<user>``.
+    The workers block on that cache lock and the parent waits forever, so
+    only the last shard to start prints a step. Threads = 1 compiles in
+    the main process. A cache directory that is already set (the pod
+    launcher writes one per shard) is kept.
+    """
+    label = shard or os.environ.get("NTC_SHARD") or str(os.getpid())
+    safe = str(label).replace("/", "_")
+    if "TORCHINDUCTOR_CACHE_DIR" not in os.environ:
+        root = os.environ.get("NTC_ROOT") or os.path.join(tempfile.gettempdir(), "ntc")
+        base = os.path.join(root, ".cache", f"shard_{safe}")
+        os.makedirs(os.path.join(base, "inductor"), exist_ok=True)
+        os.makedirs(os.path.join(base, "triton"), exist_ok=True)
+        os.environ["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(base, "inductor")
+        os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(base, "triton"))
+    elif "TRITON_CACHE_DIR" not in os.environ:
+        os.environ["TRITON_CACHE_DIR"] = os.path.join(
+            os.environ["TORCHINDUCTOR_CACHE_DIR"], "triton"
+        )
+        os.makedirs(os.environ["TRITON_CACHE_DIR"], exist_ok=True)
+    os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    try:
+        import torch._inductor.config as inductor_config
+
+        inductor_config.compile_threads = 1
+    except Exception:
+        pass
+    return os.environ["TORCHINDUCTOR_CACHE_DIR"]
+
+
 def preferred_compile_mode(device_type: str) -> str:
     """``reduce-overhead`` on every CUDA device, ``default`` on CPU.
 
@@ -1213,6 +1251,8 @@ def _log_progress(
         height = int(images.shape[-2])
         width = int(images.shape[-1])
         _refresh_file_rate_scale(stacked, cfg, height * width)
+    global last_step_at
+    last_step_at = time.monotonic()
     name = cfg.job_name or "train"
     stamp = time.strftime("%Y-%m-%d %H:%M:%S")
     print(
@@ -1364,6 +1404,7 @@ def _run_loop(
             attempts.append("default")
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
+        configure_inductor_process()
         _cover_mip_recompiles(int(cfg.mip_levels))
         if graph_idx is None and batch:
             graph_idx = static_sample_indices(
@@ -1752,7 +1793,13 @@ def _pca_quant_codes(images: np.ndarray, gw: int, gh: int, channels: int, bits: 
     mid = ((1 << int(bits)) - 1) / 2.0
     qmax = (1 << int(bits)) - 1
     stored = torch.round(values / scale.view(-1, 1, 1) + mid).clamp(0, qmax)
-    return stored.to(torch.uint8).cpu().numpy()
+    codes = stored.to(torch.uint8).cpu().numpy()
+    del target, field, flat, values, stored
+    if device.type == "cuda":
+        # Compile forks workers after this. A live CUDA op on the default
+        # stream plus that fork is how a shard sits at 0% with VRAM held.
+        torch.cuda.synchronize()
+    return codes
 
 
 def _thin_codes(codes: np.ndarray, max_values: int) -> np.ndarray:

@@ -211,6 +211,9 @@ def test_cloud_entry_points_run_as_files_without_pythonpath(tmp_path: Path):
     assert "no outbound internet" in script
     assert "cloud_split.json" in script
     assert "skip download" in script
+    assert 'export TORCHINDUCTOR_CACHE_DIR="$CACHE/inductor"' in script
+    assert 'export TRITON_CACHE_DIR="$CACHE/triton"' in script
+    assert "export TORCHINDUCTOR_COMPILE_THREADS=1" in script
     lines = script.splitlines()
 
     def at(text: str) -> int:

@@ -60,6 +60,14 @@ PY
 
 mkdir -p "$OUT/logs"
 SAFE="${SHARD//\//_}"
+# Inductor's compile workers and a shared /tmp/torchinductor_<user> lock
+# deadlock every shard but the last one launched on the pod.
+CACHE="$ROOT/.cache/shard_${SAFE}"
+mkdir -p "$CACHE/inductor" "$CACHE/triton"
+export TORCHINDUCTOR_CACHE_DIR="$CACHE/inductor"
+export TRITON_CACHE_DIR="$CACHE/triton"
+export TORCHINDUCTOR_COMPILE_THREADS=1
+export NTC_SHARD="$SAFE"
 LOG="$OUT/logs/shard_${SAFE}.log"
 PID="$OUT/logs/shard_${SAFE}.pid"
 nohup python bench/train_max_v2.py \
