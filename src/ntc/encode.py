@@ -79,10 +79,19 @@ class TrainConfig:
     seed_pool: int = 4
     with_ssim: bool = True
     latent_deflate: bool = True
+    # "deflate", "range", "best" (smaller of the two, same pixels), or "raw".
+    latent_coder: str = "best"
     tile_size: int = 0
     layer_bits: tuple = ()
     mip_loss: str = "footprint"
     mip_curriculum: bool = False
+    warmup_steps: int = 0
+    schedule: str = "cosine"
+    precision: str = "fp32"
+    eval_every: int = 0
+    early_stop: int = 0
+    resume: str = ""
+    ckpt: str = ""
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
@@ -223,6 +232,7 @@ def export_network(
     height: int,
     num_mips: int,
     latent_deflate: bool = False,
+    latent_coder: str | None = None,
 ) -> bytes:
     net.eval()
     grids = []
@@ -280,6 +290,7 @@ def export_network(
         grids=grids,
         layers=layers,
         latent_deflate=latent_deflate,
+        latent_coder=latent_coder if latent_deflate or latent_coder else "raw",
         tile_size=net.tile_size,
     )
 
@@ -293,6 +304,12 @@ def encode_arrays(
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = pick_device(cfg.device)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
+        # ROCm and CUDA fp32 GEMMs are not the CPU wheel. TF32-style
+        # reductions are off so the next GPU run is not that path.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     c, h, w = images.shape
     hidden = list(cfg.hidden)
     if any(v > 64 for v in hidden) or len(hidden) > 3:
@@ -370,6 +387,8 @@ def encode_arrays(
     # network built below does not depend on how many probes ran.
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
     nominal = shape_bpp(
         w,
         h,
@@ -398,7 +417,13 @@ def encode_arrays(
         layer_bits=cfg.layer_bits,
     ).to(device)
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
-    if cfg.pca_init:
+    start_step = 0
+    resume_ckpt = None
+    if cfg.resume:
+        resume_ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+        net.load_state_dict(resume_ckpt["model"])
+        start_step = int(resume_ckpt.get("step", -1)) + 1
+    elif cfg.pca_init:
         _pca_init(net, target)
     else:
         for i, lat in enumerate(net.latents):
@@ -407,9 +432,10 @@ def encode_arrays(
         _fit_readout(net, target)
     # Adam on a linear map, and on some hidden widths, finishes below the
     # PCA initialization. The export keeps whichever of the two has the
-    # higher 8-bit PSNR.
+    # higher 8-bit PSNR. A resumed run keeps the checkpoint instead of the
+    # initialization from this process.
     init_state = None
-    if cfg.steps > 0:
+    if cfg.steps > 0 and resume_ckpt is None:
         init_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
     latent_params = list(net.latents.parameters()) + list(net.log_scales.parameters())
     latent_params += list(net.tile_log_scales.parameters()) + list(net.tile_offsets.parameters())
@@ -419,13 +445,74 @@ def encode_arrays(
             {"params": net.linears.parameters(), "lr": cfg.lr},
         ]
     )
+    if resume_ckpt is not None and resume_ckpt.get("opt") is not None:
+        opt.load_state_dict(resume_ckpt["opt"])
     curve = []
     t0 = time.perf_counter()
     net.train()
     max_mip = max(cfg.mip_levels - 1, 1)
-    for step in range(cfg.steps):
-        cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
-        lr = max(cfg.lr * cos, cfg.lr * 0.05)
+    amp = cfg.precision in ("bf16", "fp16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if cfg.precision == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda") if cfg.precision == "fp16" and device.type == "cuda" else None
+    best_state = None
+    best_val = -1e9
+    stall = 0
+    stopped_early = False
+
+    def _step_lr(step: int) -> float:
+        # warmup_steps == 0 and cosine is the historical schedule.
+        if cfg.warmup_steps <= 0 and cfg.schedule == "cosine":
+            cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
+            return max(cfg.lr * cos, cfg.lr * 0.05)
+        warm = max(cfg.warmup_steps, 0)
+        if step < warm:
+            return cfg.lr * float(step + 1) / float(max(warm, 1))
+        span = max(cfg.steps - warm, 1)
+        t = min(1.0, float(step - warm) / float(span))
+        if cfg.schedule == "step":
+            lr = cfg.lr
+            if t >= 0.5:
+                lr *= 0.5
+            if t >= 0.75:
+                lr *= 0.5
+            return lr
+        cos = 0.5 * (1.0 + math.cos(math.pi * t))
+        return max(cfg.lr * cos, cfg.lr * 0.05)
+
+    def _val_psnr() -> float:
+        net.eval()
+        hm, wm = target.shape[-2], target.shape[-1]
+        sse = 0.0
+        count = 0
+        with torch.no_grad():
+            for y0 in range(0, hm, 256):
+                y1 = min(hm, y0 + 256)
+                ys = torch.arange(y0, y1, device=device)
+                xs = torch.arange(wm, device=device)
+                yg, xg = torch.meshgrid(ys, xs, indexing="ij")
+                uv = torch.stack(
+                    ((xg.reshape(-1).float() + 0.5) / wm, (yg.reshape(-1).float() + 0.5) / hm),
+                    dim=1,
+                )
+                tgt = target[:, yg.reshape(-1), xg.reshape(-1)].T
+                if amp:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        pred = net(uv, mip=0, max_mip=max_mip)
+                else:
+                    pred = net(uv, mip=0, max_mip=max_mip)
+                pred = pred.float()
+                q = torch.round(pred.clamp(0, 1) * 255.0) / 255.0
+                tq = torch.round(tgt.clamp(0, 1) * 255.0) / 255.0
+                sse += float((q - tq).pow(2).sum())
+                count += int(q.numel())
+        net.train()
+        mse = sse / max(count, 1)
+        if mse <= 0.0:
+            return 100.0
+        return 10.0 * math.log10(1.0 / mse)
+
+    for step in range(start_step, cfg.steps):
+        lr = _step_lr(step)
         opt.param_groups[0]["lr"] = lr * cfg.latent_lr_mult
         opt.param_groups[1]["lr"] = lr
         opt.zero_grad(set_to_none=True)
@@ -452,15 +539,45 @@ def encode_arrays(
                 xs = idx % wm
             uv = torch.stack(((xs.float() + 0.5) / wm, (ys.float() + 0.5) / hm), dim=1)
             tgt = tm[:, ys, xs].T
-            pred = net(uv, mip=m, max_mip=max_mip)
-            loss = loss + _mip_weight(cfg, m) * _loss(pred, tgt, semantics, cfg)
+            if amp:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    pred = net(uv, mip=m, max_mip=max_mip)
+            else:
+                pred = net(uv, mip=m, max_mip=max_mip)
+            loss = loss + _mip_weight(cfg, m) * _loss(pred.float(), tgt, semantics, cfg)
             if m == 0 and (step % cfg.log_every == 0 or step == cfg.steps - 1):
-                monitor_psnr = _subset_psnr(pred, tgt)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-        opt.step()
+                monitor_psnr = _subset_psnr(pred.float(), tgt)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
         if monitor_psnr is not None:
             curve.append({"step": step, "psnr_train": monitor_psnr, "loss": float(loss.detach())})
+        if cfg.eval_every and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
+            vp = _val_psnr()
+            curve.append({"step": step, "psnr_val": vp})
+            if vp > best_val + 0.01:
+                best_val = vp
+                best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                stall = 0
+                if cfg.ckpt:
+                    torch.save(
+                        {"model": best_state, "opt": opt.state_dict(), "step": step, "psnr_val": vp},
+                        cfg.ckpt,
+                    )
+            else:
+                stall += 1
+                if cfg.early_stop and stall >= cfg.early_stop:
+                    stopped_early = True
+                    break
+    if best_state is not None:
+        net.load_state_dict(best_state)
     train_s = time.perf_counter() - t0
     num_mips = min(8, int(math.floor(math.log2(max(w, h)))) + 1)
     ref = np.transpose(images, (1, 2, 0))
@@ -468,7 +585,10 @@ def encode_arrays(
 
     def _export_current():
         t_export = time.perf_counter()
-        blob_i = export_network(net, semantics, w, h, num_mips, latent_deflate=cfg.latent_deflate)
+        coder = cfg.latent_coder if cfg.latent_deflate else "raw"
+        blob_i = export_network(
+            net, semantics, w, h, num_mips, latent_deflate=cfg.latent_deflate, latent_coder=coder
+        )
         export_dt = time.perf_counter() - t_export
         t_dec = time.perf_counter()
         ts_i = parse_texture_set(blob_i)
@@ -546,6 +666,12 @@ def encode_arrays(
         ],
         "activation_requant": cfg.activation_requant,
         "latent_deflate": cfg.latent_deflate,
+        "latent_coder": cfg.latent_coder if cfg.latent_deflate else "raw",
+        "precision": cfg.precision,
+        "warmup_steps": cfg.warmup_steps,
+        "schedule": cfg.schedule,
+        "stopped_early": stopped_early,
+        "best_val_psnr": None if best_val < -1e8 else best_val,
         "tile_size": cfg.tile_size,
         "layer_bits": list(cfg.layer_bits),
         "mip_loss": cfg.mip_loss,

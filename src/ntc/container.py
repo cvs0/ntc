@@ -33,6 +33,10 @@ FLAG_ACTIVATION_REQUANT = 1 << 1
 # Header u32 at offset 84 is the inflated length. bpp counts the
 # compressed length, not the inflated grids.
 FLAG_LATENT_DEFLATE = 1 << 2
+# Order-1 nibble range coder of the same plain latent bytes. Mutually
+# exclusive with FLAG_LATENT_DEFLATE. Offset 84 is the plain length.
+FLAG_LATENT_RANGE = 1 << 3
+FLAG_LATENT_COMPRESSED = FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE
 
 ACT_IDENTITY = 0
 ACT_RELU = 1
@@ -292,6 +296,7 @@ def build_texture_set(
     layers: list[dict],
     latent_deflate: bool = False,
     tile_size: int = 0,
+    latent_coder: str | None = None,
 ) -> bytes:
     """Build a file.
 
@@ -408,11 +413,32 @@ def build_texture_set(
         abs_grids.append((rec, rel))
     plain = bytes(latent_blob)
     plain_len = len(plain)
-    if latent_deflate:
+    coder = latent_coder
+    if coder is None:
+        coder = "deflate" if latent_deflate else "raw"
+    if coder == "deflate":
         stored_latent = deflate_raw(plain)
         flags = flags | FLAG_LATENT_DEFLATE
-    else:
+    elif coder == "range":
+        from ntc.range_coder import range_encode
+
+        stored_latent = range_encode(plain)
+        flags = flags | FLAG_LATENT_RANGE
+    elif coder == "best":
+        from ntc.range_coder import range_encode
+
+        deflated = deflate_raw(plain)
+        ranged = range_encode(plain)
+        if len(ranged) < len(deflated):
+            stored_latent = ranged
+            flags = flags | FLAG_LATENT_RANGE
+        else:
+            stored_latent = deflated
+            flags = flags | FLAG_LATENT_DEFLATE
+    elif coder == "raw":
         stored_latent = plain
+    else:
+        raise ValueError(f"latent coder {coder}")
     latent_bytes = len(stored_latent)
     offset = latent_off + latent_bytes
     if offset % 2:
@@ -422,7 +448,7 @@ def build_texture_set(
     for rec, rel in abs_grids:
         s_off = scale_off + len(scale_blob)
         scale_blob += rec["scale_bytes"]
-        data_off = rel if latent_deflate else latent_off + rel
+        data_off = rel if (flags & FLAG_LATENT_COMPRESSED) else latent_off + rel
         abs_scales.append((rec, data_off, s_off))
     scale_bytes = len(scale_blob)
     offset = scale_off + scale_bytes
@@ -501,7 +527,7 @@ def build_texture_set(
         scale_bytes,
         crc,
         file_bytes,
-        plain_len if latent_deflate else 0,
+        plain_len if (flags & FLAG_LATENT_COMPRESSED) else 0,
         0,
     )
     if len(header) != HEADER_BYTES:
@@ -559,11 +585,19 @@ def parse_texture_set(blob: bytes) -> TextureSet:
     if _HEADER.size != HEADER_BYTES:
         raise RuntimeError("struct size")
 
+    if (flags & FLAG_LATENT_DEFLATE) and (flags & FLAG_LATENT_RANGE):
+        raise ValueError("deflate and range flags are mutually exclusive")
     code_src: bytes | memoryview = blob
-    if flags & FLAG_LATENT_DEFLATE:
+    if flags & FLAG_LATENT_COMPRESSED:
         if latent_plain <= 0:
-            raise ValueError("deflate flag without inflated length")
-        code_src = inflate_raw(blob[latent_off : latent_off + latent_bytes], latent_plain)
+            raise ValueError("compressed latent without inflated length")
+        packed = blob[latent_off : latent_off + latent_bytes]
+        if flags & FLAG_LATENT_DEFLATE:
+            code_src = inflate_raw(packed, latent_plain)
+        else:
+            from ntc.range_coder import range_decode
+
+            code_src = range_decode(packed, latent_plain)
 
     channels = []
     for i in range(num_channels):
@@ -624,7 +658,7 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         raw=blob,
         tile_size=int(tile_size),
         latent_stored_bytes=int(latent_bytes),
-        latent_plain_bytes=int(latent_plain) if flags & FLAG_LATENT_DEFLATE else int(latent_bytes),
+        latent_plain_bytes=int(latent_plain) if flags & FLAG_LATENT_COMPRESSED else int(latent_bytes),
         scale_stored_bytes=int(scale_bytes),
     )
 
@@ -634,7 +668,7 @@ def payload_bytes(ts: TextureSet) -> int:
 
     When the latent region is deflated, the compressed length is the rate.
     """
-    if ts.flags & FLAG_LATENT_DEFLATE:
+    if ts.flags & FLAG_LATENT_COMPRESSED:
         latent = ts.latent_stored_bytes
     else:
         latent = sum(g.data_bytes for g in ts.grids)

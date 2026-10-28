@@ -1,5 +1,6 @@
 #include "ntc/group_quant.hpp"
 #include "ntc/ntc.hpp"
+#include "../src/range_coder.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -31,6 +32,16 @@ static void test_quant() {
     auto q4 = ntc::quantize_weight(w, 2, 4, 4, 2);
     expect(q4.groups == 2, "two groups");
     for (int c : q4.codes) expect(c >= -7 && c <= 7, "int4 range");
+}
+
+static void test_range() {
+    const uint8_t src[] = {0, 1, 2, 15, 15, 15, 0, 4, 8, 255, 7, 7, 7, 1};
+    auto enc = ntc::range_encode(src, sizeof(src));
+    auto dec = ntc::range_decode(enc.data(), enc.size(), sizeof(src));
+    expect(dec.size() == sizeof(src), "range length");
+    if (dec.size() == sizeof(src)) {
+        for (size_t i = 0; i < sizeof(src); ++i) expect(dec[i] == src[i], "range byte");
+    }
 }
 
 static void test_fixture(const std::string& dir) {
@@ -73,6 +84,7 @@ static void test_fixture(const std::string& dir) {
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "tests/fixtures";
     test_quant();
+    test_range();
     test_fixture(dir);
     if (g_fails) {
         std::cerr << g_fails << " failures\n";

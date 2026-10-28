@@ -45,7 +45,33 @@ float g_hb[64];
 float g_y[16];
 int g_nfeat;
 
+#ifdef NTC_STAGE
+// Workgroup staging. Weights are one contiguous span. Each grid stages the
+// full rows the 8x8 tile bilinear-samples, including the halo. A grid that
+// does not fit is left on the global load. s_ready stays 0 until the copies
+// finish, so the fill itself reads global memory.
+shared uint s_words[4096];
+shared uint s_ready;
+shared uint s_wsrc;
+shared uint s_wlen;
+shared int s_iy0[8];
+shared int s_ny[8];
+shared int s_gh_s[8];
+shared int s_ch_s[8];
+shared uint s_off[8];
+shared uint s_stride_s[8];
+shared uint s_base_s[8];
+shared uint s_grid_ok[8];
+#endif
+
 uint ntc_u8(uint off) {
+#ifdef NTC_STAGE
+    if (s_ready != 0u && s_wlen > 0u && off >= s_wsrc && off < s_wsrc + s_wlen) {
+        uint local = off - s_wsrc;
+        uint w = s_words[local >> 2u];
+        return (w >> ((local & 3u) * 8u)) & 0xFFu;
+    }
+#endif
     uint w = g_blob[off >> 2u];
     return (w >> ((off & 3u) * 8u)) & 0xFFu;
 }
@@ -61,7 +87,35 @@ int ntc_wrap(int i, int n) {
     return r;
 }
 
+#ifdef NTC_STAGE
+uint ntc_stage_u8(uint local) {
+    uint w = s_words[local >> 2u];
+    return (w >> ((local & 3u) * 8u)) & 0xFFu;
+}
+#endif
+
 float ntc_code(uint base, uint stride, int bits, int W, int H, int ch, int x, int y) {
+#ifdef NTC_STAGE
+    if (s_ready != 0u) {
+        uint ngrids = g_desc[0].w;
+        for (uint gi = 0u; gi < ngrids; ++gi) {
+            if (s_grid_ok[gi] == 0u || base != s_base_s[gi]) continue;
+            int origin = ntc_wrap(s_iy0[gi], s_gh_s[gi]);
+            int ly = y - origin;
+            if (ly < 0) ly += s_gh_s[gi];
+            if (ly < 0 || ly >= s_ny[gi]) continue;
+            uint pitch = (s_stride_s[gi] + 3u) & ~3u;
+            uint row = s_off[gi] + uint(ly * s_ch_s[gi] + ch) * pitch;
+            if (bits == 8) return float(ntc_stage_u8(row + uint(x)));
+            if (bits == 4) {
+                uint b = ntc_stage_u8(row + uint(x >> 1));
+                return float((x & 1) == 0 ? (b & 0xFu) : (b >> 4u));
+            }
+            uint b2 = ntc_stage_u8(row + uint(x >> 2));
+            return float((b2 >> (uint(x & 3) * 2u)) & 3u);
+        }
+    }
+#endif
     uint row = base + uint(ch) * stride * uint(H) + uint(y) * stride;
     if (bits == 8) {
         return float(ntc_u8(row + uint(x)));
@@ -248,6 +302,127 @@ void ntc_mlp() {
         if (li + 1u != nlayers) cur = int(g_desc[12u + li].y);
     }
 }
+
+#ifdef NTC_STAGE
+void ntc_stage_prepare() {
+    uint tid = gl_LocalInvocationIndex;
+    if (tid == 0u) {
+        s_ready = 0u;
+        s_wsrc = 0u;
+        s_wlen = 0u;
+        for (uint i = 0u; i < 8u; ++i) s_grid_ok[i] = 0u;
+        uint nl = g_desc[1].x;
+        uint wmin = 0xFFFFFFFFu;
+        uint wmax = 0u;
+        for (uint li = 0u; li < nl; ++li) {
+            uvec4 a = g_desc[12u + li];
+            uvec4 b = g_desc[16u + li];
+            int inn = int(a.x);
+            int outn = int(a.y);
+            uint bits = b.w;
+            uint wbytes = (bits == 8u) ? uint(outn * inn) : uint(outn * ((inn + 1) / 2));
+            wmin = min(wmin, a.z);
+            wmax = max(wmax, a.z + wbytes);
+            wmin = min(wmin, a.w);
+            wmax = max(wmax, a.w + uint(outn) * 2u);
+            int groups = max(int(b.z), 1);
+            uint sbytes = uint(outn * groups) * 2u;
+            wmin = min(wmin, b.x);
+            wmax = max(wmax, b.x + sbytes);
+        }
+        if (wmax > wmin && (wmax - wmin) <= 8192u) {
+            s_wsrc = wmin;
+            s_wlen = wmax - wmin;
+        }
+    }
+    barrier();
+    if (s_wlen > 0u) {
+        uint words = (s_wlen + 3u) / 4u;
+        for (uint i = tid; i < words; i += 64u) {
+            uint b0 = i * 4u;
+            uint v = 0u;
+            uint src = s_wsrc + b0;
+            if (b0 < s_wlen) v |= ntc_u8(src);
+            if (b0 + 1u < s_wlen) v |= ntc_u8(src + 1u) << 8u;
+            if (b0 + 2u < s_wlen) v |= ntc_u8(src + 2u) << 16u;
+            if (b0 + 3u < s_wlen) v |= ntc_u8(src + 3u) << 24u;
+            s_words[i] = v;
+        }
+    }
+    barrier();
+    uint used = (s_wlen + 3u) & ~3u;
+    uint mip = g_pc.x;
+    uvec4 h0 = g_desc[0];
+    uint W = max(h0.x >> mip, 1u);
+    uint H = max(h0.y >> mip, 1u);
+    uint y0p = gl_WorkGroupID.y * 8u;
+    uint y1p = min(H, y0p + 8u);
+    uint ngrids = h0.w;
+    for (uint gi = 0u; gi < ngrids && gi < 8u; ++gi) {
+        if (tid == 0u && y0p < H) {
+            uvec4 grid = g_desc[4u + gi];
+            uint nm = grid.w;
+            uint k = mip;
+            if (k >= nm) k = nm - 1u;
+            uvec4 info = g_desc[20u + gi * 8u + k];
+            int GH = int(info.w);
+            float y_a = (float(y0p) + 0.5) / float(H) * float(GH) - 0.5;
+            float y_b = (float(max(y1p, y0p + 1u) - 1u) + 0.5) / float(H) * float(GH) - 0.5;
+            int iy0 = int(floor(y_a));
+            int iy1 = int(floor(y_b)) + 1;
+            int ny = iy1 - iy0 + 1;
+            if (ny >= GH) {
+                iy0 = 0;
+                ny = GH;
+            }
+            uint stride = info.y;
+            uint chs = grid.x;
+            uint pitch = (stride + 3u) & ~3u;
+            uint bytes = uint(ny) * chs * pitch;
+            uint aligned = (used + 3u) & ~3u;
+            if (bytes > 0u && aligned + bytes <= 4096u * 4u) {
+                s_iy0[gi] = iy0;
+                s_ny[gi] = ny;
+                s_gh_s[gi] = GH;
+                s_ch_s[gi] = int(chs);
+                s_stride_s[gi] = stride;
+                s_base_s[gi] = info.x;
+                s_off[gi] = aligned;
+                s_grid_ok[gi] = 1u;
+                used = aligned + bytes;
+            }
+        }
+        barrier();
+        if (s_grid_ok[gi] != 0u) {
+            int ny = s_ny[gi];
+            int chs = s_ch_s[gi];
+            uint stride = s_stride_s[gi];
+            uint pitch = (stride + 3u) & ~3u;
+            uint nrows = uint(ny * chs);
+            for (uint row = tid; row < nrows; row += 64u) {
+                int ly = int(row) / chs;
+                int ch = int(row) % chs;
+                int gy = ntc_wrap(s_iy0[gi] + ly, s_gh_s[gi]);
+                uint src = s_base_s[gi] + uint(ch) * stride * uint(s_gh_s[gi]) + uint(gy) * stride;
+                uint dst = s_off[gi] + row * pitch;
+                uint words = (stride + 3u) / 4u;
+                for (uint i = 0u; i < words; ++i) {
+                    uint b0 = i * 4u;
+                    uint v = 0u;
+                    if (b0 < stride) v |= ntc_u8(src + b0);
+                    if (b0 + 1u < stride) v |= ntc_u8(src + b0 + 1u) << 8u;
+                    if (b0 + 2u < stride) v |= ntc_u8(src + b0 + 2u) << 16u;
+                    if (b0 + 3u < stride) v |= ntc_u8(src + b0 + 3u) << 24u;
+                    s_words[(dst >> 2u) + i] = v;
+                }
+            }
+        }
+        barrier();
+    }
+    if (tid == 0u) s_ready = 1u;
+    barrier();
+}
+#endif
 
 void ntc_eval(vec2 uv, int mip) {
     ntc_features(uv, mip);

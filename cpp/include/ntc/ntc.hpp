@@ -26,6 +26,9 @@ constexpr uint32_t kFlagActivationRequant = 1u << 1;
 // Raw deflate (window -15) of the latent region. data_offset is then
 // relative to the inflated bytes. Header u32 at offset 84 is that length.
 constexpr uint32_t kFlagLatentDeflate = 1u << 2;
+// Order-1 nibble range coder. Same plain bytes as deflate. Offset 84 is the length.
+constexpr uint32_t kFlagLatentRange = 1u << 3;
+constexpr uint32_t kFlagLatentCompressed = kFlagLatentDeflate | kFlagLatentRange;
 
 constexpr int kActIdentity = 0;
 constexpr int kActRelu = 1;

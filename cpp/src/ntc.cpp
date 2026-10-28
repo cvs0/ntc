@@ -1,4 +1,5 @@
 #include "ntc/ntc.hpp"
+#include "range_coder.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -393,18 +394,26 @@ TextureSet parse(const uint8_t* data, size_t size) {
     ts.latent_stored_bytes = latent_bytes;
     ts.scale_stored_bytes = rd_u32(data + 72);
     const uint32_t plain_len = rd_u32(data + 84);
-    ts.latent_plain_bytes = (ts.flags & kFlagLatentDeflate) ? plain_len : latent_bytes;
+    if ((ts.flags & kFlagLatentDeflate) && (ts.flags & kFlagLatentRange)) {
+        throw std::runtime_error("deflate and range flags are mutually exclusive");
+    }
+    ts.latent_plain_bytes = (ts.flags & kFlagLatentCompressed) ? plain_len : latent_bytes;
     std::vector<uint8_t> inflated;
     const uint8_t* code_base = data;
-    if (ts.flags & kFlagLatentDeflate) {
+    if (ts.flags & kFlagLatentCompressed) {
         if (plain_len == 0 || static_cast<size_t>(latent_off) + latent_bytes > size) {
-            throw std::runtime_error("bad deflate span");
+            throw std::runtime_error("bad compressed latent span");
         }
-        inflated.assign(plain_len, 0);
-        unsigned long dlen = plain_len;
-        unsigned long slen = latent_bytes;
-        const int rc = puff(inflated.data(), &dlen, data + latent_off, &slen);
-        if (rc != 0 || dlen != plain_len) throw std::runtime_error("latent deflate");
+        if (ts.flags & kFlagLatentDeflate) {
+            inflated.assign(plain_len, 0);
+            unsigned long dlen = plain_len;
+            unsigned long slen = latent_bytes;
+            const int rc = puff(inflated.data(), &dlen, data + latent_off, &slen);
+            if (rc != 0 || dlen != plain_len) throw std::runtime_error("latent deflate");
+        } else {
+            inflated = range_decode(data + latent_off, latent_bytes, plain_len);
+            if (inflated.size() != plain_len) throw std::runtime_error("latent range");
+        }
         code_base = inflated.data();
     }
     const uint32_t grid_off = rd_u32(data + 44);
@@ -516,7 +525,7 @@ std::vector<float> decode_mip(const TextureSet& ts, int mip) {
 
 uint32_t payload_bytes(const TextureSet& ts) {
     uint32_t n = 0;
-    if (ts.flags & kFlagLatentDeflate) n += ts.latent_stored_bytes;
+    if (ts.flags & kFlagLatentCompressed) n += ts.latent_stored_bytes;
     else {
         for (const auto& g : ts.grids) n += g.data_bytes;
     }
@@ -558,7 +567,7 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
         for (size_t k = 0; k < grid.mips.size() && k < 8; ++k) {
             uint32_t data_off = grid.data_offset;
             int stride = grid.row_stride;
-            if (k > 0 || (ts.flags & kFlagLatentDeflate)) {
+            if (k > 0 || (ts.flags & kFlagLatentCompressed)) {
                 int ps = 0;
                 auto packed = pack_codes(grid.mips[k], grid.channels, grid.mip_h[k], grid.mip_w[k],
                                          grid.bits, ps);

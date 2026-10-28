@@ -132,6 +132,45 @@ def test_latent_deflate_roundtrip_and_rate():
     assert ts.latent_stored_bytes < ts.latent_plain_bytes
 
 
+def test_latent_range_roundtrip_matches_plain_codes():
+    from ntc.container import FLAG_LATENT_RANGE
+    from ntc.range_coder import range_decode, range_encode
+
+    raw = bytes([0, 1, 2, 15, 15, 15, 0, 4, 8, 255, 7, 7, 7, 1])
+    assert range_decode(range_encode(raw), len(raw)) == raw
+    codes = np.zeros((2, 16, 16), np.uint8)
+    codes[:, :, :] = 1
+    codes[:, 2, 3] = 7
+    common = dict(
+        width=16,
+        height=16,
+        num_mips=1,
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        flags=0,
+        weight_bits=8,
+        group_size=0,
+        channels=[ChannelRec(0), ChannelRec(1)],
+        grids=[{"codes": codes, "bits": 4, "scale": np.ones(2, np.float32)}],
+        layers=[
+            {
+                "codes": np.ones((2, 2), np.int16),
+                "bias": np.zeros(2, np.float32),
+                "scale": np.ones((2, 1), np.float32),
+                "group_size": 0,
+            }
+        ],
+    )
+    ranged = build_texture_set(**common, latent_coder="range")
+    ts = parse_texture_set(ranged)
+    assert ts.flags & FLAG_LATENT_RANGE
+    np.testing.assert_array_equal(ts.grids[0].codes, codes)
+    best = build_texture_set(**common, latent_coder="best")
+    deflated = build_texture_set(**common, latent_deflate=True)
+    assert len(best) <= len(deflated)
+
+
 def test_layer_weight_bits_roundtrip():
     hidden = np.array([[1, -2, 3, 0], [7, -7, 1, -1]], dtype=np.int16)
     out = np.array([[4, -3], [0, 1], [2, -2]], dtype=np.int16)

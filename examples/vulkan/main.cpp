@@ -414,6 +414,38 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        auto run_extra = [&](const std::string& path, const char* label, float tol) {
+            std::ifstream probe(path);
+            if (!probe) return;
+            VkShaderModule extra = shader_mod(dev, path);
+            stage.module = extra;
+            cpi.stage = stage;
+            VkPipeline px = VK_NULL_HANDLE;
+            CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &px));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, px);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc);
+            vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb,
+                                 0, nullptr, 0, nullptr);
+            CHECK(vkEndCommandBuffer(cmd));
+            CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+            CHECK(vkQueueWaitIdle(queue));
+            std::vector<float> got(cpu.size());
+            std::memcpy(got.data(), outb.mapped, static_cast<size_t>(out_bytes));
+            const float e = max_abs(cpu, got);
+            std::cout << label << " " << e << "\n";
+            vkDestroyPipeline(dev, px, nullptr);
+            vkDestroyShaderModule(dev, extra, nullptr);
+            if (e > tol) {
+                std::cerr << label << " mismatch\n";
+                throw std::runtime_error(label);
+            }
+        };
+        run_extra(dir + "/ntc_decompress_stage.comp.spv", "stage_max_abs", 1e-3f);
+
         if (float16) {
             const std::string fp16_path = dir + "/ntc_decompress_fp16.comp.spv";
             std::ifstream probe(fp16_path);
@@ -439,6 +471,10 @@ int main(int argc, char** argv) {
                 std::cout << "fp16_max_abs " << max_abs(cpu, g16) << "\n";
                 vkDestroyPipeline(dev, p16, nullptr);
                 vkDestroyShaderModule(dev, m16, nullptr);
+                // fp16 dots are not bit-exact. The staged fp16 path must stay in
+                // the same band as the unstaged fp16 path. The 256 metal latent
+                // measured 0.00293 on both.
+                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", 5e-3f);
             }
         }
 

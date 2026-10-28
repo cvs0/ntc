@@ -40,7 +40,7 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 84 | u32 | inflated latent bytes when flag bit 2 is set, otherwise 0 |
 | 88 | u64 | reserved |
 
-Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the deflate stream. The inflated size is the inference working set.
+Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Flag bit 3: the same plain bytes coded with an order-1 adaptive range coder over nibbles (low nibble first, 16 contexts, counts start at 1, rescale at 4096). The two flags are mutually exclusive. Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the compressed stream. The inflated size is the inference working set. `latent_coder = best` writes whichever of deflate and range is smaller.
 
 Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserved`.
 
@@ -261,7 +261,7 @@ Initialization is coarse-to-fine PCA of the residual into each grid, then a leas
 
 Loss is mean squared error. Channel weights and a normal-cosine term exist and are off by default.
 
-Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_deflate = true`, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them.
+Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_coder = best`, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them. On the locked seed-3 metal network after 40 Adam steps (mip 0 loss, PSNR 35.7492), the plain latent is 131104 bytes. Deflate stores 79269 bytes (9.7565 bpp). The range coder stores 71365 bytes (8.7916 bpp). `best` selects the range stream. The C++ decoder matches the Python image to 2.98e-7 max abs on that file. A steps-0 PCA latent of the same grids is 78880 deflate bytes versus 71006 range bytes. On an artificial 64x64 grid of repeated 8x8 blocks, deflate is smaller (396 vs 1961), and `best` keeps deflate.
 
 ## Measurements
 
@@ -427,6 +427,31 @@ Lavapipe (Mesa 25.2.8, vendor `0x10005`, device type CPU, subgroup size 8, `shad
 OpenGL 4.5 llvmpipe, compute and fragment vs the CPU reference: max abs 0. `GL_KHR_shader_subgroup` is not present, so the reported subgroup size is 0. The 4.6 context request returns `EGL_BAD_MATCH`. The shaders are GLSL 450 and do not use a 4.6-only feature.
 
 `pytest` covers the container, the quantizer, the reference decoder, filtering, and the cost model. `ctest` runs the C++ decoder against the fixture. glslang compiles the SPIR-V. CI is `.github/workflows/ci.yml`.
+
+### RX 9070 training
+
+`bench/train_sweep.ps1` on Windows 11, AMD Radeon RX 9070, ROCm 7.2.1, torch 2.9.1+rocm7.2.1, backend `rocm`. Wall times are the script's `wall` field. bpp is the deflate rate from that run (`latent_coder` was still deflate).
+
+| job | PSNR | bpp | wall s |
+| --- | --- | --- | --- |
+| metal_g16_s800_mip0 | 36.1321 | 10.4712 | 15.0 |
+| metal_g16_s2000_foot | 37.9472 | 10.9705 | 59.3 |
+| metal_g16_s4000_foot | 38.8116 | 11.4863 | 118.1 |
+| paving_g16_s2000_foot | 33.5768 | 11.2455 | 59.7 |
+| paving_g16_s4000_foot | 33.9188 | 11.9886 | 119.3 |
+| metal_g10_s2000_foot | 32.9017 | 7.6558 | 57.7 |
+| paving_g10_s2000_foot | 29.9804 | 7.3474 | 58.4 |
+| metal_pool8_s80_foot | 27.4268 | 14.1641 | 32.0 |
+
+The 4000-step footprint metal point is 38.8116 dB at 11.4863 bpp. ASTC 6x6 on this material is 38.275 dB at 17.778 bpp. The paving 4000-step point is 33.9188 dB at 11.9886 bpp. ASTC 6x6 on paving is 33.727 dB at 17.778 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8 on quality (metal 32.9017 vs 34.072, paving 29.9804 vs 30.981) at a lower rate. The 80-step pool of 8 picked a 14.164 bpp network at 27.4268 dB. That job is too short to rank grids.
+
+The same 800-step mip-0 configuration on this CPU (torch 2.14.1+cpu) is 37.049 dB at deflate 10.517 bpp, train 10.71 s. The GPU result is 36.1321 dB, 0.917 dB lower, wall 15.0 s. The wall time is the same order as the CPU 800-step train, not the CPU 80-step train (1.10 s, 36.137 dB). The encoder did not seed the ROCm generator or disable TF32 on that run. Both are set now for `torch.cuda` devices. Whether that closes the 0.917 dB is not measured.
+
+`bench/train_max.ps1` (and `bench/train_max.sh`) is the longer run. It downloads the extra CC0 set (`--preset max`: wood_floor, denim_fabric, aerial_rocks_01, forest_ground_04, plastered_wall, concrete_floor_02 at 1K, plus wood_floor and aerial_rocks_01 at 2K), probes 400 steps of fp32 against bf16 and keeps the higher PSNR for the rest, then runs seed pools and continuations. A job with a finished json is skipped. A `.pt` without a finished json is resumed. Output is `results/train_max/`. The printed `estimate_s` uses 118.1/4000 seconds per 256^2 step. 1024^2 full-frame steps scale by 16. The 2048 jobs sample 1024^2 pixels per step, so they also scale by 16. Early stop (8 evals, each 500 steps, without a 0.01 dB gain on the full-image 8-bit PSNR) can end a job earlier. Summing the planned steps at that rate is 2.94 hours before early stop. The script prints `estimate_s`. That figure is the extrapolation, not a completed run.
+
+### Workgroup staging
+
+`NTC_STAGE` in the compute shader copies the weight span and the latent rows touched by the 8x8 workgroup into shared memory, then the same `ntc_eval` reads them. `ntc_decompress_stage.comp` and `ntc_decompress_fp16_stage.comp`. On lavapipe, `stage_max_abs` is 0 for `tests/fixtures/tiny.ntc` and for the 256 range-coded metal file above. `fp16_stage_max_abs` matched the unstaged fp16 path: 0.000134453 on the fixture and 0.00292987 on that 256 file. No staged timing is a performance number.
 
 ## What is pending hardware
 
