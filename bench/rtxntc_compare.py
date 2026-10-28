@@ -225,6 +225,68 @@ def _write_decoded(blob: bytes, semantics: list[int], dest: Path) -> None:
             image.save(path)
 
 
+def bd_rate(
+    anchor_rate: list[float],
+    anchor_psnr: list[float],
+    test_rate: list[float],
+    test_psnr: list[float],
+) -> float:
+    """Bjontegaard rate difference of ``test`` against ``anchor``, in percent.
+
+    Positive means ``test`` spends more rate for the same PSNR. Identical
+    curves are 0. The integral is over the overlapping PSNR range.
+    """
+    anchor_r = np.log(np.asarray(anchor_rate, dtype=np.float64))
+    anchor_p = np.asarray(anchor_psnr, dtype=np.float64)
+    test_r = np.log(np.asarray(test_rate, dtype=np.float64))
+    test_p = np.asarray(test_psnr, dtype=np.float64)
+    order_a = np.argsort(anchor_p)
+    order_t = np.argsort(test_p)
+    anchor_r, anchor_p = anchor_r[order_a], anchor_p[order_a]
+    test_r, test_p = test_r[order_t], test_p[order_t]
+    low = float(max(anchor_p[0], test_p[0]))
+    high = float(min(anchor_p[-1], test_p[-1]))
+    if not np.isfinite(low) or not np.isfinite(high) or high <= low + 1e-6:
+        return float("nan")
+    degree = int(min(3, len(anchor_p) - 1, len(test_p) - 1))
+    poly_a = np.polyfit(anchor_p, anchor_r, degree)
+    poly_t = np.polyfit(test_p, test_r, degree)
+    int_a = np.polyint(poly_a)
+    int_t = np.polyint(poly_t)
+    area = (np.polyval(int_t, high) - np.polyval(int_t, low)) - (
+        np.polyval(int_a, high) - np.polyval(int_a, low)
+    )
+    return float((np.exp(area / (high - low)) - 1.0) * 100.0)
+
+
+def summary_table(ours: list[dict], rtx: list[dict]) -> dict:
+    """One row per material and a BD-rate of ntc against RTXNTC on BPPC.
+
+    RTXNTC rows come from the published ``ntc-cli`` only. Missing rows are
+    omitted. ``bppc`` includes the MLP. ``latent_bpp_mip0`` does not.
+    """
+    by_material: dict[str, dict[str, list]] = {}
+    for row in ours:
+        if row.get("error") or row.get("bppc") is None or row.get("psnr_u8") is None:
+            continue
+        bucket = by_material.setdefault(str(row["material"]), {"ours_bppc": [], "ours_psnr": [], "rtx_bppc": [], "rtx_psnr": []})
+        bucket["ours_bppc"].append(float(row["bppc"]))
+        bucket["ours_psnr"].append(float(row["psnr_u8"]))
+    for row in rtx:
+        if row.get("error") or row.get("bppc") is None or row.get("psnr_u8") is None:
+            continue
+        bucket = by_material.setdefault(str(row["material"]), {"ours_bppc": [], "ours_psnr": [], "rtx_bppc": [], "rtx_psnr": []})
+        bucket["rtx_bppc"].append(float(row["bppc"]))
+        bucket["rtx_psnr"].append(float(row["psnr_u8"]))
+    materials = []
+    for name, cols in sorted(by_material.items()):
+        rate = None
+        if len(cols["ours_bppc"]) >= 2 and len(cols["rtx_bppc"]) >= 2:
+            rate = bd_rate(cols["rtx_bppc"], cols["rtx_psnr"], cols["ours_bppc"], cols["ours_psnr"])
+        materials.append({"material": name, "bd_rate_percent": rate, "ours": len(cols["ours_bppc"]), "rtx": len(cols["rtx_bppc"])})
+    return {"materials": materials, "note": "bd_rate_percent is ntc versus ntc-cli on bppc. Positive means ntc uses more rate."}
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--materials", type=Path, default=Path("data/materials"))
