@@ -1,0 +1,23 @@
+gl vendor ATI Technologies Inc. renderer AMD Radeon RX 9070 version 4.6.0 Core Profile Context 26.10.1.261008
+gl_subgroup 64
+gl_software 0
+gl_compute_max_abs 2.38419e-07
+gl_fragment_max_abs 1.78814e-07
+bench load_fp32 median_ms 0.13836 p95_ms 0.1424 texels_s 6.31541e+08 gb_s 22.7355
+bench load_fp16 skipped no_gl_fp16
+wrote results\hw_encode\PavingStones070_opengl/gl_ntc_fp32.f32 256 256 9
+bench sample_native_fp32 median_ms 0.10848 p95_ms 0.11648 texels_s 6.0413e+08 gb_s 21.7487
+bench sample_1920x1080_fp32 median_ms 2.86964 p95_ms 2.87748 texels_s 7.22599e+08 gb_s 26.0136
+bench sample_3840x2160_fp32 median_ms 11.3469 p95_ms 11.3653 texels_s 7.30983e+08 gb_s 26.3154
+bench lit_native_fp32 median_ms 0.08248 p95_ms 0.08376 texels_s 7.94568e+08 gb_s 9.53482
+wrote results\hw_encode\PavingStones070_opengl/gl_lit_fp32.f32
+bench bc7_1920x1080 median_ms 0.95284 p95_ms 0.95788 texels_s 2.17623e+09 gb_s 34.8197
+bench bc7_3840x2160 median_ms 4.43172 p95_ms 4.436 texels_s 1.8716e+09 gb_s 29.9456
+wrote results\hw_encode\PavingStones070_opengl/bc7.f32 256 256
+bench bc1_1920x1080 median_ms 0.95308 p95_ms 0.95904 texels_s 2.17568e+09 gb_s 34.8109
+bench bc1_3840x2160 median_ms 4.43168 p95_ms 4.43736 texels_s 1.87162e+09 gb_s 29.9458
+wrote results\hw_encode\PavingStones070_opengl/bc1.f32 256 256
+bench bc5_1920x1080 median_ms 0.9542 p95_ms 0.95832 texels_s 2.17313e+09 gb_s 34.7701
+bench bc5_3840x2160 median_ms 4.4316 p95_ms 4.43584 texels_s 1.87165e+09 gb_s 29.9464
+wrote results\hw_encode\PavingStones070_opengl/bc5.f32 256 256
+ok

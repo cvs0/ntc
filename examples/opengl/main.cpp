@@ -25,6 +25,7 @@
 #endif
 
 #include <algorithm>
+#include <cstring>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -190,6 +191,22 @@ static void check_shader(GLuint s) {
     }
 }
 
+static std::string inject_after_version(const std::string& src, const std::string& extra) {
+    const auto pos = src.find('\n');
+    if (pos == std::string::npos) return extra + src;
+    return src.substr(0, pos + 1) + extra + src.substr(pos + 1);
+}
+
+static bool gl_ext(const char* name) {
+    GLint n = 0;
+    glGetIntegerv(0x821D, &n);  // GL_NUM_EXTENSIONS
+    for (GLint i = 0; i < n; ++i) {
+        const auto* s = reinterpret_cast<const char*>(glGetStringi(0x1F03, static_cast<GLuint>(i)));
+        if (s && std::strcmp(s, name) == 0) return true;
+    }
+    return false;
+}
+
 static GLuint program_from(const std::string& comp_src) {
     GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
     const char* p = comp_src.c_str();
@@ -314,6 +331,13 @@ static void run_gl_bench(const ntc::TextureSet& ts, const ntc::GpuUpload& up, co
     const std::string lib = read_text(dir + "/ntc_decode.glsl");
     GLuint prog = program_from(splice(read_text(dir + "/ntc_decompress_gl.comp"), lib));
     GLuint sample = program_from(splice(read_text(dir + "/ntc_sample_res_gl.comp"), lib));
+    GLuint stage = 0;
+    try {
+        std::string stage_src = inject_after_version(read_text(dir + "/ntc_decompress_stage.comp"), "#define NTC_GL 1\n");
+        stage = program_from(splice(stage_src, lib));
+    } catch (const std::exception& ex) {
+        std::cout << "bench load_fp32_stage skipped " << ex.what() << "\n";
+    }
     GLuint lit = 0;
     if (c >= 6) lit = program_from(splice(read_text(dir + "/ntc_lit_gl.comp"), lib));
 
@@ -359,9 +383,89 @@ static void run_gl_bench(const ntc::TextureSet& ts, const ntc::GpuUpload& up, co
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
     };
     const double load_bytes = static_cast<double>(mip_texels) * c * 4.0;
+    std::cout << "note load_pass one_dispatch_per_mip 8x8 point_ntc_eval ssbo_f32\n";
     report_pass("load_fp32", summarize(time_query(warmup, iters, load_body)), static_cast<double>(mip_texels),
                 load_bytes, software);
-    std::cout << "bench load_fp16 skipped no_gl_fp16\n";
+    if (stage) {
+        auto stage_body = [&]() {
+            glUseProgram(stage);
+            for (int m = 0; m < nmips; ++m) {
+                const int mw = std::max(1, w >> m);
+                const int mh = std::max(1, h >> m);
+                set_pc(static_cast<uint32_t>(m), 0, 0, 0);
+                glDispatchCompute((mw + 7) / 8, (mh + 7) / 8, 1);
+            }
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        };
+        report_pass("load_fp32_stage", summarize(time_query(warmup, iters, stage_body)),
+                    static_cast<double>(mip_texels), load_bytes, software);
+    }
+    // float16_t from, in order: the EXT arithmetic types, AMD half, NV gpu shader 5.
+    GLuint fp16 = 0;
+    GLuint fp16_stage = 0;
+    const char* fp16_tag = nullptr;
+    const char* fp16_def = nullptr;
+    if (gl_ext("GL_EXT_shader_explicit_arithmetic_types_float16") ||
+        gl_ext("GL_EXT_shader_explicit_arithmetic_types")) {
+        fp16_tag = "GL_EXT_shader_explicit_arithmetic_types_float16";
+        fp16_def = "#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require\n"
+                   "#define NTC_FP16 1\n#define NTC_FP16_EXT_DONE 1\n";
+    } else if (gl_ext("GL_AMD_gpu_shader_half_float")) {
+        fp16_tag = "GL_AMD_gpu_shader_half_float";
+        fp16_def = "#extension GL_AMD_gpu_shader_half_float : require\n"
+                   "#define NTC_FP16 1\n#define NTC_FP16_AMD 1\n#define NTC_FP16_EXT_DONE 1\n";
+    } else if (gl_ext("GL_NV_gpu_shader5")) {
+        fp16_tag = "GL_NV_gpu_shader5";
+        fp16_def = "#extension GL_NV_gpu_shader5 : require\n"
+                   "#define NTC_FP16 1\n#define NTC_FP16_NV 1\n#define NTC_FP16_EXT_DONE 1\n";
+    }
+    if (fp16_def) {
+        try {
+            std::string src = inject_after_version(read_text(dir + "/ntc_decompress_gl.comp"), fp16_def);
+            fp16 = program_from(splice(src, lib));
+            std::string ssrc = inject_after_version(read_text(dir + "/ntc_decompress_stage.comp"),
+                                                    std::string("#define NTC_GL 1\n") + fp16_def);
+            fp16_stage = program_from(splice(ssrc, lib));
+            std::cout << "fp16_ext " << fp16_tag << "\n";
+        } catch (const std::exception& ex) {
+            std::cout << "bench load_fp16 skipped compile\n";
+            std::cout << "bench load_fp16_stage skipped compile\n";
+            std::cout << "fp16_ext_error " << fp16_tag << "\n";
+            fp16 = 0;
+            fp16_stage = 0;
+        }
+    } else {
+        std::cout << "bench load_fp16 skipped no_gl_fp16\n";
+        std::cout << "bench load_fp16_stage skipped no_gl_fp16\n";
+    }
+    if (fp16) {
+        auto body = [&]() {
+            glUseProgram(fp16);
+            for (int m = 0; m < nmips; ++m) {
+                const int mw = std::max(1, w >> m);
+                const int mh = std::max(1, h >> m);
+                set_pc(static_cast<uint32_t>(m), 0, 0, 0);
+                glDispatchCompute((mw + 7) / 8, (mh + 7) / 8, 1);
+            }
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        };
+        report_pass("load_fp16", summarize(time_query(warmup, iters, body)), static_cast<double>(mip_texels),
+                    load_bytes, software);
+    }
+    if (fp16_stage) {
+        auto body = [&]() {
+            glUseProgram(fp16_stage);
+            for (int m = 0; m < nmips; ++m) {
+                const int mw = std::max(1, w >> m);
+                const int mh = std::max(1, h >> m);
+                set_pc(static_cast<uint32_t>(m), 0, 0, 0);
+                glDispatchCompute((mw + 7) / 8, (mh + 7) / 8, 1);
+            }
+            glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
+        };
+        report_pass("load_fp16_stage", summarize(time_query(warmup, iters, body)), static_cast<double>(mip_texels),
+                    load_bytes, software);
+    }
 
     std::vector<float> gpu(static_cast<size_t>(w * h * c));
     load_body();
@@ -389,6 +493,7 @@ static void run_gl_bench(const ntc::TextureSet& ts, const ntc::GpuUpload& up, co
         report_pass(name, summarize(time_query(warmup, iters, body)), static_cast<double>(ow) * oh,
                     static_cast<double>(nfloat) * 4.0, software);
     };
+    std::cout << "note sample_pass one_dispatch 8x8 point_ntc_eval mip0 ssbo_f32 no_filter\n";
     sample_res(w, h, "sample_native_fp32");
     sample_res(1920, 1080, "sample_1920x1080_fp32");
     sample_res(3840, 2160, "sample_3840x2160_fp32");

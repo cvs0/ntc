@@ -48,13 +48,13 @@ if (-not (Test-Path "build\CMakeCache.txt")) {
     if (Test-Path $vswhere) {
         $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
         if ($vs) {
-            cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+            cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DVCPKG_APPLOCAL_DEPS=OFF
             if ($LASTEXITCODE -eq 0) { $configured = $true }
             else { if (Test-Path build) { Remove-Item -Recurse -Force build } }
         }
     }
     if (-not $configured) {
-        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DVCPKG_APPLOCAL_DEPS=OFF
         if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
     }
 }
@@ -64,6 +64,34 @@ ctest --test-dir build -C Release --output-on-failure
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 & $py bench/download_materials.py --dest data/materials
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+# astcenc 5.7.0 Windows x64. The zip hash is the one published on the
+# ARM-software/astc-encoder 5.7.0 release. ASTCENC skips the download.
+$astcDir = "tools\astcenc"
+$astcExe = Join-Path $astcDir "astcenc-avx2.exe"
+if ($env:ASTCENC -and (Test-Path $env:ASTCENC)) {
+    $astcExe = $env:ASTCENC
+} elseif (-not (Test-Path $astcExe)) {
+    New-Item -ItemType Directory -Force -Path $astcDir | Out-Null
+    $zip = Join-Path $astcDir "astcenc-5.7.0-windows-x64.zip"
+    $url = "https://github.com/ARM-software/astc-encoder/releases/download/5.7.0/astcenc-5.7.0-windows-x64.zip"
+    Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+    $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash.ToLower()
+    $want = "cbde7c78adcc90d0d90ecf10f32d03f3340fbe1720cb6d6c892147d625e74d2d"
+    if ($hash -ne $want) {
+        Write-Host "astcenc zip sha256 $hash != $want"
+        exit 1
+    }
+    Expand-Archive -Path $zip -DestinationPath $astcDir -Force
+    $found = Get-ChildItem -Path $astcDir -Recurse -Filter astcenc-avx2.exe | Select-Object -First 1
+    if (-not $found) { Write-Host "astcenc-avx2.exe was not in the zip"; exit 1 }
+    $dest = Join-Path $astcDir "astcenc-avx2.exe"
+    if ($found.FullName -ne [System.IO.Path]::GetFullPath($dest)) {
+        Copy-Item $found.FullName $dest -Force
+    }
+    $astcExe = $dest
+}
+$env:PATH = "$(Resolve-Path (Split-Path $astcExe -Parent));$env:PATH"
+$env:ASTCENC = (Resolve-Path $astcExe).Path
 $vk = "build\ntc_vk.exe"
 $gl = "build\ntc_gl.exe"
 if (-not (Test-Path $vk)) { $vk = "build\Release\ntc_vk.exe" }

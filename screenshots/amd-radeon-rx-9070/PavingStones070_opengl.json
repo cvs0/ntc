@@ -1,0 +1,14 @@
+{
+  "panels": [
+    "albedo",
+    "normal",
+    "orm"
+  ],
+  "written": [
+    "PavingStones070_opengl_albedo.png",
+    "PavingStones070_opengl_normal.png",
+    "PavingStones070_opengl_orm.png",
+    "PavingStones070_opengl_lit.png",
+    "PavingStones070_opengl_bc7.png"
+  ]
+}

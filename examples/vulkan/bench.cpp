@@ -271,14 +271,19 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         lit = make_compute(dev, shader_dir + "/ntc_lit.comp.spv", desc.buffer, desc.size, blob.buffer, blob.size,
                            outb.buffer, outb.size);
     }
-    Pipe fp16p;
-    if (float16) {
-        const std::string p = shader_dir + "/ntc_decompress_fp16.comp.spv";
-        std::ifstream probe(p);
+    auto maybe_pipe = [&](const std::string& file) {
+        Pipe p;
+        std::ifstream probe(file);
         if (probe) {
-            fp16p = make_compute(dev, p, desc.buffer, desc.size, blob.buffer, blob.size, outb.buffer, outb.size);
+            p = make_compute(dev, file, desc.buffer, desc.size, blob.buffer, blob.size, outb.buffer, outb.size);
         }
-    }
+        return p;
+    };
+    Pipe fp16p;
+    if (float16) fp16p = maybe_pipe(shader_dir + "/ntc_decompress_fp16.comp.spv");
+    Pipe stage = maybe_pipe(shader_dir + "/ntc_decompress_stage.comp.spv");
+    Pipe stage16;
+    if (float16) stage16 = maybe_pipe(shader_dir + "/ntc_decompress_fp16_stage.comp.spv");
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qfam;
@@ -355,28 +360,29 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         vkCmdDispatch(c, gx, gy, 1);
     };
 
-    const PassStats load = time_records([&](VkCommandBuffer c) {
-        for (uint32_t m = 0; m < nmips; ++m) {
-            const uint32_t mw = std::max(1u, base_w >> m);
-            const uint32_t mh = std::max(1u, base_h >> m);
-            bind_dispatch(c, fp32, m, 0, 0, 0, (mw + 7) / 8, (mh + 7) / 8);
-        }
-    });
     const double load_bytes = double(mip_texels) * channels * 4.0;
-    report("load_fp32", load, double(mip_texels), load_bytes, cpu_dev);
-
-    if (fp16p.pipe) {
-        const PassStats load16 = time_records([&](VkCommandBuffer c) {
+    auto time_load = [&](Pipe& p, const char* name, const char* skip) {
+        if (!p.pipe) {
+            std::cout << "bench " << name << " skipped " << skip << "\n";
+            return;
+        }
+        const PassStats st = time_records([&](VkCommandBuffer c) {
             for (uint32_t m = 0; m < nmips; ++m) {
                 const uint32_t mw = std::max(1u, base_w >> m);
                 const uint32_t mh = std::max(1u, base_h >> m);
-                bind_dispatch(c, fp16p, m, 0, 0, 0, (mw + 7) / 8, (mh + 7) / 8);
+                bind_dispatch(c, p, m, 0, 0, 0, (mw + 7) / 8, (mh + 7) / 8);
             }
         });
-        report("load_fp16", load16, double(mip_texels), load_bytes, cpu_dev);
-    } else {
-        std::cout << "bench load_fp16 skipped shaderFloat16\n";
-    }
+        report(name, st, double(mip_texels), load_bytes, cpu_dev);
+    };
+    // One dispatch per mip, 8x8, one ntc_eval per texel, point sample.
+    // Timestamps bracket those dispatches. The barrier between iterations
+    // is outside the pair. Output is an SSBO of fp32 channels.
+    std::cout << "note load_pass one_dispatch_per_mip 8x8 point_ntc_eval ssbo_f32\n";
+    time_load(fp32, "load_fp32", "missing_shader");
+    time_load(fp16p, "load_fp16", "shaderFloat16");
+    time_load(stage, "load_fp32_stage", "missing_shader");
+    time_load(stage16, "load_fp16_stage", float16 ? "missing_shader" : "shaderFloat16");
 
     auto sample_at = [&](uint32_t w, uint32_t h, const char* tag) {
         if (cpu_dev && (w > 512 || h > 512)) {
@@ -389,6 +395,11 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         const double texels = double(w) * double(h);
         report(tag, st, texels, texels * channels * 4.0, cpu_dev);
     };
+    // One 8x8 dispatch. Each thread calls ntc_eval once at mip 0 (point,
+    // no derivatives, no footprint). Writes `channels` fp32 values. The
+    // 1920 and 3840 passes are that many MLP evaluations, not a blit of
+    // the 256 image. No overdraw.
+    std::cout << "note sample_pass one_dispatch 8x8 point_ntc_eval mip0 ssbo_f32 no_filter\n";
     sample_at(base_w, base_h, "sample_native_fp32");
     sample_at(1920, 1080, "sample_1920x1080_fp32");
     sample_at(3840, 2160, "sample_3840x2160_fp32");
@@ -616,6 +627,10 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
             report((std::string(tag) + suffix).c_str(), st, double(w) * double(h), double(w) * double(h) * 16.0,
                    cpu_dev);
         };
+        // One 8x8 dispatch. One linear texture() of the native-resolution
+        // block image, magnified to the output size, written as 4 fp32s.
+        // The upload is not inside the timestamp pair.
+        std::cout << "note bc_pass one_dispatch 8x8 linear_sample ssbo_rgba32f magnify\n";
         time_res(1920, 1080, "_1920x1080");
         time_res(3840, 2160, "_3840x2160");
         {
@@ -657,6 +672,8 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
     destroy_pipe(dev, sample);
     destroy_pipe(dev, lit);
     destroy_pipe(dev, fp16p);
+    destroy_pipe(dev, stage);
+    destroy_pipe(dev, stage16);
     destroy_buf(dev, desc);
     destroy_buf(dev, blob);
     destroy_buf(dev, outb);

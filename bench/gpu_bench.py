@@ -7,8 +7,8 @@ Rows tagged ``not_a_performance_claim`` are CPU devices. 1920x1080 and
 
 NTCB block files are written by ``bench/bc_pack.py`` (BC7 mode 6, BC1, BC5).
 That is not the ``bc7enc`` encoder used for the rate-distortion table.
-``astcenc`` is recorded and skipped unless it is on ``PATH``. RTXNTC is probed
-and not required.
+``astcenc`` is used for 6x6 screenshot panels when ``ASTCENC``, ``tools/astcenc``,
+or ``PATH`` has the binary. RTXNTC is probed and not required.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import subprocess
 from pathlib import Path
 
 from bc_pack import write_material_blocks
-from make_shots import write_material
+from make_shots import write_astc_panels, write_material
 
 from ntc.encode import TrainConfig, encode_arrays
 from ntc.materials import load_material
@@ -62,6 +62,8 @@ def _kv_line(line: str) -> tuple[str, str] | None:
         "timestamp_period_ns",
         "device_index",
         "device_count",
+        "fp16_ext",
+        "fp16_ext_error",
     }:
         return key, value.strip()
     return None
@@ -122,14 +124,34 @@ def probe_rtxntc() -> dict:
     return {"available": True, "path": exe, "reason": "ntc-cli is on PATH. This script does not invoke it."}
 
 
+def find_astcenc() -> str | None:
+    env = os.environ.get("ASTCENC")
+    candidates = []
+    if env:
+        candidates.append(Path(env))
+    candidates += [
+        Path("tools/astcenc/astcenc-avx2.exe"),
+        Path("tools/astcenc/astcenc-avx2"),
+        Path("tools/astcenc/astcenc"),
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    return shutil.which("astcenc") or shutil.which("astcenc-avx2") or shutil.which("astcenc-native")
+
+
 def probe_astc() -> dict:
-    exe = shutil.which("astcenc") or shutil.which("astcenc-avx2") or shutil.which("astcenc-native")
+    exe = find_astcenc()
     if not exe:
         return {
             "available": False,
-            "reason": "astcenc is not on PATH. ASTC screenshot panels are skipped. The rate table still uses the earlier astcenc 5.7.0 numbers.",
+            "reason": "astcenc is not on PATH and tools/astcenc is empty. ASTC screenshot panels are skipped. The rate table still uses the earlier astcenc 5.7.0 numbers.",
         }
-    return {"available": True, "path": exe, "reason": "astcenc is on PATH. Screenshot panels still use BC7 mode 6 from bc_pack.py. The rate table is unchanged."}
+    return {
+        "available": True,
+        "path": exe,
+        "reason": "astcenc 6x6 -medium panels are written next to the GPU screenshots. The rate table is unchanged.",
+    }
 
 
 def _encode_material(manifest: Path, dest: Path, bpp: float) -> dict:
@@ -249,6 +271,7 @@ def main() -> None:
         jobs.append({"material": path.stem, "ntc": path, "semantics": [], "reference": None, "bc_dir": None})
 
     runs = []
+    astc_done = set()
     gpu = {}
     gl_info = {}
     shot_dir = None
@@ -331,6 +354,17 @@ def main() -> None:
             )
             if shot_dir is not None and job.get("reference") is not None and code == 0:
                 write_material(shot_dir, api, job["material"], job["reference"], job["semantics"], read_dir)
+                exe = find_astcenc()
+                if exe and job["material"] not in astc_done:
+                    astc_done.add(job["material"])
+                    write_astc_panels(
+                        shot_dir,
+                        job["material"],
+                        job["reference"],
+                        job["semantics"],
+                        exe,
+                        Path("results") / "hw_encode" / "astc_work",
+                    )
 
     if hw_dir is None:
         hw_dir = args.out / ("software" if args.software else "unknown")

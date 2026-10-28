@@ -1,0 +1,14 @@
+{
+  "panels": [
+    "albedo",
+    "normal",
+    "orm"
+  ],
+  "written": [
+    "metal_plate_opengl_albedo.png",
+    "metal_plate_opengl_normal.png",
+    "metal_plate_opengl_orm.png",
+    "metal_plate_opengl_lit.png",
+    "metal_plate_opengl_bc7.png"
+  ]
+}

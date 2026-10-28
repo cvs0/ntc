@@ -198,7 +198,7 @@ Shipped 16.084 bpp network, one feature-bilinear texel:
 | unique latent bytes in an 8x8 tile | 2.9375 per texel |
 | same tile, no reuse | 24 per texel |
 
-Color bilinear multiplies the MLP term by 4 (1920 MACs, 4488 flops). Feature trilinear multiplies it by 2. The shipped compute shader is one thread per texel and does not stage the 8x8 tile. The 2.9375 byte figure is the fetch count if a workgroup did. No GPU timing of that optimization exists.
+Color bilinear multiplies the MLP term by 4 (1920 MACs, 4488 flops). Feature trilinear multiplies it by 2. The sample pass used by `run_all` is one thread per output pixel and does not stage the tile. `load_fp32_stage` and `load_fp16_stage` are the staged load dispatches. The RX 9070 report below is from c33648b, before those two rows existed.
 
 Baking the per-channel latent scale into the first int8 matrix is not exact: the scale is fp16 and the stored weights are integer. The dequant is 12 flops and 12 scale bytes on this network, next to 960 dot flops. It was not implemented.
 
@@ -237,7 +237,7 @@ ntc_eval_filtered(uv, dudx, dudy, lod, frame, /*filt*/ 1u, /*maxAniso*/ 8u);
 
 `examples/vulkan/main.cpp`: `ntc_vk file.ntc spv_dir [--device index|name] [--bench outdir] [--warmup N] [--iters N] [--bc7 file] [--bc1 file] [--bc5 file]`. Prints `device_count`, one `device_list` line per physical device (index, name, vendor, device id, type), then the selected device's name, vendor id, device id, raw driver version, API version, and subgroup size. Selection is the integer index or a case-insensitive name substring when `--device` is set, otherwise discrete, then integrated, then CPU. The fp32 compute shader is compared to `ntc::decode_mip` with tolerance `1e-3`. If `shaderFloat16` is set, it also runs `ntc_decompress_fp16.comp`. Cooperative matrix is queried and ignored. `--bench` times inference-on-load (every mip) and inference-on-sample at the texture size, 1920x1080, and 3840x2160 with `vkCmdWriteTimestamp`, after warmup submits. Median and p95 are printed with texels/s and GB/s of the written output. A CPU device skips resolutions above 512 and tags every row `not_a_performance_claim`. Optional `--bc7`, `--bc1`, and `--bc5` are NTCB files (`bench/bc_pack.py`): sampled at the same resolutions. The host writes `vk_ntc_fp32.f32` and, when the file has at least six channels, `vk_lit_fp32.f32`.
 
-`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir` with the same `--bench`, `--warmup`, `--iters`, and block-file flags. Linux uses a surfaceless EGL context. Windows creates a hidden window and a core-profile WGL context (`wglCreateContextAttribsARB`, 4.6 then 4.5) and loads GL entry points with `wglGetProcAddress`. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`. `--bench` uses `GL_TIME_ELAPSED`. There is no fp16 GL decode path. A renderer string containing llvmpipe, softpipe, or swiftshader is tagged `not_a_performance_claim` and skips resolutions above 512. Readbacks are `gl_ntc_fp32.f32` and `gl_lit_fp32.f32`.
+`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir` with the same `--bench`, `--warmup`, `--iters`, and block-file flags. Linux uses a surfaceless EGL context. Windows creates a hidden window and a core-profile WGL context (`wglCreateContextAttribsARB`, 4.6 then 4.5) and loads GL entry points with `wglGetProcAddress`. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`. `--bench` uses `GL_TIME_ELAPSED`. The fp16 load path is compiled when the context advertises `GL_EXT_shader_explicit_arithmetic_types_float16`, `GL_EXT_shader_explicit_arithmetic_types`, `GL_AMD_gpu_shader_half_float`, or `GL_NV_gpu_shader5`, in that order. The extension that linked is printed as `fp16_ext`. If none is present, or the compile fails, the row is `load_fp16 skipped no_gl_fp16` or `skipped compile`. A renderer string containing llvmpipe, softpipe, or swiftshader is tagged `not_a_performance_claim` and skips resolutions above 512. Readbacks are `gl_ntc_fp32.f32` and `gl_lit_fp32.f32`.
 
 CPU reference: `ntc_decode file.ntc out.f32 [--mip N]`.
 
@@ -375,7 +375,7 @@ More Adam steps on the locked metal grids, mip 0 loss, cosine decay already in t
 | 320 | 36.446 | 10.123 | +0.697 | 4.58 |
 | 800 | 37.049 | 10.517 | +1.299 | 10.71 |
 
-The 320 to 800 step is still +0.603 dB. 37.049 is 1.226 dB under ASTC 6x6. 2000 and 4000 steps are in `bench/train_sweep.py` and have not been measured. Paving at 160 steps is 31.858 dB (+0.170) at deflate 9.455 bpp, still under ASTC 6x6.
+The 320 to 800 step is still +0.603 dB. 37.049 is 1.226 dB under ASTC 6x6. The 2000 and 4000 step jobs were measured on the RX 9070. That table is below. Paving at 160 steps is 31.858 dB (+0.170) at deflate 9.455 bpp, still under ASTC 6x6.
 
 Automatic selector, deflate and footprint, 40 steps (`results/rd_round2.json`):
 
@@ -457,7 +457,7 @@ The same 800-step mip-0 configuration on this CPU (torch 2.14.1+cpu) is 37.049 d
 
 ### Workgroup staging
 
-`NTC_STAGE` in the compute shader copies the weight span and the latent rows touched by the 8x8 workgroup into shared memory, then the same `ntc_eval` reads them. `ntc_decompress_stage.comp` and `ntc_decompress_fp16_stage.comp`. On lavapipe, `stage_max_abs` is 0 for `tests/fixtures/tiny.ntc` and for the 256 range-coded metal file above. `fp16_stage_max_abs` matched the unstaged fp16 path: 0.000134453 on the fixture and 0.00292987 on that 256 file. No staged timing is a performance number.
+`NTC_STAGE` in the compute shader copies the weight span and the latent rows touched by the 8x8 workgroup into shared memory, then the same `ntc_eval` reads them. `ntc_decompress_stage.comp` and `ntc_decompress_fp16_stage.comp`. On lavapipe, `stage_max_abs` is 0 for `tests/fixtures/tiny.ntc` and for the 256 range-coded metal file above. `fp16_stage_max_abs` matched the unstaged fp16 path: 0.000134453 on the fixture and 0.00292987 on that 256 file. `--bench` now times those shaders as `load_fp32_stage` and `load_fp16_stage` (one dispatch per mip, same output as `load_fp32`). The c33648b RX 9070 log does not have those rows.
 
 ## What is pending hardware
 
@@ -487,7 +487,7 @@ powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
 sh bench/run_all.sh
 ```
 
-`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (the VS 2022 generator when Visual Studio is installed, otherwise Ninja), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. ASTC panels are skipped unless `astcenc` is on `PATH`; the skip reason is in the report. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
+`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (the VS 2022 generator when Visual Studio is installed, otherwise Ninja), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. `run_all.ps1` downloads astcenc 5.7.0 (`astcenc-avx2.exe`, zip sha256 `cbde7c78adcc90d0d90ecf10f32d03f3340fbe1720cb6d6c892147d625e74d2d`) into `tools/astcenc/` and writes ASTC 6x6 `-medium` panels. Set `ASTCENC` to skip the download. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
 
 `ntc_view` is `examples/realtime_viewer`. It is Vulkan 1.3 with dynamic rendering. The window is Win32 or X11. There is no second OpenGL scene renderer. The fragment shader includes `ntc_decode.glsl` and calls `ntc_eval_filtered` with lod `log2(max(|dFdx(uv)|, |dFdy(uv)|) * max(width, height))` and filter mode 4 (feature trilinear). The scene is a sphere, a plane, and a cube, orbit camera, one directional light, GGX specular, tangent frame from `dFdx/dFdy` of world position. Channel slots come from the file semantics (albedo 0..2, normal 3..5, roughness 6, metalness 7, ao 8). Keys: `1` inference-on-sample, `2` BC7 albedo plus BC5 normal plus BC7 ORM packed at load from the CPU decode, `3` the same with BC1 albedo and BC1 ORM, `4` ASTC (white placeholder; the binary has no ASTC encoder, and the format is reported unsupported when the device lacks `VK_FORMAT_ASTC_4x4_UNORM_BLOCK`), `5` the CPU decode uploaded as RGBA8, `h` albedo error heatmap against that upload, `j` wipe (left NTC, right the CPU decode), mouse drag orbits, wheel zooms. The timestamp pair is around the three draws. The overlay text (mode, resolution, GPU milliseconds, FPS from that time, bpp, material VRAM) is drawn into the readback after the timestamp, so it is not inside the query. `--benchmark` is offscreen at 1920x1080 and 2560x1440 for NTC, the BC7 transcode, and the CPU-decode reference, plus a heatmap at 1080p. A CPU device skips those sizes, renders one 256x256 NTC frame, and tags `not_a_performance_claim`. Output is `results/hw/<gpu-slug>/realtime/report.json` and `screenshots/<gpu-slug>/realtime/`. `run_all` passes `--ntc-dir results/hw_encode`, `results/train_sweep`, and `results/train_max`.
 
@@ -507,11 +507,39 @@ powershell -ExecutionPolicy Bypass -File bench\rtxntc_compare.ps1
 sh bench/rtxntc_compare.sh
 ```
 
-The 2000-step and 4000-step rows, and every millisecond in `results/hw/`, stay out of this file until those directories are measured.
+### RX 9070 decode, c33648b
+
+`bench/run_all.ps1` at c33648b. Windows 11 (`10.0.26300`), AMD Radeon RX 9070, vendor `0x1002`, device `0x7550`, Vulkan 1.4.359, subgroup 64, OpenGL 4.6.0 Core Profile Context 26.10.1.261008, driver raw `8389024`. Files: `results/hw/amd-radeon-rx-9070/report.md` and `screenshots/amd-radeon-rx-9070/`. The encode inside that run is the 40-step default, not the 4000-step sweep above. ASTC panels are absent: `astcenc` was not on `PATH`. OpenGL `load_fp16` is `no_gl_fp16` on that build. Vulkan `load_fp16` did run (shaderFloat16).
+
+What the rows measure. `load_fp32` is one 8x8 compute dispatch per mip, one point `ntc_eval` per texel, writing fp32 channels to an SSBO. The timestamp pair is around those dispatches. `sample_1920x1080_fp32` and `sample_3840x2160_fp32` are one 8x8 dispatch each. Every output pixel runs `ntc_eval` at mip 0. There is no derivative, no footprint filter, and no overdraw. A 3840x2160 sample is 8,294,400 evaluations of a 256 texture, not a blit. `bc7_3840x2160` is one 8x8 dispatch, one linear `texture()` of the native-resolution BC7 image, magnified, writing four fp32 values (16 bytes) per pixel. The BC7 upload is outside the query. It is not a fragment pass into a color attachment. That is why 4.42 ms for BC7 at 4K is not a full-screen hardware sample in the usual sense: the pass stores 3840 times 2160 times 16 bytes, about 127 MB, through a storage buffer.
+
+| pass | metal Vulkan ms | metal OpenGL ms | paving Vulkan ms |
+| --- | --- | --- | --- |
+| load_fp32 | 0.160 | 0.141 | 0.159 |
+| load_fp16 | 0.165 | skipped, no_gl_fp16 | 0.163 |
+| sample_native_fp32 | 0.120 | 0.109 | 0.119 |
+| sample_1920x1080_fp32 | 2.868 | 2.868 | 2.876 |
+| sample_3840x2160_fp32 | 11.245 | 11.340 | 11.267 |
+| bc7_1920x1080 | 0.942 | 0.949 | 0.942 |
+| bc7_3840x2160 | 4.425 | 4.435 | 4.425 |
+
+BC1 and BC5 at the same sizes match BC7 to 0.01 ms. The full table, including p95, is `results/hw/amd-radeon-rx-9070/report.md`.
+
+Vaidyanathan et al. 2023 report 1.15 to 1.92 ms total at 4K for their decoder on an RTX 4090, and 0.49 ms for BC7. On this RX 9070 the 4K NTC sample is 11.245 ms, which is 5.9 times the slow end of that band and 9.8 times the fast end. The 4K BC7 row here is 4.425 ms, 9.0 times their 0.49 ms. The NTC minus BC7 gap on this GPU is 6.82 ms. Their published gap is 0.66 to 1.43 ms. This pass is slower on both sides, and the two BC7 experiments are not the same kind of draw, so the ratio is not a claim that the MLP alone is 9 times their decoder.
+
+![metal_plate albedo, Vulkan, source / NTC / error / crop](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_albedo.png)
+
+![metal_plate lit, Vulkan](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_lit.png)
+
+![metal_plate BC7 sample, Vulkan](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_bc7.png)
+
+![PavingStones070 albedo, Vulkan](screenshots/amd-radeon-rx-9070/PavingStones070_vulkan_albedo.png)
+
+The same four panels exist for OpenGL, plus normal and orm, in that directory.
 
 ## Limitations
 
-The deflated 16 bpp network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The dedicated 10 bpp grids also lose to ASTC 8x8. 800 Adam steps reach 37.049 dB, 1.226 dB under ASTC 6x6, and the curve was still rising. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight.
+The 40-step deflated network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The 4000-step footprint points on the RX 9070 are 38.81 dB at 11.49 bpp (metal) and 33.92 dB at 11.99 bpp (paving), against ASTC 6x6 at 38.28 dB and 33.73 dB, both at 17.78 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight. The 4K sample pass is documented above. It is not the RTX 4090 fragment timing from Vaidyanathan et al. 2023.
 
 ## Prior work
 

@@ -1,4 +1,11 @@
 cmake_minimum_required(VERSION 3.20)
+# vcpkg's AppLocalFromInstalled post-build runs pwsh.exe once per target.
+# Stock Windows has powershell.exe (5.1) and does not have pwsh.exe. This
+# tree does not ship vcpkg DLLs, so the copy step is off.
+if(WIN32)
+    set(VCPKG_APPLOCAL_DEPS OFF CACHE BOOL "Skip vcpkg applocal. It requires pwsh.exe." FORCE)
+    set(CMAKE_VS_GLOBALS "VcpkgApplocalDeps=false")
+endif()
 project(ntc LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 20)

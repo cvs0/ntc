@@ -20,7 +20,15 @@
 // optional and is not bit-exact.
 
 #ifdef NTC_FP16
+#ifndef NTC_FP16_EXT_DONE
+#ifdef NTC_FP16_AMD
+#extension GL_AMD_gpu_shader_half_float : require
+#elif defined(NTC_FP16_NV)
+#extension GL_NV_gpu_shader5 : require
+#else
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#endif
+#endif
 #endif
 
 #ifdef NTC_GL
