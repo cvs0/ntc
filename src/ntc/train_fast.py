@@ -51,6 +51,19 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
 NEAR_INIT_DB = 4.0
 
 
+# Learning-rate multiplier for a grid with 8 or more channels. 1 is the
+# historical rate. On a 32 checker stand-in the historical rate put a
+# 4+12 file 7 dB under its init at step 500 (the first v2 eval) and a
+# 4+4 file did not. Half of that rate stayed within 1 dB of the init there
+# and finished higher.
+WIDE_LR_MULT = 0.5
+
+
+def wide_latent(grids) -> bool:
+    """True when any latent grid has 8 or more channels."""
+    return any(int(g[2]) >= 8 for g in grids)
+
+
 def fullres_batch_floor(
     height: int,
     width: int,
@@ -232,7 +245,12 @@ class StackedTrain(nn.Module):
             flat.append(bias)
         for param, flag in zip(flat, requires, strict=True):
             param.requires_grad_(flag)
+        # ``quantize`` is the latent STE. ``quantize_weights`` is the weight
+        # STE. ``qat_late`` turns them on together after 70% of the steps.
         self.quantize = True
+        self.quantize_weights = True
+        self.allow_weight_qat = True
+        self.wide_lr_mult = 1.0
 
     def layer_bits_of(self, index: int) -> int:
         if self.layer_bits:
@@ -288,7 +306,7 @@ class StackedTrain(nn.Module):
         """fp32 master weights. ``amp_dtype`` autocasts the GEMM only."""
         last = len(self.weights) - 1
         for li, (weight, bias) in enumerate(zip(self.weights, self.biases, strict=True)):
-            if self.quantize:
+            if self.quantize_weights:
                 ste = quantize_weight_batched(weight, self.layer_bits_of(li), self.group_size)
             else:
                 ste = weight
@@ -321,6 +339,10 @@ class StackedTrain(nn.Module):
     def slice_seeds(self, index: torch.Tensor) -> StackedTrain:
         """New module with the selected seeds. ``index`` is a long tensor."""
         out = self._blank_like(int(index.shape[0]))
+        out.quantize = self.quantize
+        out.quantize_weights = self.quantize_weights
+        out.allow_weight_qat = self.allow_weight_qat
+        out.wide_lr_mult = self.wide_lr_mult
         with torch.no_grad():
             for dst, src in zip(out.latents, self.latents, strict=True):
                 dst.copy_(src.index_select(0, index))
@@ -474,13 +496,14 @@ def _clip_no_sync(params, max_norm: float) -> None:
 
 
 def _adam_on(stacked: StackedTrain, cfg: TrainConfig, capturable: bool):
+    mult = float(stacked.wide_lr_mult)
     latent = [p for p in list(stacked.latents.parameters()) + list(stacked.log_scales.parameters()) if p.requires_grad]
     mlp = [p for p in list(stacked.weights.parameters()) + list(stacked.biases.parameters()) if p.requires_grad]
     groups = []
     if latent:
-        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult, "name": "latent"})
+        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult * mult, "name": "latent"})
     if mlp:
-        groups.append({"params": mlp, "lr": cfg.lr, "name": "mlp"})
+        groups.append({"params": mlp, "lr": cfg.lr * mult, "name": "mlp"})
     if not groups:
         raise ValueError("no trainable parameters")
     if cfg.optimizer == "lion":
@@ -603,6 +626,28 @@ def _loss_from_mips(
     return total
 
 
+def configure_wide_step(stacked: StackedTrain, grids) -> None:
+    """Halve the step size when a latent grid has 8 or more channels.
+
+    A 4-channel pair keeps the historical learning rate. That pair is the
+    ``b10`` grid, which trained. The 12-channel and 8-channel grids fell
+    several dB under the init during warmup at that rate.
+    """
+    stacked.wide_lr_mult = WIDE_LR_MULT if wide_latent(grids) else 1.0
+    if stacked.wide_lr_mult != 1.0:
+        channels = [int(g[2]) for g in grids]
+        print(f"wide latent lr x{stacked.wide_lr_mult:g}", channels, flush=True)
+
+
+def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
+    """``qat_late`` holds both STEs off until 70% of the run, then enables them."""
+    if not cfg.qat_late:
+        return
+    on = step >= int(cfg.steps * 0.7)
+    stacked.quantize = on
+    stacked.quantize_weights = bool(on and stacked.allow_weight_qat)
+
+
 def _run_loop(
     stacked: StackedTrain,
     opt: torch.optim.Optimizer,
@@ -627,15 +672,17 @@ def _run_loop(
     graph_error = None
     static_loss = None
 
-    def one_step(step: int, replay: bool) -> torch.Tensor:
-        lr = _step_lr(cfg, step) * lr_scale
+    def _group_lr(step: int) -> None:
+        lr = _step_lr(cfg, step) * lr_scale * float(stacked.wide_lr_mult)
         for group in opt.param_groups:
             if group.get("name") == "latent":
                 group["lr"] = lr * cfg.latent_lr_mult
             else:
                 group["lr"] = lr
-        if cfg.qat_late:
-            stacked.quantize = step >= int(cfg.steps * 0.7)
+
+    def one_step(step: int, replay: bool) -> torch.Tensor:
+        _group_lr(step)
+        _sync_step_qat(stacked, cfg, step)
         if cfg.coarse_to_fine:
             from ntc.train_steps import coarse_lowpass
 
@@ -697,12 +744,8 @@ def _run_loop(
                 loop_graph_from_compile = True
             # The compiled function replaces the fp32 loss path only.
             def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
-                lr = _step_lr(cfg, step) * lr_scale
-                for group in opt.param_groups:
-                    if group.get("name") == "latent":
-                        group["lr"] = lr * cfg.latent_lr_mult
-                    else:
-                        group["lr"] = lr
+                _group_lr(step)
+                _sync_step_qat(stacked, cfg, step)
                 opt.zero_grad(set_to_none=True)
                 per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
                 loss = per.sum()
@@ -976,6 +1019,7 @@ def encode_arrays_fast(
         nets[0].load_state_dict(ckpt["model"])
     init_states = [{k: v.detach().clone() for k, v in net.state_dict().items()} for net in nets]
     stacked = StackedTrain(nets)
+    configure_wide_step(stacked, grids)
     amp_dtype = None
     if cfg.precision == "bf16":
         amp_dtype = torch.bfloat16
@@ -1091,12 +1135,6 @@ def encode_arrays_fast(
                 if stall >= cfg.early_stop:
                     stopped_early = True
                     break
-        if best_state is not None:
-            # Same rule as the eager loop: the export is the best eval, including
-            # when the run used every step and the last eval was not the best.
-            with torch.no_grad():
-                for p, src in zip(stacked.parameters(), best_state, strict=True):
-                    p.copy_(src)
     elif done_steps < cfg.steps and (cfg.stop_psnr > 0 or cfg.plateau_stop):
         hit_target = False
         plateau_hits = 0
@@ -1111,9 +1149,12 @@ def encode_arrays_fast(
             loop_info = _merge_info(loop_info, info)
             done_steps += span
             was = stacked.quantize
+            was_w = stacked.quantize_weights
             stacked.quantize = True
+            stacked.quantize_weights = True
             score = max(_psnr_per_seed(stacked, images_bank, device))
             stacked.quantize = was
+            stacked.quantize_weights = was_w
             best_val = max(best_val, score)
             if cfg.stop_psnr > 0 and score >= cfg.stop_psnr:
                 hit_target = True
@@ -1146,27 +1187,47 @@ def encode_arrays_fast(
     scores = _psnr_per_seed(stacked, images_bank if images_bank.shape[0] == stacked.n_seeds else target, device)
     winner = int(max(range(stacked.n_seeds), key=lambda i: scores[i]))
     # Export through the ordinary writer so the file matches the slow path.
-    export_net = nets[0]
     # nets[0] may not be the winner after slicing. Build a fresh shell.
     export_net = _build_nets(target, replace(cfg, pca_init=False), grids, [seeds[winner]], device)[0]
-    stacked.write_seed(winner, export_net)
     num_mips = min(8, int(math.floor(math.log2(max(width, height)))) + 1)
     coder = cfg.latent_coder if cfg.latent_deflate else "raw"
-    blob = export_network(
-        export_net,
-        semantics,
-        width,
-        height,
-        num_mips,
-        latent_deflate=cfg.latent_deflate,
-        latent_coder=coder,
-    )
-    ts = parse_texture_set(blob)
     from ntc.decode_ref import decode_mip as _decode
 
-    recon = _decode(ts, 0)
     ref = np.transpose(images, (1, 2, 0))
-    trained_psnr = psnr_u8(recon, ref)
+
+    def _export_current() -> tuple[bytes, np.ndarray, float]:
+        stacked.write_seed(winner, export_net)
+        exported = export_network(
+            export_net,
+            semantics,
+            width,
+            height,
+            num_mips,
+            latent_deflate=cfg.latent_deflate,
+            latent_coder=coder,
+        )
+        parsed = parse_texture_set(exported)
+        decoded = _decode(parsed, 0)
+        return exported, decoded, psnr_u8(decoded, ref)
+
+    # The parameters here are the last step. best_state is the eval whose
+    # loop score was highest. On b10 that loop score was 12.67 while the
+    # file was 33.07, so the loop ranking is not the file. Keep whichever
+    # of the two decodes higher. A warmup dip must not replace a later file.
+    blob, recon, trained_psnr = _export_current()
+    if best_state is not None:
+        final_params = [p.detach().clone() for p in stacked.parameters()]
+        with torch.no_grad():
+            for param, src in zip(stacked.parameters(), best_state, strict=True):
+                param.copy_(src)
+        blob_b, recon_b, psnr_b = _export_current()
+        if psnr_b > trained_psnr:
+            blob, recon, trained_psnr = blob_b, recon_b, psnr_b
+        else:
+            with torch.no_grad():
+                for param, src in zip(stacked.parameters(), final_params, strict=True):
+                    param.copy_(src)
+    ts = parse_texture_set(blob)
     kept = "trained"
     init_psnr = None
     # A resumed run keeps the continued weights. A fresh run keeps the
@@ -1209,6 +1270,7 @@ def encode_arrays_fast(
         "freeze_decoder": cfg.freeze_decoder,
         "coarse_to_fine": cfg.coarse_to_fine,
         "qat_late": cfg.qat_late,
+        "wide_lr_mult": float(stacked.wide_lr_mult),
         "importance": cfg.importance,
         "plateau_stop": cfg.plateau_stop,
         "host_syncs_per_step": 0,
@@ -1452,6 +1514,7 @@ def encode_bank(
         seed_ids.extend(these)
         targets.extend([target] * len(built))
     stacked = StackedTrain(nets)
+    configure_wide_step(stacked, grids)
     bank = torch.stack(targets, 0)
     mips = _prep_mips(bank, cfg, device)
     opt = _adam_on(stacked, cfg, capturable=False)

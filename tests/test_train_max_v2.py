@@ -12,6 +12,8 @@ from bench.train_max_v2 import (
     build_jobs,
     claim_job,
     claim_next,
+    collapse_reason,
+    dense_retry_batch,
     is_dense_2k,
     job_cost,
     owns_index,
@@ -219,3 +221,22 @@ def test_workers_spawn_a_queue(monkeypatch, tmp_path: Path):
     calls.clear()
     assert v2._spawn_workers(args) == 0
     assert "--no-pack" in calls[0]
+
+
+def test_dense_pass_below_init_is_not_retried():
+    """b15 already ran 1048576 flat and scored 11.70 against an init of 13.57.
+
+    The b031669 guard compared the requested 262144 batch and trained that
+    same 1048576 step again. A finished dense pass is not a second job.
+    """
+    pixels = 2048 * 2048
+    assert dense_retry_batch(11.70, 13.57, 1_048_576, pixels, False) is None
+    reason = collapse_reason(11.70, 13.57, 1_048_576, pixels)
+    assert "fell below" in reason
+    assert "not retrying" in reason
+    # b5's first pass was still on the 256K area batch and within 4 dB.
+    assert dense_retry_batch(11.91, 10.58, 262_144, pixels, False) == pixels // 4
+    assert dense_retry_batch(11.91, 10.58, 262_144, pixels, True) is None
+    assert dense_retry_batch(33.07, 12.0, 1_048_576, pixels, False) is None
+    stayed = collapse_reason(12.0, 10.0, 1_048_576, pixels)
+    assert "stayed within" in stayed

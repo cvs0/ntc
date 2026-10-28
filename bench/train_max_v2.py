@@ -44,6 +44,44 @@ def owns_index(index: int, shard: int | None, n: int | None) -> bool:
     return index % n == shard
 
 
+def dense_retry_batch(
+    trained: object,
+    init: object,
+    effective: int,
+    pixels: int,
+    fallback: bool,
+) -> int | None:
+    """Flat quarter-frame batch for one retry, or None when the run should stop.
+
+    The b031669 guard compared the requested 262144 batch, so a full-resolution
+    job that had already been raised to 1048576 flat was trained a second time
+    at that same batch. ``sdk_MetalPlates013_2K_b15`` scored 11.70 dB against
+    an init of 13.57 on that first dense pass. Retry only when the batch the
+    trainer actually used is still under a quarter of the frame.
+    """
+    if not isinstance(trained, (int, float)) or not isinstance(init, (int, float)):
+        return None
+    if float(trained) >= float(init) + NEAR_INIT_DB:
+        return None
+    if fallback or pixels <= 0:
+        return None
+    if not (0 < int(effective) < int(pixels) // 4):
+        return None
+    return int(pixels) // 4
+
+
+def collapse_reason(trained: float, init: float, effective: int, pixels: int) -> str:
+    """Why a near-init json is left ``done`` false."""
+    if float(trained) < float(init) and int(effective) >= max(int(pixels) // 4, 1):
+        return (
+            f"trained PSNR {float(trained):.2f} fell below init {float(init):.2f} "
+            f"on dense batch {int(effective)}; not retrying the same run"
+        )
+    return (
+        f"trained PSNR {float(trained):.2f} stayed within {NEAR_INIT_DB:.0f} dB of init {float(init):.2f}"
+    )
+
+
 def job_cost(job: dict) -> float:
     """Estimated work: pixels per step times steps.
 
@@ -413,6 +451,7 @@ def _run_claimed(
         "target_bpp": float(job["bpp"]),
         "latent_rate_scale": float(job.get("latent_rate_scale", 1.0)),
         "min_latent_bits": int(job.get("min_latent_bits", 0)),
+        "wide_lr_mult": float(stats.get("wide_lr_mult", 1.0)),
         "compiled": stats.get("compiled"),
         "cuda_graph": stats.get("cuda_graph"),
         "halving": stats.get("halving"),
@@ -420,17 +459,13 @@ def _run_claimed(
     }
     trained = row.get("psnr_u8_trained")
     init = row.get("psnr_u8_init")
-    near_init = (
-        isinstance(trained, (int, float))
-        and isinstance(init, (int, float))
-        and float(trained) < float(init) + NEAR_INIT_DB
-    )
     pixels = int(job["size"]) * int(job["size"])
     effective = int(row.get("batch_pixels") or 0)
-    if near_init and not job.get("_fallback") and 0 < effective < pixels // 4:
+    retry_batch = dense_retry_batch(trained, init, effective, pixels, bool(job.get("_fallback")))
+    if retry_batch is not None:
         print(
             f"near init {job['name']} trained {float(trained):.2f} init {float(init):.2f}, "
-            f"retry flat {pixels // 4}",
+            f"retry flat {retry_batch}",
             flush=True,
         )
         if ckpt.is_file():
@@ -440,16 +475,19 @@ def _run_claimed(
         if dest.is_file():
             dest.unlink()
         fallback = dict(job)
-        fallback["batch_pixels"] = pixels // 4
+        fallback["batch_pixels"] = retry_batch
         fallback["batch_mip"] = "flat"
         fallback["_fallback"] = True
         return _run_claimed(fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
+    near_init = (
+        isinstance(trained, (int, float))
+        and isinstance(init, (int, float))
+        and float(trained) < float(init) + NEAR_INIT_DB
+    )
     if near_init:
         row["done"] = False
         row["collapsed"] = True
-        row["error"] = (
-            f"trained PSNR {float(trained):.2f} stayed within {NEAR_INIT_DB:.0f} dB of init {float(init):.2f}"
-        )
+        row["error"] = collapse_reason(float(trained), float(init), effective, pixels)
         print("collapsed", job["name"], row["error"], flush=True)
     dest.write_text(json.dumps(row, indent=2))
     sps = row["steps_per_s"]

@@ -7,12 +7,14 @@ from ntc.encode import TrainConfig, encode_arrays
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
     NEAR_INIT_DB,
+    WIDE_LR_MULT,
     StackedTrain,
     _mesh_uv,
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
     scaled_lr,
+    wide_latent,
 )
 
 
@@ -182,3 +184,75 @@ def test_fullres_sparse_batch_trains_above_init():
     assert stats["batch_pixels"] == (n * n) // 4
     assert stats["batch_mip"] == "flat"
     assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"] + NEAR_INIT_DB
+    assert stats["wide_lr_mult"] == 1.0
+
+
+def _checker(n: int) -> np.ndarray:
+    yy, xx = np.mgrid[0:n, 0:n]
+    hi = ((xx + yy) & 1).astype(np.float32)
+    lo = (0.5 + 0.4 * np.sin(xx / 7.0) * np.cos(yy / 11.0)).astype(np.float32)
+    chans = []
+    for k in range(9):
+        if k < 3:
+            base = (0.2 + 0.6 * hi) if k != 1 else (0.8 - 0.6 * hi)
+            v = 0.7 * base + 0.3 * lo
+        elif k < 6:
+            sign = 1.0 if k % 2 == 0 else -1.0
+            v = np.clip((0.5 + 0.5 * hi * sign) * 0.5 + 0.5, 0.0, 1.0)
+        else:
+            v = lo * (0.4 + 0.1 * k) + 0.05 * hi
+        chans.append(np.clip(v, 0.0, 1.0).astype(np.float32))
+    return np.stack(chans, 0)
+
+
+def test_wide_latent_is_eight_channels_or_more():
+    assert wide_latent([(2048, 2048, 4, 4), (1024, 1024, 12, 4)])
+    assert wide_latent([(2048, 2048, 8, 4), (1024, 1024, 8, 4)])
+    assert not wide_latent([(2048, 2048, 4, 4), (1024, 1024, 4, 4)])
+    assert WIDE_LR_MULT == 0.5
+
+
+def test_wide_checker_half_lr_finishes_above_init():
+    """A 4+12 grid at the historical rate is under its init at the first eval.
+
+    Half the learning rate is what ``configure_wide_step`` applies. On this
+    32 stand-in that schedule's file ends above the init. A 4+4 grid keeps
+    the historical rate.
+    """
+    n = 32
+    sems = list(range(9))
+    common = dict(
+        steps=600,
+        hidden=(32,),
+        seed=1,
+        seed_pool=1,
+        adaptive_pool=1,
+        with_ssim=False,
+        mip_levels=12,
+        mip_loss="footprint",
+        warmup_steps=400,
+        schedule="cosine",
+        eval_every=0,
+        early_stop=0,
+        fast=True,
+        device="cpu",
+        pca_init=True,
+        batch_pixels=max(1, (n * n) // 4),
+        batch_mip="flat",
+        compile_step="off",
+        cuda_graph="off",
+        log_every=10**9,
+        latent_deflate=False,
+    )
+    img = _checker(n)
+    _blob, wide = encode_arrays_fast(
+        img, sems, TrainConfig(grids=[(n, n, 4, 4), (n // 2, n // 2, 12, 4)], **common)
+    )
+    assert wide["wide_lr_mult"] == WIDE_LR_MULT
+    assert wide["psnr_u8_trained"] > wide["psnr_u8_init"]
+    _blob, narrow = encode_arrays_fast(
+        img,
+        sems,
+        TrainConfig(grids=[(n, n, 4, 4), (n // 2, n // 2, 4, 4)], **{**common, "steps": 1, "warmup_steps": 0}),
+    )
+    assert narrow["wide_lr_mult"] == 1.0
