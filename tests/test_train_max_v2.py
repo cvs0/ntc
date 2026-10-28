@@ -8,6 +8,7 @@ from pathlib import Path
 import bench.train_max_v2 as v2
 from bench.train_max_v2 import (
     _job_blocked,
+    apply_rate_neighbor,
     assign_shards,
     build_jobs,
     cheaper_better,
@@ -21,6 +22,7 @@ from bench.train_max_v2 import (
     parse_shard,
     planned_workers,
     release_job,
+    upper_hull,
 )
 from ntc.grids import grow_grids
 from ntc.train_fast import mip_sample_count
@@ -261,3 +263,32 @@ def test_cheaper_bitrate_blocks_a_worse_higher_rate(tmp_path: Path):
     assert found is not None
     assert found["name"] == "sdk_Metal_b5"
     assert cheaper_better(tmp_path, job, 34.0) is None
+
+
+def test_upper_hull_drops_a_point_under_the_chord():
+    assert upper_hull([(1.0, 30.0, "a"), (2.0, 36.0, "b"), (3.0, 40.0, "c")]) == {"a", "b", "c"}
+    assert upper_hull([(1.0, 30.0, "a"), (2.0, 31.0, "b"), (3.0, 40.0, "c")]) == {"a", "c"}
+    assert upper_hull([(1.0, 30.0, "a"), (2.0, 29.0, "b"), (3.0, 40.0, "c")]) == {"a", "c"}
+
+
+def test_neighbor_warm_start_grows_the_lower_grid(tmp_path: Path):
+    (tmp_path / "sdk_Metal_b5.json").write_text(json.dumps({
+        "name": "sdk_Metal_b5",
+        "done": True,
+        "psnr_u8": 33.45,
+        "grids": [[32, 32, 4, 4], [16, 16, 4, 4]],
+        "checkpoint": "init",
+        "total_bpp": 2.2,
+    }))
+    job = {
+        "name": "sdk_Metal_b10",
+        "bpp": 10.0,
+        "rate": "latent",
+        "latent_rate_scale": 0.5,
+        "size": 64,
+        "grids": None,
+    }
+    got = apply_rate_neighbor(job, tmp_path)
+    assert got["grids"][0][2] > 4
+    assert got["grids"][0][:2] == [32, 32]
+    assert got.get("warm_start") in (None, "")

@@ -97,17 +97,12 @@ def _rate_family(name: str) -> tuple[str, float] | None:
         return None
 
 
-def cheaper_better(out: Path, job: dict, psnr: float) -> dict | None:
-    """Finished lower-bitrate sibling of ``job`` whose file PSNR beats ``psnr``.
-
-    ``b5`` at 33.45 dB beat ``b10`` at 33.07 dB. The higher label is retrained
-    from a channel-grown copy of the cheaper grid so step 0 matches that file.
-    """
+def _lower_rows(out: Path, job: dict) -> list[dict]:
     parsed = _rate_family(str(job.get("name") or ""))
     if parsed is None or not out.is_dir():
-        return None
+        return []
     stem, bpp = parsed
-    best = None
+    rows = []
     for path in out.glob(f"{stem}_b*.json"):
         try:
             row = json.loads(path.read_text())
@@ -121,16 +116,135 @@ def cheaper_better(out: Path, job: dict, psnr: float) -> dict | None:
         score = row.get("psnr_u8")
         if not isinstance(score, (int, float)):
             continue
-        if float(score) <= float(psnr) + 0.05:
+        rows.append({
+            "name": str(row.get("name") or path.stem),
+            "psnr": float(score),
+            "bpp": other[1],
+            "grids": row["grids"],
+            "checkpoint": row.get("checkpoint"),
+            "total_bpp": row.get("total_bpp"),
+        })
+    return rows
+
+
+def best_lower_sibling(out: Path, job: dict) -> dict | None:
+    """The next-lower finished label for ``job``, the neighbor to warm-start from."""
+    rows = _lower_rows(out, job)
+    if not rows:
+        return None
+    neighbor_bpp = max(row["bpp"] for row in rows)
+    neighbors = [row for row in rows if abs(row["bpp"] - neighbor_bpp) < 1e-6]
+    return max(neighbors, key=lambda row: row["psnr"])
+
+
+def cheaper_better(out: Path, job: dict, psnr: float) -> dict | None:
+    """Finished lower-bitrate sibling of ``job`` whose file PSNR beats ``psnr``.
+
+    ``b5`` at 33.45 dB beat ``b10`` at 33.07 dB. The higher label is retrained
+    from a channel-grown copy of the cheaper grid so step 0 matches that file.
+    """
+    rows = [row for row in _lower_rows(out, job) if row["psnr"] > float(psnr) + 0.05]
+    if not rows:
+        return None
+    return max(rows, key=lambda row: row["psnr"])
+
+
+def apply_rate_neighbor(job: dict, out: Path) -> dict:
+    """Point a latent job at its lower-rate neighbor before the first step.
+
+    The grid keeps that neighbor's lattice and adds channels until the target
+    raw rate. The checkpoint is loaded when the neighbor file kept its trained
+    weights, so the new run starts at the neighbor's PSNR.
+    """
+    job = dict(job)
+    if job.get("_neighbor_applied") or job.get("_rd_retry") or job.get("_fallback"):
+        return job
+    job["_neighbor_applied"] = True
+    if str(job.get("rate") or "") != "latent":
+        return job
+    lower = best_lower_sibling(out, job)
+    if lower is None or not lower.get("grids"):
+        return job
+    from ntc.grids import grow_grids
+
+    scale = float(job.get("latent_rate_scale") or 1.0)
+    target = float(job["bpp"])
+    if 0 < scale < 1:
+        target = target / scale
+    if job.get("grids") is None:
+        grown = grow_grids(
+            [tuple(g) for g in lower["grids"]],
+            int(job["size"]),
+            int(job["size"]),
+            target,
+        )
+        job["grids"] = [list(g) for g in grown]
+    prior = out / f"{lower['name']}.pt"
+    if prior.is_file() and lower.get("checkpoint") == "trained" and not job.get("warm_start"):
+        job["warm_start"] = str(prior)
+    print(f"warm start {job['name']} from {lower['name']}", flush=True)
+    return job
+
+
+def upper_hull(points: list[tuple[float, float, str]]) -> set[str]:
+    """Names on the upper convex hull of ``(rate, psnr, name)``.
+
+    A point under the chord between its neighbors is dropped. A point that
+    does not beat every cheaper rate is dropped. Endpoints stay when they
+    are not duplicated at the same rate by a higher score.
+    """
+    ordered = sorted(points, key=lambda item: (item[0], item[1]))
+    dedup: list[tuple[float, float, str]] = []
+    for rate, psnr, name in ordered:
+        if dedup and abs(dedup[-1][0] - rate) <= 1e-9:
+            if psnr >= dedup[-1][1]:
+                dedup[-1] = (rate, psnr, name)
             continue
-        if best is None or float(score) > float(best["psnr"]):
-            best = {
-                "name": str(row.get("name") or path.stem),
-                "psnr": float(score),
-                "grids": row["grids"],
-                "checkpoint": row.get("checkpoint"),
-            }
-    return best
+        dedup.append((rate, psnr, name))
+    hull: list[tuple[float, float, str]] = []
+    for point in dedup:
+        while len(hull) >= 2:
+            origin, prev = hull[-2], hull[-1]
+            cross = (prev[0] - origin[0]) * (point[1] - origin[1]) - (prev[1] - origin[1]) * (
+                point[0] - origin[0]
+            )
+            if cross >= 0:
+                hull.pop()
+            else:
+                break
+        hull.append(point)
+    return {item[2] for item in hull}
+
+
+def refresh_rate_hull(out: Path, name: str) -> None:
+    """Write ``on_hull`` for every finished bitrate of this material."""
+    parsed = _rate_family(name)
+    if parsed is None or not out.is_dir():
+        return
+    stem, _bpp = parsed
+    points = []
+    files = []
+    for path in sorted(out.glob(f"{stem}_b*.json")):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not row.get("done"):
+            continue
+        rate = row.get("total_bpp")
+        score = row.get("psnr_u8")
+        label = str(row.get("name") or path.stem)
+        if not isinstance(rate, (int, float)) or not isinstance(score, (int, float)):
+            continue
+        points.append((float(rate), float(score), label))
+        files.append((path, row, label))
+    keep = upper_hull(points)
+    for path, row, label in files:
+        flag = label in keep
+        if row.get("on_hull") is flag:
+            continue
+        row["on_hull"] = flag
+        path.write_text(json.dumps(row, indent=2))
 
 
 def job_cost(job: dict) -> float:
@@ -432,6 +546,7 @@ def _run_claimed(
         print("missing", job["name"], mat, flush=True)
         return row
     images, sems, _info = load_material(mat, int(job["size"]))
+    job = apply_rate_neighbor(job, out)
     cfg = TrainConfig(
         steps=int(job["steps"]),
         target_bpp=float(job["bpp"]),
@@ -585,6 +700,8 @@ def _run_claimed(
                     fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s
                 )
     dest.write_text(json.dumps(row, indent=2))
+    if row.get("done"):
+        refresh_rate_hull(out, str(job["name"]))
     sps = row["steps_per_s"]
     sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
     print(
