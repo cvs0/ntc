@@ -915,6 +915,45 @@ def _log_progress(
     )
 
 
+def _rewind_if_below_init(
+    stacked: StackedTrain,
+    rewind: dict | None,
+    step: int,
+    total: int,
+    seed: int,
+) -> None:
+    """At 25% and 50% of the run, roll back a drop of more than 1 dB.
+
+    One retry restores the last weights that were within 1 dB of the init,
+    halves the latent learning rate, and draws later samples from a new
+    seed. A second drop is left for the final export.
+    """
+    if rewind is None or total < 4:
+        return
+    marks = {max(1, int(total * 0.25)), max(1, int(total * 0.5))}
+    if step not in marks:
+        return
+    score = _psnr_per_seed(stacked, rewind["images"], stacked.latents[0].device)[0]
+    if score >= float(rewind["init_score"]) - 1.0:
+        rewind["last_good"] = [p.detach().clone() for p in stacked.parameters()]
+        return
+    if int(rewind["retries"]) >= 1:
+        return
+    with torch.no_grad():
+        for param, src in zip(stacked.parameters(), rewind["last_good"], strict=True):
+            param.copy_(src)
+    rewind["latent_mult"] = float(rewind["latent_mult"]) * 0.5
+    rewind["retries"] = int(rewind["retries"]) + 1
+    torch.manual_seed(int(seed) + 10007)
+    if stacked.latents[0].is_cuda:
+        torch.cuda.manual_seed_all(int(seed) + 10007)
+    print(
+        f"rewind step {step}/{total} psnr {score:.2f} init {float(rewind['init_score']):.2f} "
+        f"latent lr x{float(rewind['latent_mult']):.4g}",
+        flush=True,
+    )
+
+
 def _run_loop(
     stacked: StackedTrain,
     opt: torch.optim.Optimizer,
@@ -929,6 +968,7 @@ def _run_loop(
     warmup: int = 0,
     compile_mode_override: str | None = None,
     progress_images: torch.Tensor | None = None,
+    rewind: dict | None = None,
 ) -> dict:
     """Train ``steps`` Adam steps starting at ``start_step``.
 
@@ -952,9 +992,10 @@ def _run_loop(
 
     def _group_lr(step: int) -> None:
         lr = _step_lr(cfg, step) * lr_scale
+        latent_mult = float(cfg.latent_lr_mult if rewind is None else rewind["latent_mult"])
         for group in opt.param_groups:
             if group.get("name") == "latent":
-                _assign_lr(group, lr * cfg.latent_lr_mult)
+                _assign_lr(group, lr * latent_mult)
             else:
                 _assign_lr(group, lr)
 
@@ -1121,6 +1162,7 @@ def _run_loop(
             _group_lr(step)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph.replay()
+            _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
             if static_loss is not None and step == start_step + steps - 1:
                 _log_progress(cfg, step + 1, total_steps, static_loss, t0, start_step, stacked, progress_images)
         _ = static_loss
@@ -1128,6 +1170,7 @@ def _run_loop(
         for step in range(start_step, start_step + steps):
             loss = one_step(step, replay=False)
             _log_progress(cfg, step + 1, total_steps, loss, t0, start_step, stacked, progress_images)
+            _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
     if device_type == "cuda":
         torch.cuda.synchronize()
     _require_finite_params(stacked)
@@ -1559,6 +1602,15 @@ def encode_arrays_fast(
     stopped_early = False
     best_val = -1e9
     images_bank = target.unsqueeze(0).expand(stacked.n_seeds, -1, -1, -1).contiguous()
+    rewind = None
+    if stacked.n_seeds == 1 and cfg.steps >= 4 and not cfg.resume:
+        rewind = {
+            "init_score": _psnr_per_seed(stacked, images_bank, device)[0],
+            "retries": 0,
+            "latent_mult": float(cfg.latent_lr_mult),
+            "last_good": [p.detach().clone() for p in stacked.parameters()],
+            "images": images_bank,
+        }
     while done_steps < cfg.steps and stacked.n_seeds > 1 and rung > 0:
         span = min(rung, cfg.steps - done_steps)
         info = _run_loop(
@@ -1573,6 +1625,7 @@ def encode_arrays_fast(
             device.type,
             use_graph=False,
             progress_images=images_bank,
+            rewind=rewind,
         )
         loop_info = _merge_info(loop_info, info)
         done_steps += span
@@ -1612,6 +1665,7 @@ def encode_arrays_fast(
                 stacked, opt, mips, cfg, semantics, span, done_steps, amp_dtype, device.type,
                 use_graph=False,
                 progress_images=images_bank,
+                rewind=rewind,
             )
             loop_info = _merge_info(loop_info, info)
             done_steps += span
@@ -1641,6 +1695,7 @@ def encode_arrays_fast(
                 stacked, opt, mips, cfg, semantics, span, done_steps, amp_dtype, device.type,
                 use_graph=False,
                 progress_images=images_bank,
+                rewind=rewind,
             )
             loop_info = _merge_info(loop_info, info)
             done_steps += span
@@ -1678,10 +1733,17 @@ def encode_arrays_fast(
             device.type,
             use_graph=use_graph and stacked.n_seeds == 1,
             progress_images=images_bank,
+            rewind=rewind,
         )
         loop_info = _merge_info(loop_info, info)
         done_steps = cfg.steps
 
+    if rewind is not None:
+        live = _psnr_per_seed(stacked, images_bank, device)[0]
+        if live < float(rewind["init_score"]) - 1.0:
+            with torch.no_grad():
+                for param, src in zip(stacked.parameters(), rewind["last_good"], strict=True):
+                    param.copy_(src)
     scores = _psnr_per_seed(stacked, images_bank if images_bank.shape[0] == stacked.n_seeds else target, device)
     winner = int(max(range(stacked.n_seeds), key=lambda i: scores[i]))
     # Export through the ordinary writer so the file matches the slow path.
@@ -1779,6 +1841,7 @@ def encode_arrays_fast(
         "batch_mip": str(cfg.batch_mip),
         "latent_rate_scale": float(cfg.latent_rate_scale),
         "grad_skips": int(loop_info.get("grad_skips") or 0),
+        "lr_rewinds": 0 if rewind is None else int(rewind["retries"]),
         "device": device_report(device),
         "steps": cfg.steps,
         "grids": [list(g) for g in grids],

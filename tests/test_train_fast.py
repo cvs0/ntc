@@ -27,8 +27,10 @@ from ntc.train_fast import (
     _cover_mip_recompiles,
     _mesh_uv,
     _psnr_from_mse,
+    _psnr_per_seed,
     _reported_best_val,
     _require_finite_stats,
+    _rewind_if_below_init,
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
@@ -646,6 +648,63 @@ def test_finished_checkpoint_starts_fresh(tmp_path: Path):
     assert not path.is_file()
     assert stats["steps_ran"] == 2
     assert np.isfinite(stats["psnr_u8_init"])
+
+
+def test_rewind_once_when_psnr_drops_below_init():
+    net = _net()
+    stacked = StackedTrain([net])
+    images = torch.rand(1, 3, 8, 8)
+    init = [p.detach().clone() for p in stacked.parameters()]
+    score = _psnr_per_seed(stacked, images, torch.device("cpu"))[0]
+    rewind = {
+        "init_score": score + 5.0,
+        "retries": 0,
+        "latent_mult": 1.0,
+        "last_good": [t.clone() for t in init],
+        "images": images,
+    }
+    with torch.no_grad():
+        stacked.latents[0].add_(1.0)
+    _rewind_if_below_init(stacked, rewind, 2, 8, 1)
+    assert rewind["retries"] == 1
+    assert rewind["latent_mult"] == 0.5
+    for param, src in zip(stacked.parameters(), init, strict=True):
+        assert torch.allclose(param, src)
+    with torch.no_grad():
+        stacked.latents[0].add_(1.0)
+    _rewind_if_below_init(stacked, rewind, 4, 8, 1)
+    assert rewind["retries"] == 1
+
+
+def test_w8_shaped_runs_do_not_ship_a_collapse():
+    """Five seeds of an 8-bit wide grid. None may finish more than 1 dB under init."""
+    rng = np.random.default_rng(2)
+    n = 32
+    img = rng.random((3, n, n), dtype=np.float32)
+    for seed in range(5):
+        _blob, stats = encode_arrays_fast(
+            img,
+            [0, 1, 2],
+            TrainConfig(
+                steps=8,
+                hidden=(8,),
+                grids=[(16, 16, 12, 8), (8, 8, 4, 4)],
+                fast=True,
+                adaptive_pool=1,
+                seed_pool=1,
+                with_ssim=False,
+                log_every=10**9,
+                mip_levels=2,
+                seed=seed,
+                compile_step="off",
+                cuda_graph="off",
+                precision="fp32",
+                batch_pixels=64,
+                batch_mip="flat",
+            ),
+        )
+        assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"] - 1.0
+        assert isinstance(stats["lr_rewinds"], int)
 
 
 def test_recompile_limit_covers_every_mip_sample_count():
