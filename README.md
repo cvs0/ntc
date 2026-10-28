@@ -597,9 +597,10 @@ The fast path stacks every seed of a pool into one module. Latent grids are `[se
 ```powershell
 powershell -ExecutionPolicy Bypass -File bench\train_speed.ps1
 python bench\train_max_v2.py --out results\train_max_v2 --materials data\materials --probe-steps 400
+.\.venv-rocm\Scripts\python.exe bench\train_max_v2.py --workers 3 --out results\train_max_v2 --materials data\materials --probe-steps 400
 ```
 
-Use the same ROCm 7.2.1 / torch 2.9.1 environment as the c33648b run. The script does not install torch. The 3x wall-time bar is `speedup_time_to_target` in `results\train_speed\rx9070.json` at `--size 256 --g16 --steps 200`. `train_max_v2` chooses bf16 only when its PSNR at the fp32 probe's wall time is at least the fp32 PSNR. The equal-step choice is recorded next to it as `historical_equal_steps_choice`.
+Use the same ROCm 7.2.1 / torch 2.9.1 environment as the c33648b run. The script does not install torch. The 3x wall-time bar is `speedup_time_to_target` in `results\train_speed\rx9070.json` at `--size 256 --g16 --steps 200`. `train_max_v2 --workers N` spawns N processes, shard `i/N`, on one GPU. Each shard skips a finished `results/train_max_v2/<name>.json` and claims `locks/<name>.lock` with `O_CREAT|O_EXCL`. A lock whose pid is dead, or whose age exceeds `--stale-lock-s` (default 86400), is taken. The log line is `worker I/N pid ... steps/s ...`. File names are unchanged. 256 jobs stay full-frame (`batch_pixels` 0). `--batch-pixels K` overrides those jobs and sets `lr_batch_ref` to 65536 so the learning rate scales by `K/65536`. A 256 frame already has 65536 pixels, so the default batch was not raised. The precision probe still records `historical_equal_steps_choice` next to the equal-wall choice.
 
 `results/train_speed/cpu.json` is a 32x32, 8-step run on this CPU (torch 2.14.1+cpu). Eager and fast one-model PSNR both 17.709 dB. One-model wall 0.031 s versus 0.027 s (1.16x). Inner steps/s 471 versus 518. A pool of 4 seeds: 0.122 s versus 0.035 s (3.48x). `gpu_idle_fraction` is null. `launch_cpu_fraction` is 0 because the CPU profiler has no CUDA launch keys. The top self-CPU ops were `aten::_to_copy`, `aten::index`, and `Adam.step`.
 
