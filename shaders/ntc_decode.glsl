@@ -252,7 +252,24 @@ float ntc_activate(float y, uint kind, bool requant) {
     return z;
 }
 
+void ntc_quantize_inputs(uint li, int n) {
+    if (g_desc[3].w == 0u || n <= 0) return;
+    float s = ntc_f16(g_desc[3].w + li * 2u);
+    if (s < 1e-6) s = 1e-6;
+    for (int i = 0; i < n; ++i) {
+        float v = (li == 0u) ? g_feat[i] : (((li & 1u) == 1u) ? g_ha[i] : g_hb[i]);
+        int q = int(round(v / s));
+        if (q < -127) q = -127;
+        if (q > 127) q = 127;
+        v = float(q) * s;
+        if (li == 0u) g_feat[i] = v;
+        else if ((li & 1u) == 1u) g_ha[i] = v;
+        else g_hb[i] = v;
+    }
+}
+
 void ntc_layer(uint li, int cur_n) {
+    ntc_quantize_inputs(li, cur_n);
     uvec4 a = g_desc[12u + li];
     uvec4 b = g_desc[16u + li];
     int inn = int(a.x);

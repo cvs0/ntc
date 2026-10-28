@@ -181,6 +181,7 @@ class NtcNet(nn.Module):
         qat_weights: bool,
         tile_size: int = 0,
         layer_bits: tuple = (),
+        act_int8: bool = False,
     ):
         super().__init__()
         self.activation = activation
@@ -194,6 +195,7 @@ class NtcNet(nn.Module):
         self.activation_requant = activation_requant
         self.qat_latents = qat_latents
         self.qat_weights = qat_weights
+        self.act_int8 = bool(act_int8)
         self.image_channels = image_channels
         self.grid_bits = []
         self.grid_shapes = []
@@ -224,6 +226,10 @@ class NtcNet(nn.Module):
         self.linears = nn.ModuleList(
             nn.Linear(a, b, bias=True) for a, b in zip(dims[:-1], dims[1:])
         )
+        # One learned input scale per layer. Present only when act_int8 is on,
+        # so a checkpoint from the default trainer still loads.
+        if self.act_int8:
+            self.act_log_s = nn.Parameter(torch.full((len(self.linears),), -3.0))
         self._init_linears()
 
     def _init_linears(self):
@@ -372,10 +378,24 @@ class NtcNet(nn.Module):
             feat = torch.cat([feat, pe], dim=1)
         return feat
 
+    def act_scale(self, index: int) -> torch.Tensor:
+        s = torch.exp(self.act_log_s[index]).clamp(min=1e-4)
+        return fp16_round(s)
+
+    def quantize_act(self, h: torch.Tensor, index: int) -> torch.Tensor:
+        s = self.act_scale(index)
+        scaled = h / s
+        q = torch.round(scaled).clamp(-127, 127)
+        # Straight-through on the round. The scale still receives gradient.
+        q_ste = scaled + (q - scaled).detach()
+        return q_ste * s
+
     def forward_mlp(self, x: torch.Tensor) -> torch.Tensor:
         h = x
         last = len(self.linears) - 1
         for i, lin in enumerate(self.linears):
+            if self.act_int8:
+                h = self.quantize_act(h, i)
             w, b = self._weight(lin, i)
             y = F.linear(h, w, b)
             if i != last:

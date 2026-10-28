@@ -1,0 +1,121 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#include "ntc_decode.glsl"
+
+// Packed int8 dot. glslang 15.1 does not accept GL_EXT_shader_integer_dot_product,
+// so this is four int8 multiplies. RDNA and NVIDIA drivers contract that
+// pattern to DP4a when the types stay int8. g_pc.z is the output width,
+// g_pc.w the height. g_desc[3].w is the byte offset of the fp16 act scales
+// when FLAG_ACT_INT8 is set, otherwise 0 and each vector uses max-abs/127.
+
+int ntc_dot4(int w0, int w1, int w2, int w3, int x0, int x1, int x2, int x3) {
+    i8vec4 wv = i8vec4(int8_t(w0), int8_t(w1), int8_t(w2), int8_t(w3));
+    i8vec4 xv = i8vec4(int8_t(x0), int8_t(x1), int8_t(x2), int8_t(x3));
+    return int(wv.x) * int(xv.x) + int(wv.y) * int(xv.y) + int(wv.z) * int(xv.z) + int(wv.w) * int(xv.w);
+}
+
+float ntc_vec_scale(int n, int layer) {
+    if (g_desc[3].w != 0u) return ntc_f16(g_desc[3].w + uint(layer) * 2u);
+    float m = 0.0;
+    for (int i = 0; i < n; ++i) {
+        float v = (layer == 0) ? g_feat[i] : (((layer & 1) == 1) ? g_ha[i] : g_hb[i]);
+        m = max(m, abs(v));
+    }
+    return max(m, 1e-6) / 127.0;
+}
+
+void ntc_quant_in(int n, int layer, float scale) {
+    for (int i = 0; i < n; ++i) {
+        float v = (layer == 0) ? g_feat[i] : (((layer & 1) == 1) ? g_ha[i] : g_hb[i]);
+        int q = int(round(v / scale));
+        q = clamp(q, -127, 127);
+        float deq = float(q) * scale;
+        if (layer == 0) g_feat[i] = deq;
+        else if ((layer & 1) == 1) g_ha[i] = deq;
+        else g_hb[i] = deq;
+    }
+}
+
+int ntc_q(int layer, int i, float scale) {
+    float v = (layer == 0) ? g_feat[i] : (((layer & 1) == 1) ? g_ha[i] : g_hb[i]);
+    return clamp(int(round(v / scale)), -127, 127);
+}
+
+void ntc_i8_layer(uint li, float in_scale) {
+    uvec4 a = g_desc[12u + li];
+    uvec4 b = g_desc[16u + li];
+    int inn = int(a.x);
+    int outn = int(a.y);
+    uint woff = a.z;
+    uint boff = a.w;
+    uint soff = b.x;
+    int gs = int(b.y);
+    int groups = int(b.z);
+    uint bits = b.w;
+    bool one = gs <= 0 || gs >= inn;
+    bool last = li + 1u == g_desc[1].x;
+    uint kind = g_desc[1].y;
+    bool requant = (g_desc[2].x & 2u) != 0u;
+    int layer = int(li);
+    for (int o = 0; o < outn; ++o) {
+        float acc_out;
+        if (one) {
+            int acc = 0;
+            int i = 0;
+            for (; i + 3 < inn; i += 4) {
+                int w0 = int(ntc_weight(woff, o, i, inn, bits));
+                int w1 = int(ntc_weight(woff, o, i + 1, inn, bits));
+                int w2 = int(ntc_weight(woff, o, i + 2, inn, bits));
+                int w3 = int(ntc_weight(woff, o, i + 3, inn, bits));
+                acc += ntc_dot4(w0, w1, w2, w3, ntc_q(layer, i, in_scale), ntc_q(layer, i + 1, in_scale),
+                                ntc_q(layer, i + 2, in_scale), ntc_q(layer, i + 3, in_scale));
+            }
+            for (; i < inn; ++i) acc += int(ntc_weight(woff, o, i, inn, bits)) * ntc_q(layer, i, in_scale);
+            float wscale = ntc_f16(soff + uint(o) * 2u);
+            float bias = ntc_f16(boff + uint(o) * 2u);
+            acc_out = bias + wscale * in_scale * float(acc);
+        } else {
+            float yv = ntc_f16(boff + uint(o) * 2u);
+            for (int g = 0; g < groups; ++g) {
+                int i0 = g * gs;
+                int i1 = min(inn, i0 + gs);
+                int acc = 0;
+                int i = i0;
+                for (; i + 3 < i1; i += 4) {
+                    acc += ntc_dot4(int(ntc_weight(woff, o, i, inn, bits)), int(ntc_weight(woff, o, i + 1, inn, bits)),
+                                    int(ntc_weight(woff, o, i + 2, inn, bits)), int(ntc_weight(woff, o, i + 3, inn, bits)),
+                                    ntc_q(layer, i, in_scale), ntc_q(layer, i + 1, in_scale), ntc_q(layer, i + 2, in_scale),
+                                    ntc_q(layer, i + 3, in_scale));
+                }
+                for (; i < i1; ++i) acc += int(ntc_weight(woff, o, i, inn, bits)) * ntc_q(layer, i, in_scale);
+                yv += ntc_f16(soff + uint(o * groups + g) * 2u) * in_scale * float(acc);
+            }
+            acc_out = yv;
+        }
+        if (!last) acc_out = ntc_activate(acc_out, kind, requant);
+        if (last) g_y[o] = acc_out;
+        else if ((li & 1u) == 0u) g_ha[o] = acc_out;
+        else g_hb[o] = acc_out;
+    }
+}
+
+void main() {
+    uint W = g_pc.z;
+    uint H = g_pc.w;
+    if (W == 0u || H == 0u) return;
+    if (gl_GlobalInvocationID.x >= W || gl_GlobalInvocationID.y >= H) return;
+    vec2 uv = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) / vec2(float(W), float(H));
+    ntc_features(uv, 0);
+    uint nlayers = g_desc[1].x;
+    int cur_n = int(g_desc[12u].x);
+    for (uint li = 0u; li < nlayers; ++li) {
+        float s = ntc_vec_scale(cur_n, int(li));
+        ntc_i8_layer(li, s);
+        if (li + 1u < nlayers) cur_n = int(g_desc[12u + li].y);
+    }
+    uint ch = g_desc[0].z;
+    uint idx = (gl_GlobalInvocationID.y * W + gl_GlobalInvocationID.x) * ch;
+    for (uint i = 0u; i < ch; ++i) g_outimg[idx + i] = g_y[i];
+}

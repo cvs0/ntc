@@ -68,6 +68,8 @@ class TrainConfig:
     normal_cosine: float = 0.0
     pca_init: bool = True
     activation_requant: bool = False
+    # Off by default. A mid-run train_max checkpoint has no act_log_s.
+    act_int8: bool = False
     seed: int = 0
     batch_pixels: int = 0
     device: str = "auto"
@@ -278,6 +280,9 @@ def export_network(
             }
         )
     flags = FLAG_ACTIVATION_REQUANT if net.activation_requant else 0
+    act_scales = None
+    if getattr(net, "act_int8", False):
+        act_scales = [float(net.act_scale(i).detach().cpu()) for i in range(len(net.linears))]
     return build_texture_set(
         width=width,
         height=height,
@@ -294,6 +299,7 @@ def export_network(
         latent_deflate=latent_deflate,
         latent_coder=latent_coder if latent_deflate or latent_coder else "raw",
         tile_size=net.tile_size,
+        act_scales=act_scales,
     )
 
 
@@ -418,6 +424,7 @@ def encode_arrays(
         qat_weights=cfg.qat_weights,
         tile_size=cfg.tile_size,
         layer_bits=cfg.layer_bits,
+        act_int8=cfg.act_int8,
     ).to(device)
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
     start_step = 0

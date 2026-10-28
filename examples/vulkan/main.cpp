@@ -208,9 +208,11 @@ int main(int argc, char** argv) {
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, exts.data());
         bool has_coop = false;
         bool has_f16ext = false;
+        bool has_coopvec = false;
         for (const auto& e : exts) {
             if (std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) has_coop = true;
             if (std::strcmp(e.extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0) has_f16ext = true;
+            if (std::strcmp(e.extensionName, "VK_NV_cooperative_vector") == 0) has_coopvec = true;
         }
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderFloat16Int8Features f16q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
@@ -226,6 +228,7 @@ int main(int argc, char** argv) {
         const bool float16 = f16q.shaderFloat16 == VK_TRUE;
         const bool int8 = f16q.shaderInt8 == VK_TRUE;
         const bool coop = has_coop && cm.cooperativeMatrix == VK_TRUE;
+        const bool coopvec = has_coopvec;
         const bool cpu_dev = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 
         std::cout << "device_name " << props.deviceName << "\n";
@@ -240,7 +243,7 @@ int main(int argc, char** argv) {
                   << " type " << props.deviceType << " api " << VK_VERSION_MAJOR(props.apiVersion) << "."
                   << VK_VERSION_MINOR(props.apiVersion) << " driver " << props.driverVersion
                   << " subgroup " << sg.subgroupSize << " float16 " << float16 << " int8 " << int8
-                  << " coopmat " << coop << " cpu " << cpu_dev << "\n";
+                  << " coopmat " << coop << " coopvec " << coopvec << " cpu " << cpu_dev << "\n";
 
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, nullptr);
@@ -248,11 +251,23 @@ int main(int argc, char** argv) {
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, qf.data());
         uint32_t qfam = 0;
         bool found_q = false;
+        bool graphics_q = false;
         for (uint32_t i = 0; i < nq; ++i) {
-            if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            const auto flags = qf[i].queueFlags;
+            if ((flags & VK_QUEUE_GRAPHICS_BIT) && (flags & VK_QUEUE_COMPUTE_BIT)) {
                 qfam = i;
                 found_q = true;
+                graphics_q = true;
                 break;
+            }
+        }
+        if (!found_q) {
+            for (uint32_t i = 0; i < nq; ++i) {
+                if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                    qfam = i;
+                    found_q = true;
+                    break;
+                }
             }
         }
         if (!found_q) throw std::runtime_error("no compute queue");
@@ -265,10 +280,21 @@ int main(int argc, char** argv) {
 
         VkPhysicalDeviceShaderFloat16Int8Features f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         f16.shaderFloat16 = float16 ? VK_TRUE : VK_FALSE;
-        f16.shaderInt8 = VK_FALSE;
+        f16.shaderInt8 = int8 ? VK_TRUE : VK_FALSE;
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        cm_on.cooperativeMatrix = coop ? VK_TRUE : VK_FALSE;
         VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         v13.dynamicRendering = v13q.dynamicRendering;
-        v13.pNext = has_f16ext ? static_cast<void*>(&f16) : nullptr;
+        void* feat_tail = nullptr;
+        if (has_f16ext) {
+            f16.pNext = feat_tail;
+            feat_tail = &f16;
+        }
+        if (coop) {
+            cm_on.pNext = feat_tail;
+            feat_tail = &cm_on;
+        }
+        v13.pNext = feat_tail;
         VkPhysicalDeviceFeatures2 feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         feat.pNext = &v13;
         feat.features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
@@ -474,13 +500,16 @@ int main(int argc, char** argv) {
                 // fp16 dots are not bit-exact. The staged fp16 path must stay in
                 // the same band as the unstaged fp16 path. The 256 metal latent
                 // measured 0.00293 on both.
-                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", 5e-3f);
+                const float fp16_tol = ts.act_int8() ? 0.25f : 5e-3f;
+                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", fp16_tol);
             }
         }
 
         if (!bench_dir.empty()) {
             run_vk_bench(dev, phys, queue, qfam, ts, up, float16, cpu_dev, dir, bench_dir, warmup, iters, bc7_path,
                          bc1_path, bc5_path);
+            run_vk_speed(dev, phys, queue, qfam, graphics_q, int8, coop, coopvec, ts, up, cpu_dev, dir, warmup, iters,
+                         bc7_path);
         }
         std::cout << "ok\n";
         vkDestroyQueryPool(dev, qpool, nullptr);

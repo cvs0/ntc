@@ -252,7 +252,7 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         if (mw == 1 && mh == 1) break;
     }
 
-    const uint32_t resolutions[][2] = {{base_w, base_h}, {1920, 1080}, {3840, 2160}};
+    const uint32_t resolutions[][2] = {{base_w, base_h}, {1920, 1080}, {2560, 1440}, {3840, 2160}};
     uint64_t max_floats = static_cast<uint64_t>(base_w) * base_h * channels;
     for (auto wh : resolutions) {
         max_floats = std::max(max_floats, static_cast<uint64_t>(wh[0]) * wh[1] * std::max(channels, 4u));
@@ -402,6 +402,7 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
     std::cout << "note sample_pass one_dispatch 8x8 point_ntc_eval mip0 ssbo_f32 no_filter\n";
     sample_at(base_w, base_h, "sample_native_fp32");
     sample_at(1920, 1080, "sample_1920x1080_fp32");
+    sample_at(2560, 1440, "sample_2560x1440_fp32");
     sample_at(3840, 2160, "sample_3840x2160_fp32");
 
     // One readback of mip 0 and of the lit pass at the material resolution.
@@ -631,7 +632,9 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         // block image, magnified to the output size, written as 4 fp32s.
         // The upload is not inside the timestamp pair.
         std::cout << "note bc_pass one_dispatch 8x8 linear_sample ssbo_rgba32f magnify\n";
+        std::cout << "note bc_compute_pass storage_buffer_rgba32f not_a_color_attachment\n";
         time_res(1920, 1080, "_1920x1080");
+        time_res(2560, 1440, "_2560x1440");
         time_res(3840, 2160, "_3840x2160");
         {
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};

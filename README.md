@@ -537,6 +537,32 @@ Vaidyanathan et al. 2023 report 1.15 to 1.92 ms total at 4K for their decoder on
 
 The same four panels exist for OpenGL, plus normal and orm, in that directory.
 
+## Decode speed
+
+The 4K number from the RX 9070 section is a compute dispatch into an SSBO. Two more passes are in `--bench` now.
+
+`sample_fs_*` and `bc7_fs_*` are one triangle into an `R8G8B8A8` color attachment. The timestamp is `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT`. The BC7 upload is outside the pair. `bc7_1920x1080` without `_fs` is still the storage-buffer compute sample. `sample_i8_*` is the packed int8 dot (`i8vec4`, four multiplies). glslang 15.1 does not accept `GL_EXT_shader_integer_dot_product`, so the shader is not `dotPacked4x8EXT`. Drivers that contract int8 dot-4 to DP4a can still do that. `sample_coopmat_*` runs only when `VK_KHR_cooperative_matrix` is on and a native readback matches the scalar decoder within 0.02. Otherwise the row is `skipped`. `sample_coopvec` is `skipped no_extension` or `toolchain_has_no_GL_NV_cooperative_vector`. This glslang has no `GL_NV_cooperative_vector`. `tile_cache_cold` and `tile_cache_steady` are pass 1 (requested tile ids), pass 2 (decode missing 16x16 tiles into an RGBA8 atlas), pass 3 (hardware linear sample of that atlas). The window is half the texture and steps by 16 px. `tile_cache_bytes` is the atlas plus the two masks. There is no BC7 transcode of the atlas in this build. The atlas is RGBA8.
+
+`act_int8` on `TrainConfig` is off by default. `train_max` does not set it, and a checkpoint from c33648b has no `act_log_s` parameter. When it is on, each layer input is quantized to int8 with one learned fp16 scale stored in a tail, `FLAG_ACT_INT8` (`1 << 4`). The scalar shader applies the same quantize, so the packed shader can match it. On a 64x64 smooth image, 40 steps, same grids and seed, the int8 network was 25.57 dB and the default network 27.48 dB, delta -1.91 dB (`results/qat_int8_cpu.json`). At 120 steps the delta was -1.87 dB. That is the measured loss on that image, not a claim that a long material train loses the same amount. Lavapipe `i8_exact_psnr` on the 40-step file was 100 against the CPU int8 decode.
+
+Published RTX 4090 figures from Vaidyanathan et al. 2023, a different decoder and a fragment pass: 1.15 to 1.92 ms at 4K, BC7 0.49 ms. RX 9070 compute rows from c33648b are in the table above (NTC 11.245 ms, BC7 storage-buffer 4.425 ms, gap 6.82 ms). Lavapipe rows below are `not_a_performance_claim`. 1920, 2560, and 3840 are skipped on a CPU device. Re-run `bench/run_all.ps1` on the RX 9070 to fill the fragment, int8, and tile-cache rows.
+
+| path | 1080p | 1440p | 4K | source |
+| --- | --- | --- | --- | --- |
+| NTC compute SSBO, RX 9070 | 2.868 ms | | 11.245 ms | c33648b, metal Vulkan |
+| BC7 compute SSBO, RX 9070 | 0.942 ms | | 4.425 ms | c33648b, not a color attachment |
+| NTC fragment, RTX 4090 | | | 1.15 to 1.92 ms | Vaidyanathan et al. 2023 |
+| BC7 fragment, RTX 4090 | | | 0.49 ms | same paper |
+| NTC/BC7 fragment, int8, coopmat, tile cache | | | | next `run_all.ps1` on the RX 9070 |
+
+Lavapipe, 64x64 int8 file, one iteration, not a performance number (`results/decode_speed_lavapipe.txt`): `sample_i8_native` 1.238 ms, `bc7_fs_native` 2.139 ms, `tile_cache_cold` 0.408 ms, `tile_cache_steady` 0.353 ms at a 128 shade of a 32 px window, `tile_cache_bytes` 16512. Cooperative matrix and cooperative vector were absent.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
+```
+
+The new rows are in `results\hw\<gpu-slug>\*_vulkan.txt`.
+
 ## Limitations
 
 The 40-step deflated network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The 4000-step footprint points on the RX 9070 are 38.81 dB at 11.49 bpp (metal) and 33.92 dB at 11.99 bpp (paving), against ASTC 6x6 at 38.28 dB and 33.73 dB, both at 17.78 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight. The 4K sample pass is documented above. It is not the RTX 4090 fragment timing from Vaidyanathan et al. 2023.

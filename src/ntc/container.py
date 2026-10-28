@@ -37,6 +37,10 @@ FLAG_LATENT_DEFLATE = 1 << 2
 # exclusive with FLAG_LATENT_DEFLATE. Offset 84 is the plain length.
 FLAG_LATENT_RANGE = 1 << 3
 FLAG_LATENT_COMPRESSED = FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE
+# Hidden inputs to each MLP layer are int8 with one fp16 scale per layer,
+# stored as a tail of float16 values (one per layer, input side). Default
+# files do not set this bit. train_max does not set it.
+FLAG_ACT_INT8 = 1 << 4
 
 ACT_IDENTITY = 0
 ACT_RELU = 1
@@ -151,10 +155,16 @@ class TextureSet:
     latent_stored_bytes: int = 0
     latent_plain_bytes: int = 0
     scale_stored_bytes: int = 0
+    # One positive scale per MLP layer input. Empty unless FLAG_ACT_INT8.
+    act_scales: list[float] = field(default_factory=list)
 
     @property
     def activation_requant(self) -> bool:
         return bool(self.flags & FLAG_ACTIVATION_REQUANT)
+
+    @property
+    def act_int8(self) -> bool:
+        return bool(self.flags & FLAG_ACT_INT8)
 
     @property
     def num_channels(self) -> int:
@@ -297,6 +307,7 @@ def build_texture_set(
     latent_deflate: bool = False,
     tile_size: int = 0,
     latent_coder: str | None = None,
+    act_scales: list[float] | None = None,
 ) -> bytes:
     """Build a file.
 
@@ -455,7 +466,13 @@ def build_texture_set(
     weight_off = offset
     weight_blob = bytes(weight)
     weight_bytes = len(weight_blob)
-    file_bytes = weight_off + weight_bytes
+    tail = b""
+    if act_scales:
+        flags = flags | FLAG_ACT_INT8
+        tail = np.asarray(act_scales, np.float32).astype(np.float16).tobytes()
+        if len(tail) != len(act_scales) * 2:
+            raise RuntimeError("act scale tail")
+    file_bytes = weight_off + weight_bytes + len(tail)
 
     grid_table = bytearray()
     for rec, data_off, s_off in abs_scales:
@@ -497,6 +514,8 @@ def build_texture_set(
     body[latent_off : latent_off + latent_bytes] = stored_latent
     body[scale_off : scale_off + scale_bytes] = scale_blob
     body[weight_off : weight_off + weight_bytes] = weight_blob
+    if tail:
+        body[weight_off + weight_bytes : weight_off + weight_bytes + len(tail)] = tail
 
     crc = zlib.crc32(body[HEADER_BYTES:]) & 0xFFFFFFFF
     header = _HEADER.pack(
@@ -660,7 +679,18 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         latent_stored_bytes=int(latent_bytes),
         latent_plain_bytes=int(latent_plain) if flags & FLAG_LATENT_COMPRESSED else int(latent_bytes),
         scale_stored_bytes=int(scale_bytes),
+        act_scales=_read_act_scales(blob, flags, num_layers),
     )
+
+
+def _read_act_scales(blob: bytes, flags: int, num_layers: int) -> list[float]:
+    if not (flags & FLAG_ACT_INT8) or num_layers <= 0:
+        return []
+    nbytes = num_layers * 2
+    if len(blob) < nbytes:
+        raise ValueError("act int8 tail missing")
+    raw = np.frombuffer(blob[len(blob) - nbytes :], dtype=np.float16).astype(np.float32)
+    return [float(v) for v in raw]
 
 
 def payload_bytes(ts: TextureSet) -> int:

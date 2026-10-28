@@ -262,10 +262,19 @@ def apply_layer(x: np.ndarray, layer) -> np.ndarray:
     return y.astype(np.float32)
 
 
+def quantize_act_vec(h: np.ndarray, scale: float) -> np.ndarray:
+    s = np.float32(max(scale, 1e-6))
+    q = np.rint(h / s).clip(-127, 127)
+    return (q * s).astype(np.float32)
+
+
 def mlp(x: np.ndarray, ts: TextureSet) -> np.ndarray:
     h = x.astype(np.float32)
     last = len(ts.layers) - 1
+    use_i8 = bool(ts.act_scales)
     for i, layer in enumerate(ts.layers):
+        if use_i8:
+            h = quantize_act_vec(h, ts.act_scales[i])
         y = apply_layer(h, layer)
         if i != last:
             y = activate(y, ts.activation, ts.activation_requant)

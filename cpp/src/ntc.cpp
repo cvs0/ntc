@@ -301,6 +301,8 @@ void features_at(const TextureSet& ts, float u, float v, int mip, float* feat) {
     }
 }
 
+void quantize_inplace(float* v, int n, float scale);
+
 void mlp(const TextureSet& ts, const float* feat, float* out) {
     float a[kMaxHidden];
     float b[kMaxHidden];
@@ -310,6 +312,12 @@ void mlp(const TextureSet& ts, const float* feat, float* out) {
     for (int li = 0; li <= last; ++li) {
         const Layer& layer = ts.layers[li];
         if (layer.in_features != cur_n) throw std::runtime_error("layer input mismatch");
+        float qbuf[kMaxHidden];
+        if (!ts.act_scales.empty() && li < static_cast<int>(ts.act_scales.size())) {
+            std::memcpy(qbuf, cur, static_cast<size_t>(cur_n) * sizeof(float));
+            quantize_inplace(qbuf, cur_n, ts.act_scales[static_cast<size_t>(li)]);
+            cur = qbuf;
+        }
         float* dst = (li == last) ? out : ((li % 2 == 0) ? a : b);
         // first hidden writes a, but if last, out. For li==0 and not last, dst=a.
         if (li != last && li % 2 == 1) dst = b;
@@ -322,6 +330,16 @@ void mlp(const TextureSet& ts, const float* feat, float* out) {
             cur = dst;
             cur_n = layer.out_features;
         }
+    }
+}
+
+void quantize_inplace(float* v, int n, float scale) {
+    const float s = scale > 1e-6f ? scale : 1e-6f;
+    for (int i = 0; i < n; ++i) {
+        float q = std::round(v[i] / s);
+        if (q < -127.f) q = -127.f;
+        if (q > 127.f) q = 127.f;
+        v[i] = q * s;
     }
 }
 
@@ -492,6 +510,16 @@ TextureSet parse(const uint8_t* data, size_t size) {
         }
         ts.layers[i] = std::move(layer);
     }
+    if (ts.flags & kFlagActInt8) {
+        const int n = static_cast<int>(ts.layers.size());
+        const uint32_t nbytes = static_cast<uint32_t>(n) * 2u;
+        if (nbytes > size) throw std::runtime_error("act int8 tail missing");
+        ts.act_scales.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            ts.act_scales[static_cast<size_t>(i)] =
+                read_f16(data, size - nbytes + static_cast<uint32_t>(i) * 2u);
+        }
+    }
     return ts;
 }
 
@@ -590,7 +618,12 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
          static_cast<uint32_t>(ts.grids.size()));
     set4(1, static_cast<uint32_t>(ts.layers.size()), ts.activation, ts.pe_mode, ts.pe_octaves);
     set4(2, ts.flags, ts.weight_bits, ts.num_mips, frame);
-    set4(3, filter_mode, max_aniso, kMaxMips, 0);
+    uint32_t act_off = 0;
+    if (!ts.act_scales.empty()) {
+        const uint32_t nbytes = static_cast<uint32_t>(ts.act_scales.size()) * 2u;
+        if (ts.raw.size() >= nbytes) act_off = static_cast<uint32_t>(ts.raw.size() - nbytes);
+    }
+    set4(3, filter_mode, max_aniso, kMaxMips, act_off);
     for (size_t g = 0; g < ts.grids.size() && g < 8; ++g) {
         const Grid& grid = ts.grids[g];
         set4(4 + static_cast<int>(g), static_cast<uint32_t>(grid.channels),

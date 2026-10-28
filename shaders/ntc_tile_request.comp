@@ -1,0 +1,24 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) buffer Req { uint req[]; };
+layout(push_constant) uniform Pc { uvec4 g_pc; };
+
+// g_pc.x: screen width (low 16) and tiles_x (high 16).
+// g_pc.y: screen height.
+// g_pc.z: window width (low 16) and origin x (high 16), material pixels.
+// g_pc.w: window height and origin y. Tile size is 16.
+void main() {
+    uint sw = g_pc.x & 0xFFFFu;
+    uint sh = g_pc.y;
+    if (gl_GlobalInvocationID.x >= sw || gl_GlobalInvocationID.y >= sh) return;
+    uint tiles_x = g_pc.x >> 16;
+    float ow = float(g_pc.z & 0xFFFFu);
+    float oh = float(g_pc.w & 0xFFFFu);
+    float ox = float(g_pc.z >> 16);
+    float oy = float(g_pc.w >> 16);
+    float mx = ox + (float(gl_GlobalInvocationID.x) + 0.5) / float(sw) * ow;
+    float my = oy + (float(gl_GlobalInvocationID.y) + 0.5) / float(sh) * oh;
+    uint tx = min(uint(mx) >> 4u, tiles_x - 1u);
+    uint ty = uint(my) >> 4u;
+    atomicOr(req[ty * tiles_x + tx], 1u);
+}

@@ -496,6 +496,7 @@ static void run_gl_bench(const ntc::TextureSet& ts, const ntc::GpuUpload& up, co
     std::cout << "note sample_pass one_dispatch 8x8 point_ntc_eval mip0 ssbo_f32 no_filter\n";
     sample_res(w, h, "sample_native_fp32");
     sample_res(1920, 1080, "sample_1920x1080_fp32");
+    sample_res(2560, 1440, "sample_2560x1440_fp32");
     sample_res(3840, 2160, "sample_3840x2160_fp32");
 
     if (lit) {

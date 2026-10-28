@@ -1,0 +1,20 @@
+{
+  "device": "cpu",
+  "not_a_performance_claim": true,
+  "steps": 40,
+  "size": 64,
+  "image": "smooth gradient",
+  "psnr_default": 27.47768586069313,
+  "psnr_act_int8": 25.565132892535217,
+  "delta_db": -1.912552968157911,
+  "act_scales": [
+    0.049774169921875,
+    0.049774169921875
+  ],
+  "note": "Same grids, seed, and 40 steps. act_int8 is off in train_max. The int8 path stores one fp16 scale per layer input.",
+  "steps_120": {
+    "psnr_default": 27.566687376882054,
+    "psnr_act_int8": 25.691699179314913,
+    "delta_db": -1.8749881975671414
+  }
+}
