@@ -344,6 +344,59 @@ def test_cuda_compile_mode_is_reduce_overhead():
     assert preferred_compile_mode("cpu") == "default"
 
 
+def test_crop_plan_is_eight_to_sixteen_plus_a_tenth_scattered():
+    from ntc.train_fast import crop_indices, crop_plan
+
+    side, n_crops, scatter = crop_plan(2048, 2048, 256 * 1024)
+    assert side == 128
+    assert 8 <= n_crops <= 16
+    assert scatter == (256 * 1024) // 10
+    torch.manual_seed(0)
+    idx = crop_indices(2048, 2048, 256 * 1024, torch.device("cpu"))
+    assert idx.shape == (256 * 1024,)
+    assert int(idx.min()) >= 0
+    assert int(idx.max()) < 2048 * 2048
+    small_side, small_n, small_scatter = crop_plan(64, 64, 4096)
+    assert small_side == 64
+    assert 8 <= small_n <= 16
+    assert small_scatter == 409
+
+
+def test_crop_batch_trains_and_the_queue_stays_on_area():
+    """``crop`` is opt-in. SDK jobs stay ``area``, which is what 5a71784 runs."""
+    from bench.train_max_v2 import build_jobs
+
+    jobs = build_jobs(Path("data/materials"), None)
+    sdk = [j for j in jobs if str(j["name"]).startswith("sdk_")]
+    assert sdk and all(j["batch_mip"] == "area" for j in sdk)
+    n = 32
+    img = np.linspace(0.0, 1.0, 3 * n * n, dtype=np.float32).reshape(3, n, n)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=2,
+            hidden=(8,),
+            grids=[(n // 2, n // 2, 2, 4)],
+            seed=0,
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=2,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            batch_pixels=n * n // 4,
+            batch_mip="crop",
+            pca_init=True,
+        ),
+    )
+    assert stats["batch_mip"] == "crop"
+    assert np.isfinite(stats["psnr_u8_trained"])
+
+
 def test_static_indices_are_refilled_in_place():
     uv = torch.zeros(8, 2)
     mips = [{"uv": uv, "tgt": torch.zeros(1, 8, 1), "weight": 1.0}]

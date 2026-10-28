@@ -166,7 +166,9 @@ def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat"
         return 0
     if mode == "area":
         budget = max(1, int(batch_pixels) >> (2 * int(mip)))
-    elif mode == "flat":
+    elif mode in ("flat", "crop"):
+        # ``crop`` draws the same count as ``flat``. The indices are crops
+        # plus scattered pixels. The live queue uses ``area``.
         budget = int(batch_pixels)
     else:
         raise ValueError(mode)
@@ -839,6 +841,58 @@ def static_sample_indices(
     return slots
 
 
+def crop_plan(height: int, width: int, budget: int) -> tuple[int, int, int]:
+    """Crop side, crop count, and scattered-pixel count.
+
+    8 to 16 crops of 64 or 128, plus 10 percent scattered pixels. A small
+    image or a small budget uses fewer crops so the total stays ``budget``.
+    """
+    budget = int(budget)
+    side = 128 if int(height) >= 256 and int(width) >= 256 else 64
+    side = max(1, min(side, int(height), int(width)))
+    scatter = budget // 10 if budget >= 10 else 0
+    rest = budget - scatter
+    per = side * side
+    guess = int(round(rest / per)) if per else 1
+    if rest >= 8:
+        n_crops = max(8, min(16, max(guess, 1)))
+    else:
+        n_crops = max(1, rest)
+    if n_crops > rest:
+        n_crops = max(1, rest)
+    return side, n_crops, scatter
+
+
+def crop_indices(height: int, width: int, budget: int, device: torch.device) -> torch.Tensor:
+    """``budget`` linear indices. Crops first, then the scattered tail."""
+    budget = int(budget)
+    if budget <= 0:
+        return torch.empty(0, dtype=torch.long, device=device)
+    side, n_crops, scatter = crop_plan(height, width, budget)
+    rest = budget - scatter
+    base = rest // n_crops
+    extra = rest - base * n_crops
+    chunks = []
+    y0 = torch.randint(0, int(height) - side + 1, (n_crops,))
+    x0 = torch.randint(0, int(width) - side + 1, (n_crops,))
+    for i in range(n_crops):
+        n = base + (1 if i < extra else 0)
+        if n <= 0:
+            continue
+        ly = torch.randint(0, side, (n,))
+        lx = torch.randint(0, side, (n,))
+        chunks.append((y0[i] + ly) * int(width) + (x0[i] + lx))
+    if scatter:
+        sy = torch.randint(0, int(height), (scatter,))
+        sx = torch.randint(0, int(width), (scatter,))
+        chunks.append(sy * int(width) + sx)
+    idx = torch.cat(chunks) if chunks else torch.zeros(budget, dtype=torch.long)
+    if idx.numel() < budget:
+        pad = torch.randint(0, int(height) * int(width), (budget - int(idx.numel()),))
+        idx = torch.cat([idx, pad])
+    return idx[:budget].to(device=device, dtype=torch.long)
+
+
 def refill_sample_indices(
     slots: list[torch.Tensor | None],
     mips: list[dict],
@@ -852,7 +906,11 @@ def refill_sample_indices(
         budget = mip_sample_count(batch_pixels, mip, count, batch_mip)
         if budget != int(buf.numel()):
             raise RuntimeError("sample buffer does not match the mip budget")
-        buf.copy_(torch.randint(0, count, (budget,), device=buf.device))
+        if batch_mip == "crop":
+            drawn = crop_indices(int(slot["height"]), int(slot["width"]), budget, buf.device)
+            buf.copy_(drawn)
+        else:
+            buf.copy_(torch.randint(0, count, (budget,), device=buf.device))
 
 
 def _loss_from_mips(
@@ -881,6 +939,8 @@ def _loss_from_mips(
                 provided = None if indices is None else indices[mip]
                 if provided is not None:
                     idx = provided
+                elif cfg.batch_mip == "crop":
+                    idx = crop_indices(int(slot["height"]), int(slot["width"]), budget, uv.device)
                 elif cfg.importance and mip == 0:
                     from ntc.train_steps import importance_index
 
