@@ -199,3 +199,84 @@ def test_setup_pod_workers_mode():
     assert len(launches) == 2
     for start in launches:
         assert "9>&-" in "\n".join(lines[start : start + 8])
+
+
+def test_backfill_jobs_skip_core_and_holdout(tmp_path: Path):
+    extra = v2.cloud_backfill_jobs(tmp_path)
+    materials = {Path(job["material"]).name for job in extra}
+    assert materials == {f"{name}_2K" for name in CLOUD_TRAIN if name not in CLOUD_FAST_TRAIN}
+    assert not materials & {f"{name}_2K" for name in CLOUD_HOLDOUT}
+    assert len(extra) == (len(CLOUD_TRAIN) - len(CLOUD_FAST_TRAIN)) * len(CLOUD_FAST_BPP)
+    core = {job["name"] for job in build_cloud_jobs(tmp_path, "cloudfast")}
+    assert not core & {job["name"] for job in extra}
+    for chain in material_chains(extra):
+        assert [job["bpp"] for job in chain] == list(CLOUD_FAST_BPP)
+        assert chain[0]["steps"] == CLOUD_FULL_STEPS
+        assert {job["batch_pixels"] for job in chain} == {v2.CLOUD_BATCH}
+
+
+def test_chain_loop_backfills_after_core(tmp_path: Path, monkeypatch):
+    jobs = build_cloud_jobs(tmp_path, "cloudfast")
+    extra = v2.cloud_backfill_jobs(tmp_path)
+    ran = []
+    monkeypatch.setattr(v2, "_run", lambda job, *a, **k: ran.append(job["name"]))
+    v2._chain_loop(jobs, tmp_path, "fp32", 86400.0, "worker_0", extra)
+    assert ran[: len(jobs)] == [job["name"] for job in jobs]
+    assert len(ran) == len(jobs) + len(extra)
+
+
+def test_compile_attempts(monkeypatch):
+    from ntc.train_fast import compile_attempts
+
+    monkeypatch.delenv("NTC_MAX_GPU", raising=False)
+    monkeypatch.delenv("NTC_COMPILE_MODE", raising=False)
+    assert compile_attempts("cpu") == ["default"]
+    assert compile_attempts("cuda") == ["reduce-overhead", "default"]
+    monkeypatch.setenv("NTC_MAX_GPU", "1")
+    assert compile_attempts("cuda") == ["reduce-overhead", "max-autotune-no-cudagraphs", "default"]
+    assert compile_attempts("cpu") == ["default"]
+    monkeypatch.setenv("NTC_COMPILE_MODE", "max-autotune-no-cudagraphs")
+    assert compile_attempts("cuda") == ["max-autotune-no-cudagraphs", "reduce-overhead", "default"]
+
+
+def test_max_gpu_worker_env(tmp_path: Path):
+    env = worker_env(0, base={}, root=str(tmp_path), max_gpu=True)
+    assert env["NTC_MAX_GPU"] == "1"
+    assert "NTC_MAX_GPU" not in worker_env(0, base={}, root=str(tmp_path))
+
+
+def test_max_gpu_dry_run_defaults_to_one_worker_per_chain(tmp_path: Path):
+    repo = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = f"{repo / 'src'}{os.pathsep}{repo}"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "bench/train_max_v2.py",
+            "--profile",
+            "cloudfast",
+            "--max-gpu",
+            "--dry-run",
+            "--out",
+            str(tmp_path / "out"),
+            "--materials",
+            str(tmp_path / "materials"),
+        ],
+        cwd=repo,
+        env=env,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "would spawn 4 chain workers" in result.stdout
+    assert result.stdout.count("plan backfill") == len(CLOUD_TRAIN) - len(CLOUD_FAST_TRAIN)
+
+
+def test_setup_pod_max_gpu():
+    repo = Path(__file__).resolve().parents[1]
+    script = (repo / "bench/cloud/setup_pod.sh").read_text()
+    assert 'MAX_GPU="${NTC_MAX_GPU:-0}"' in script
+    assert "EXTRA+=(--max-gpu)" in script
+    assert 'WORKERS="${NTC_WORKERS:-4}"' in script

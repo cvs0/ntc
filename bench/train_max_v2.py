@@ -432,6 +432,17 @@ def is_cloud_profile(profile: str | None) -> bool:
     return str(profile or "") in CLOUD_PROFILES
 
 
+def cloud_backfill_jobs(root: Path) -> list[dict]:
+    """The cloudfast ladder on the other cloud train materials.
+
+    A chain worker with ``--max-gpu`` takes these once the four cloudfast
+    chains are claimed, so the card does not idle. Held-out names are never
+    jobs.
+    """
+    extra = tuple(name for name in CLOUD_TRAIN if name not in CLOUD_FAST_TRAIN)
+    return _cloud_ladder(root, extra, CLOUD_FAST_BPP, "cloudfast")
+
+
 def cloud_profile_bpp(profile: str | None) -> tuple[float, ...]:
     return CLOUD_FAST_BPP if str(profile or "") == "cloudfast" else CLOUD_BPP
 
@@ -1096,6 +1107,10 @@ def build_cloud_jobs(root: Path, profile: str = "cloud5090") -> list[dict]:
         train, labels = CLOUD_TRAIN, CLOUD_BPP
     else:
         raise SystemExit(f"unknown cloud profile {profile}")
+    return _cloud_ladder(root, train, labels, profile)
+
+
+def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list[dict]:
     missing = [name for name in train if name not in CLOUD_TRAIN]
     if missing:
         raise RuntimeError(f"not a cloud train material: {missing}")
@@ -1325,7 +1340,7 @@ def _ensure_precision(args: argparse.Namespace) -> str:
         release_job(args.out, "precision")
 
 
-def worker_env(index: int, base: dict | None = None, root: str | None = None) -> dict:
+def worker_env(index: int, base: dict | None = None, root: str | None = None, max_gpu: bool = False) -> dict:
     """Environment for chain worker ``index``: private compile caches.
 
     Workers that share one Inductor cache and its compile pool deadlock, so
@@ -1339,6 +1354,8 @@ def worker_env(index: int, base: dict | None = None, root: str | None = None) ->
     env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
     env["NTC_SHARD"] = f"worker_{int(index)}"
     env[_DENSE_LOCK_ENV] = "0"
+    if max_gpu:
+        env["NTC_MAX_GPU"] = "1"
     return env
 
 
@@ -1371,9 +1388,26 @@ def _chain_lock(chain: list[dict]) -> str:
     return "chain_" + Path(str(chain[0]["material"])).name
 
 
-def _chain_loop(jobs: list[dict], out: Path, precision: str, stale_s: float, label: str) -> None:
-    """Claim one whole material chain at a time and train it in rate order."""
-    for chain in material_chains(jobs):
+def _chain_loop(
+    jobs: list[dict],
+    out: Path,
+    precision: str,
+    stale_s: float,
+    label: str,
+    backfill: list[dict] | None = None,
+) -> None:
+    """Claim one whole material chain at a time and train it in rate order.
+
+    ``backfill`` chains are claimed only after every chain in ``jobs`` is
+    taken, so the main set always starts first.
+    """
+    chains = material_chains(jobs)
+    if backfill:
+        chains = chains + material_chains(backfill)
+    main_count = len(material_chains(jobs))
+    for index, chain in enumerate(chains):
+        if index == main_count:
+            print("main chains claimed; backfill", label, flush=True)
         lock = _chain_lock(chain)
         if not claim_job(out, lock, stale_s):
             continue
@@ -1424,6 +1458,8 @@ def _spawn_workers(args: argparse.Namespace) -> int:
             "--chain-queue" if chains else "--queue",
             "--profile", args.profile,
         ]
+        if chains and getattr(args, "max_gpu", False):
+            cmd.append("--max-gpu")
         if args.batch_pixels is not None:
             cmd.extend(["--batch-pixels", str(args.batch_pixels)])
         if not args.pack:
@@ -1433,7 +1469,7 @@ def _spawn_workers(args: argparse.Namespace) -> int:
         if chains:
             if i and stagger > 0:
                 time.sleep(stagger)
-            env = worker_env(i)
+            env = worker_env(i, max_gpu=bool(getattr(args, "max_gpu", False)))
             os.makedirs(env["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
             os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
             procs.append(subprocess.Popen(cmd, env=env))
@@ -1754,6 +1790,14 @@ def main() -> None:
     )
     p.add_argument("--chain-queue", action="store_true", help="Internal: claim whole material chains until none remain.")
     p.add_argument("--stagger-s", type=float, default=20.0, help="Seconds between dense worker starts.")
+    p.add_argument(
+        "--max-gpu",
+        action="store_true",
+        default=os.environ.get("NTC_MAX_GPU") == "1",
+        help="Cards >= 80 GB (or with --dense-workers): one chain worker per material by default, "
+        "a max-autotune fallback if CUDA graphs fail, and idle workers backfill the other "
+        "cloud train materials on the cloudfast ladder. Also NTC_MAX_GPU=1.",
+    )
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
     p.add_argument("--stale-lock-s", type=float, default=86400.0)
@@ -1769,6 +1813,18 @@ def main() -> None:
             raise SystemExit("--dense-workers must be >= 1")
         args.workers = int(args.dense_workers)
         args.chains = True
+    if args.max_gpu and args.profile == "cloudfast" and not (args.workers or args.chain_queue or args.shard or args.queue):
+        args.workers = len(CLOUD_FAST_TRAIN)
+        args.chains = True
+    if args.max_gpu and not (args.dry_run or args.chain_queue):
+        total = _gpu_total_gb()
+        if total < DENSE_WORKERS_MIN_VRAM_GB and not args.dense_workers:
+            print(f"gpu {total:.0f} GB is under {DENSE_WORKERS_MIN_VRAM_GB:.0f} GB: --max-gpu is off", flush=True)
+            args.max_gpu = False
+            if args.chains and args.workers == len(CLOUD_FAST_TRAIN):
+                args.chains = False
+    if args.max_gpu:
+        os.environ["NTC_MAX_GPU"] = "1"
     if args.chain_queue and (args.queue or args.shard or args.workers):
         raise SystemExit("--chain-queue runs alone")
     if args.workers and args.shard:
@@ -1802,6 +1858,9 @@ def main() -> None:
                         + " ".join(job["name"] for job in chain),
                         flush=True,
                     )
+            if args.max_gpu and args.profile == "cloudfast":
+                for chain in material_chains(cloud_backfill_jobs(args.materials)):
+                    print(f"plan backfill {_chain_lock(chain)}", flush=True)
             print(f"would spawn {args.workers} chain workers", flush=True)
             return
         if args.dry_run:
@@ -1866,7 +1925,17 @@ def main() -> None:
         return
     precision = _ensure_precision(args)
     if args.chain_queue:
-        _chain_loop(jobs, args.out, precision, args.stale_lock_s, os.environ.get("NTC_SHARD") or "chain")
+        backfill = None
+        if args.max_gpu and args.profile == "cloudfast":
+            backfill = cloud_backfill_jobs(args.materials)
+        _chain_loop(
+            jobs,
+            args.out,
+            precision,
+            args.stale_lock_s,
+            os.environ.get("NTC_SHARD") or "chain",
+            backfill,
+        )
         print("wrote", args.out, "chain", flush=True)
         return
     if args.queue:

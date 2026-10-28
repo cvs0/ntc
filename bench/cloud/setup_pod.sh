@@ -9,7 +9,13 @@ if ! curl -m 10 -sI https://github.com >/dev/null; then
   exit 1
 fi
 PROFILE="${NTC_PROFILE:-cloud5090}"
-WORKERS="${NTC_WORKERS:-1}"
+MAX_GPU="${NTC_MAX_GPU:-0}"
+# NTC_MAX_GPU=1 defaults to one chain worker per cloudfast material.
+if [[ "$MAX_GPU" == "1" ]]; then
+  WORKERS="${NTC_WORKERS:-4}"
+else
+  WORKERS="${NTC_WORKERS:-1}"
+fi
 if [[ ! "$WORKERS" =~ ^[0-9]+$ ]] || (( WORKERS < 1 )); then
   echo "NTC_WORKERS must be a positive integer, got $WORKERS" >&2
   exit 1
@@ -77,11 +83,16 @@ if (( WORKERS > 1 )); then
   # Each worker gets its own Inductor and Triton cache from the trainer and
   # takes whole material chains, so warm starts stay in rate order.
   export TORCHINDUCTOR_COMPILE_THREADS=1
+  EXTRA=()
+  if [[ "$MAX_GPU" == "1" ]]; then
+    EXTRA+=(--max-gpu)
+  fi
   LOG="$OUT/logs/workers.log"
   PID="$OUT/logs/workers.pid"
   nohup python bench/train_max_v2.py \
     --profile "$PROFILE" \
     --dense-workers "$WORKERS" \
+    "${EXTRA[@]}" \
     --out "$OUT" \
     --materials "$ROOT/data/materials" \
     9>&- > "$LOG" 2>&1 &

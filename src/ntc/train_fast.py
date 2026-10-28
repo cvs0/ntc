@@ -1161,6 +1161,28 @@ def preferred_compile_mode(device_type: str) -> str:
     return "default"
 
 
+def compile_attempts(device_type: str) -> list[str]:
+    """Compile modes to try in order. The first that runs is kept.
+
+    CUDA starts with ``reduce-overhead`` (CUDA graphs) and falls back to
+    ``default``. ``NTC_MAX_GPU=1`` adds ``max-autotune-no-cudagraphs``
+    between them, for a card where graph capture fails. ``NTC_COMPILE_MODE``
+    puts one mode first.
+    """
+    first = preferred_compile_mode(device_type)
+    attempts = [first]
+    if first == "reduce-overhead":
+        # A cudagraph compile can OOM an 8 GB card. Fall back to the
+        # default mode, which still compiled at 19.57 steps/s on the 5070.
+        if os.environ.get("NTC_MAX_GPU") == "1":
+            attempts.append("max-autotune-no-cudagraphs")
+        attempts.append("default")
+    forced = os.environ.get("NTC_COMPILE_MODE", "").strip()
+    if forced:
+        attempts = [forced] + [mode for mode in attempts if mode != forced]
+    return attempts
+
+
 def _format_eta(seconds: float) -> str:
     seconds = max(0, int(seconds))
     hours, rem = divmod(seconds, 3600)
@@ -1397,11 +1419,7 @@ def _run_loop(
     if compile_mode_override:
         attempts = [compile_mode_override]
     else:
-        attempts = [preferred_compile_mode(device_type)]
-        if attempts[0] == "reduce-overhead":
-            # A cudagraph compile can OOM an 8 GB card. Fall back to the
-            # default mode, which still compiled at 19.57 steps/s on the 5070.
-            attempts.append("default")
+        attempts = compile_attempts(device_type)
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
         configure_inductor_process()
@@ -1433,7 +1451,7 @@ def _run_loop(
                 opt.zero_grad(set_to_none=True)
                 _require_finite_params(stacked)
                 compiled = True
-                if compile_mode == "reduce-overhead":
+                if compile_mode in ("reduce-overhead", "max-autotune"):
                     # Inductor reduce-overhead replays the step as a CUDA/HIP graph.
                     loop_graph_from_compile = True
                 # The compiled function replaces the fp32 loss path only.
