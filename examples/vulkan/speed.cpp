@@ -165,7 +165,7 @@ void run_vk_speed(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
     Buf desc = make_buf(dev, phys, up.desc.size() * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, up.desc.data(), false);
     Buf blob = make_buf(dev, phys, up.blob.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, up.blob.data(), false);
     Buf outb = make_buf(dev, phys, max_floats * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr, false);
-    Buf scratch = make_buf(dev, phys, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr, false);
+    Buf scratch = make_buf(dev, phys, 8192, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr, false);
 
     VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     cpci.queueFamilyIndex = qfam;
@@ -425,6 +425,29 @@ void run_vk_speed(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
                 for (auto wh : res) {
                     std::string name = "sample_coopmat_" + std::to_string(wh[0]) + "x" + std::to_string(wh[1]);
                     PassStats st = time_records([&](VkCommandBuffer c) { draw(c, wh[0], wh[1]); },
+                                                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+                    report(name.c_str(), st, double(wh[0]) * wh[1], cpu_dev);
+                }
+            }
+        }
+        make_compute(shader_dir + "/ntc_coopmat_i8.comp.spv", binds, 4, bufs, sizes, VK_NULL_HANDLE, VK_NULL_HANDLE, 99,
+                     pipe, layout, set);
+        if (!pipe) {
+            std::cout << "bench sample_coopmat_i8 skipped pipeline\n";
+        } else {
+            auto draw_i8 = [&](VkCommandBuffer c, uint32_t w, uint32_t h) {
+                vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+                vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE, layout, 0, 1, &set, 0, nullptr);
+                uint32_t pc[4] = {0, 0, w, h};
+                vkCmdPushConstants(c, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc);
+                vkCmdDispatch(c, (w + 31) / 32, 1, 1);
+            };
+            if (cpu_dev) {
+                std::cout << "bench sample_coopmat_i8_3840x2160 skipped cpu_device\n";
+            } else {
+                for (auto wh : res) {
+                    std::string name = "sample_coopmat_i8_" + std::to_string(wh[0]) + "x" + std::to_string(wh[1]);
+                    PassStats st = time_records([&](VkCommandBuffer c) { draw_i8(c, wh[0], wh[1]); },
                                                 VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
                     report(name.c_str(), st, double(wh[0]) * wh[1], cpu_dev);
                 }
