@@ -54,6 +54,8 @@ set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
 set(SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SPV_DIR})
 
+option(NTC_REQUIRE_DOT4 "Fail configure when glslang cannot compile GL_EXT_integer_dot_product" OFF)
+
 if(GLSLANG)
     set(NTC_DOT_PROBE ${SPV_DIR}/ntc_dot_probe.comp)
     file(WRITE ${NTC_DOT_PROBE}
@@ -66,6 +68,9 @@ if(GLSLANG)
     if(NTC_DOT_RC EQUAL 0 AND NOT NTC_DOT_ERR MATCHES "WARNING" AND NOT NTC_DOT_OUT MATCHES "WARNING")
         file(WRITE ${SPV_DIR}/ntc_dot_config.glsl "#define NTC_HAVE_DOT4 1\n")
     else()
+        if(NTC_REQUIRE_DOT4)
+            message(FATAL_ERROR "GL_EXT_integer_dot_product probe failed. glslang 15.1.0 does not provide dotPacked4x8EXT. Pin a glslang that includes Khronos glslang PR 3832.")
+        endif()
         file(WRITE ${SPV_DIR}/ntc_dot_config.glsl "/* GL_EXT_integer_dot_product is not in this glslang */\n")
     endif()
 endif()

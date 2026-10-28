@@ -35,6 +35,11 @@ jobs:
           cmake --build build 2>&1 | tee build.log
           if grep -E "WARNING:" build.log; then exit 1; fi
           find build/shaders -name '*.spv' -print0 | xargs -0 -r spirv-val
+          if grep -q NTC_HAVE_DOT4 build/shaders/ntc_dot_config.glsl; then
+            spirv-dis build/shaders/ntc_sample_i8.comp.spv | grep -q OpSDot
+          else
+            echo "glslang has no GL_EXT_integer_dot_product; int8 dot stays four multiplies"
+          fi
           ctest --test-dir build --output-on-failure
       - name: shader hosts
         env:
