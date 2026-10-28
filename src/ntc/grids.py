@@ -123,11 +123,18 @@ def select_grids(
     group_size: int,
     adaptive_pool: int = 1,
     rate: str = "payload",
+    min_bits: int = 0,
 ) -> list[list[tuple[int, int, int, int]]]:
     """Return up to ``adaptive_pool`` shapes closest to ``target_bpp``.
 
     The first entry is the default (closest). ``adaptive_pool > 1`` is the
     short list a rate search trains. ``rate`` is ``payload`` or ``latent``.
+    The bpp here is the packed latent (and, for ``payload``, the MLP), not
+    the deflate or range-coded size written into the file.
+
+    ``min_bits`` of 0 keeps the historical order. Above 0, a grid that uses
+    fewer bits per code sorts after one that meets the floor, and a higher
+    minimum bit depth wins a raw-bpp tie. A 2-bit code has four levels.
     """
     if rate not in ("payload", "latent"):
         raise ValueError(rate)
@@ -156,12 +163,30 @@ def select_grids(
         # not a free win when the comparison is at matched rate
         err = abs(bpp - target_bpp)
         over = max(0.0, bpp - target_bpp)
-        scored.append((err + 0.25 * over, bpp, grids))
-    scored.sort(key=lambda t: (t[0], -t[1], len(t[2])))
+        if min_bits > 0:
+            depth = min(g[3] for g in grids)
+            peak = max(g[3] for g in grids)
+            # Grids under the floor sort last. Among the rest, a 4-bit code
+            # trains in fewer steps than an 8-bit code at the same raw bpp,
+            # so the lowest depth that still meets the floor wins the tie.
+            # Scale bytes move the raw bpp by about 1e-5, which is not a
+            # different rate. Quantize the error so that tie uses bit depth.
+            score_q = round(err + 0.25 * over, 2)
+            if depth >= min_bits:
+                scored.append((score_q, 0, peak, depth, len(grids), err + 0.25 * over, grids))
+            else:
+                scored.append((score_q, 1, 0, 0, len(grids), err + 0.25 * over, grids))
+        else:
+            scored.append((err + 0.25 * over, -bpp, len(grids), grids))
+    if min_bits > 0:
+        scored.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5]))
+    else:
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
     # unique by grid tuple
     seen = set()
     picked = []
-    for _err, _bpp, grids in scored:
+    for item in scored:
+        grids = item[-1]
         key = tuple(tuple(g) for g in grids)
         if key in seen:
             continue

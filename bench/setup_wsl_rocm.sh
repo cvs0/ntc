@@ -66,11 +66,18 @@ if ! grep -q HSA_ENABLE_DXG_DETECTION "$ROOT/.venv-wsl/bin/activate" 2>/dev/null
   echo 'export HSA_ENABLE_DXG_DETECTION=1' >> "$ROOT/.venv-wsl/bin/activate"
 fi
 python -m pip install --upgrade pip wheel
-# Same torch the Windows ROCm 7.2.1 run used: 2.9.1. The Radeon wheel index
-# pulls the matching torchvision and the ROCm Triton build.
-python -m pip install torch==2.9.1 torchvision==0.24.0 torchaudio==2.9.0 \
-  -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
 python -m pip install numpy pillow
+# torch 2.9.1+rocm6.4 from download.pytorch.org. The repo.radeon.com
+# manylinux directory is not a pip index ("no versions found" with
+# --index-url). These are the wheel files themselves. The venv's CPython
+# tag selects cp310 through cp314. This build sees an RX 9070 when the
+# system ROCm 7.2 libhsa and librocdxg are the ones that load.
+PYTAG="$(python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
+WHEEL="https://download.pytorch.org/whl/rocm6.4"
+python -m pip install \
+  "${WHEEL}/torch-2.9.1%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl" \
+  "${WHEEL}/torchvision-0.24.0%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl" \
+  "${WHEEL}/torchaudio-2.9.0%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl"
 
 # Drop every libhsa-runtime64 the wheel unpacked. The dynamic linker then
 # uses the system libhsa, which is the one that loads librocdxg.

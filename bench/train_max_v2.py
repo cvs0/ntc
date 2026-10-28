@@ -263,6 +263,9 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         early_stop=int(job.get("early_stop", 8)),
         batch_pixels=int(job.get("batch_pixels", 0)),
         lr_batch_ref=int(job.get("lr_batch_ref", 0)),
+        min_latent_bits=int(job.get("min_latent_bits", 0)),
+        batch_mip=str(job.get("batch_mip", "flat")),
+        latent_rate_scale=float(job.get("latent_rate_scale", 1.0)),
         resume=str(ckpt) if ckpt.is_file() else "",
         ckpt=str(ckpt),
         log_every=10**9,
@@ -307,6 +310,10 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         "worker_pid": os.getpid(),
         "batch_pixels": int(job.get("batch_pixels", 0)),
         "lr_batch_ref": int(job.get("lr_batch_ref", 0)),
+        "batch_mip": str(job.get("batch_mip", "flat")),
+        "target_bpp": float(job["bpp"]),
+        "latent_rate_scale": float(job.get("latent_rate_scale", 1.0)),
+        "min_latent_bits": int(job.get("min_latent_bits", 0)),
         "compiled": stats.get("compiled"),
         "cuda_graph": stats.get("cuda_graph"),
         "halving": stats.get("halving"),
@@ -350,6 +357,9 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
             "seed_pool": kw.pop("seed_pool", 1),
             "halve_steps": kw.pop("halve_steps", 0),
             "lr_batch_ref": 0,
+            "min_latent_bits": kw.pop("min_latent_bits", 0),
+            "batch_mip": kw.pop("batch_mip", "flat"),
+            "latent_rate_scale": kw.pop("latent_rate_scale", 1.0),
         }
         row.update(kw)
         if batch_pixels is not None and row["size"] == 256 and int(row["batch_pixels"]) == 0:
@@ -389,6 +399,19 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
                 eval_every=500,
                 early_stop=6,
             ))
+    # A 2048 frame is 4M pixels. The 1M flat batch also trained all of mip 1.
+    # 256K samples at mip 0, and 1/4 of that per coarser mip, is the stand-in
+    # trade that stayed within 0.1 dB of a full frame. The loss is a mean, so
+    # the learning rate stays at the full-frame step (lr_batch_ref 0).
+    for row in jobs:
+        if int(row["size"]) >= 2048 and int(row.get("batch_pixels") or 0) >= 1024 * 1024:
+            row["batch_pixels"] = 256 * 1024
+            row["batch_mip"] = "area"
+        if row.get("rate") == "latent":
+            # Drop 2-bit ties, and aim the packed grid above the label because
+            # the file keeps the coded bytes. 0.5 is the smooth-latent ratio.
+            row["min_latent_bits"] = 4
+            row["latent_rate_scale"] = 0.5
     return jobs
 
 

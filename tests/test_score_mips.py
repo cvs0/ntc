@@ -44,6 +44,16 @@ def test_latent_target_orders_shapes():
     assert latent_payload_bits(high) > latent_payload_bits(low)
 
 
+def test_latent_min_bits_avoids_a_two_bit_tie():
+    raw = select_grids(2048, 2048, 5.0, [32], 9, 0, 0, 8, 0, rate="latent")[0]
+    assert min(g[3] for g in raw) == 2
+    held = select_grids(2048, 2048, 5.0, [32], 9, 0, 0, 8, 0, rate="latent", min_bits=4)[0]
+    assert min(g[3] for g in held) >= 4
+    assert max(g[3] for g in held) == 4
+    bpp = latent_payload_bits(held) / (2048 * 2048)
+    assert abs(bpp - 5.0) < 0.05
+
+
 def test_rd_svg_labels_table3(tmp_path: Path):
     from bench.rtxntc_compare import PAPER_NOTE, _svg
 

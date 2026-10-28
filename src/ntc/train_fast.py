@@ -47,6 +47,35 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
     return float(lr) * (float(batch_pixels) / float(ref_pixels))
 
 
+def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat") -> int:
+    """Pixels to draw at this mip. 0 means every pixel.
+
+    ``flat`` uses ``batch_pixels`` whenever the mip is larger. ``area`` uses
+    ``batch_pixels >> (2 * mip)``, so a coarse mip is not a second full frame.
+    """
+    if batch_pixels <= 0 or count <= 0:
+        return 0
+    if mode == "area":
+        budget = max(1, int(batch_pixels) >> (2 * int(mip)))
+    elif mode == "flat":
+        budget = int(batch_pixels)
+    else:
+        raise ValueError(mode)
+    if budget >= count:
+        return 0
+    return budget
+
+
+def _state_matches_grids(state: dict, grids: list) -> bool:
+    """True when a checkpoint's latent tensors have the selected shapes."""
+    for index, (gw, gh, ch, _bits) in enumerate(grids):
+        tensor = state.get(f"latents.{index}")
+        if tensor is None or tuple(tensor.shape) != (ch, gh, gw):
+            return False
+    n = sum(1 for key in state if key.startswith("latents.") and key.count(".") == 1)
+    return n == len(grids)
+
+
 def _mesh_uv(height: int, width: int, device: torch.device) -> torch.Tensor:
     ys = torch.arange(height, device=device)
     xs = torch.arange(width, device=device)
@@ -493,7 +522,8 @@ def _loss_from_mips(
         uv = slot["uv"]
         tgt = slot["tgt"]
         count = uv.shape[0]
-        if batch_pixels and batch_pixels < count:
+        budget = mip_sample_count(batch_pixels, mip, count, cfg.batch_mip)
+        if budget:
             if cfg.importance and mip == 0:
                 from ntc.train_steps import importance_index
 
@@ -501,9 +531,9 @@ def _loss_from_mips(
                 if cache is None:
                     cache = {}
                     stacked._importance = cache
-                idx = importance_index(stacked, uv, tgt, batch_pixels, step, cache)
+                idx = importance_index(stacked, uv, tgt, budget, step, cache)
             else:
-                idx = torch.randint(0, count, (batch_pixels,), device=uv.device)
+                idx = torch.randint(0, count, (budget,), device=uv.device)
             uv = uv.index_select(0, idx)
             tgt = tgt.index_select(1, idx)
         pred = stacked.predict(
@@ -806,10 +836,13 @@ def encode_arrays_fast(
     hidden = list(cfg.hidden)
     pe_mode = _PE[cfg.pe]
     if cfg.grids is None:
+        select_bpp = float(cfg.target_bpp)
+        if cfg.rate == "latent" and 0 < float(cfg.latent_rate_scale) < 1:
+            select_bpp = select_bpp / float(cfg.latent_rate_scale)
         choices = select_grids(
             width,
             height,
-            cfg.target_bpp,
+            select_bpp,
             hidden,
             channels,
             pe_mode,
@@ -818,6 +851,7 @@ def encode_arrays_fast(
             cfg.group_size,
             adaptive_pool=max(1, cfg.adaptive_pool),
             rate=cfg.rate,
+            min_bits=int(cfg.min_latent_bits),
         )
         grids = choices[0]
         if cfg.adaptive_pool > 1 and cfg.steps > 0 and len(choices) > 1:
@@ -842,6 +876,11 @@ def encode_arrays_fast(
     else:
         grids = cfg.grids
 
+    if cfg.resume:
+        preview = torch.load(cfg.resume, map_location="cpu", weights_only=False)
+        if not _state_matches_grids(preview.get("model", {}), grids):
+            print("resume grid mismatch, training from scratch", cfg.resume, flush=True)
+            cfg = replace(cfg, resume="")
     seeds = [cfg.seed + i for i in range(max(1, cfg.seed_pool if cfg.steps > 0 else 1))]
     if cfg.resume:
         seeds = [cfg.seed]
@@ -966,7 +1005,9 @@ def encode_arrays_fast(
                 if stall >= cfg.early_stop:
                     stopped_early = True
                     break
-        if best_state is not None and stopped_early:
+        if best_state is not None:
+            # Same rule as the eager loop: the export is the best eval, including
+            # when the run used every step and the last eval was not the best.
             with torch.no_grad():
                 for p, src in zip(stacked.parameters(), best_state, strict=True):
                     p.copy_(src)

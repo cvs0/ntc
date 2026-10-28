@@ -117,6 +117,17 @@ class TrainConfig:
     cuda_graph: str = "auto"
     # Linear LR scale batch_pixels / lr_batch_ref when both are positive.
     lr_batch_ref: int = 0
+    # 0 keeps the historical grid order. The fast path can set 4 so a raw-bpp
+    # tie does not pick a 2-bit code. encode_arrays does not read this.
+    min_latent_bits: int = 0
+    # "flat" draws batch_pixels at every mip larger than that. "area" divides
+    # the budget by 4 per mip. encode_arrays does not read this.
+    batch_mip: str = "flat"
+    # 1 keeps the raw packed size as the selection target. Below 1, a latent
+    # target is divided by this factor before the grid search, because the
+    # file stores the deflate or range-coded bytes, not the packed size.
+    # encode_arrays does not read this.
+    latent_rate_scale: float = 1.0
     # The fields below are read only by the fast path. encode_arrays ignores them.
     warm_start: str = ""
     freeze_decoder: bool = False

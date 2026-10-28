@@ -17,6 +17,7 @@ from bench.train_max_v2 import (
     parse_shard,
     release_job,
 )
+from ntc.train_fast import mip_sample_count
 
 
 def test_shard_covers_each_job_once():
@@ -37,7 +38,8 @@ def test_shard_covers_each_job_once():
     assert overridden[0]["batch_pixels"] == 32768
     assert overridden[0]["lr_batch_ref"] == 256 * 256
     big = next(job for job in overridden if job["size"] == 2048)
-    assert big["batch_pixels"] == 1024 * 1024
+    assert big["batch_pixels"] == 256 * 1024
+    assert big["batch_mip"] == "area"
     assert big["lr_batch_ref"] == 0
 
 
@@ -55,14 +57,27 @@ def test_claim_is_exclusive_and_a_dead_pid_is_stale(tmp_path: Path):
     assert payload["pid"] == os.getpid()
 
 
+def test_area_batch_shrinks_coarser_mips():
+    assert mip_sample_count(1048576, 1, 1048576, "flat") == 0
+    assert mip_sample_count(262144, 0, 2048 * 2048, "area") == 262144
+    assert mip_sample_count(262144, 1, 1024 * 1024, "area") == 65536
+    assert mip_sample_count(262144, 2, 512 * 512, "area") == 16384
+
+
 def test_job_cost_and_cost_balanced_shards():
     jobs = build_jobs(Path("data/materials"), None)
     by_name = {job["name"]: job for job in jobs}
     assert job_cost(by_name["metal_g16_s20000"]) == 256 * 256 * 20000
     assert job_cost(by_name["metal_b4_s10000"]) == 256 * 256 * 10000
     sdk = by_name["sdk_MetalPlates013_2K_b2.5"]
-    assert job_cost(sdk) == (1024 * 1024) * 4000
-    assert job_cost(sdk) > job_cost(by_name["metal_g16_s20000"])
+    assert sdk["batch_pixels"] == 256 * 1024
+    assert sdk["batch_mip"] == "area"
+    assert sdk["lr_batch_ref"] == 0
+    assert sdk["min_latent_bits"] == 4
+    assert sdk["latent_rate_scale"] == 0.5
+    assert job_cost(sdk) == (256 * 1024) * 4000
+    assert by_name["wood_floor_2k_b16_s1000"]["batch_pixels"] == 256 * 1024
+    assert by_name["wood_floor_2k_b16_s1000"]["min_latent_bits"] == 0
     assign = assign_shards(jobs, 3)
     assert len(assign) == len(jobs)
     sdk_shards = {assign[i] for i, job in enumerate(jobs) if job["name"].startswith("sdk_")}
@@ -98,9 +113,9 @@ def test_queue_claims_heaviest_then_another(tmp_path: Path):
     second = claim_next(jobs, tmp_path, 3600, pack=False)
     heaviest = max(job_cost(job) for job in jobs)
     assert job_cost(first[0]) == heaviest
-    assert job_cost(second[0]) == heaviest
+    assert job_cost(first[0]) > job_cost(second[0])
     assert [job["name"] for job in first] == ["wood_floor_1k_b16_s4000"]
-    assert [job["name"] for job in second] == ["sdk_MetalPlates013_2K_b2.5"]
+    assert [job["name"] for job in second] == ["metal_g16_s20000"]
 
 
 def _packable(name: str, steps: int) -> dict:
