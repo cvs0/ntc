@@ -37,10 +37,10 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 72 | u32 | scale_bytes |
 | 76 | u32 | crc32 |
 | 80 | u32 | file_bytes |
-| 84 | u32 | inflated latent bytes when flag bit 2 is set, otherwise 0 |
+| 84 | u32 | plain latent bytes when flag bit 2, 3, or 5 is set, otherwise 0 |
 | 88 | u64 | reserved |
 
-Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Flag bit 3: the same plain bytes coded with an order-1 adaptive range coder over nibbles (low nibble first, 16 contexts, counts start at 1, rescale at 4096). The two flags are mutually exclusive. Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the compressed stream. The inflated size is the inference working set. `latent_coder = best` writes whichever of deflate and range is smaller.
+Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Flag bit 3: the same plain bytes coded with an order-1 adaptive range coder over nibbles (low nibble first, 16 contexts, counts start at 1, rescale at 4096). Flag bit 5: the same plain bytes coded with a 256-context range coder. The context is the previous nibble, the top two bits of the previous byte, and one of four bands along the concatenated latent (`min(3, index * 4 / length)`). At most one of bits 2, 3, and 5 is set. Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the compressed stream. The inflated size is the inference working set. `latent_coder = best` writes whichever of deflate and the order-1 range coder is smaller. It does not set bit 5, so a `train_max` file stays on those two coders. `latent_coder = context` sets bit 5. `latent_coder = best_all` writes the smallest of the three streams.
 
 Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserved`.
 
@@ -68,6 +68,8 @@ Four rates are reported on every encode. `total_bpp` is the historical one and i
 `file_bpp_chain` is `8 * file_bytes / mip_chain_texels`. The numerator is the whole file. The denominator is every mip the header declares (`num_mips`, a full chain is `floor(log2(max(width, height))) + 1` levels down to 1x1). Derived color mips are not stored a second time.
 
 `bppc` is the paper rate: `8 * payload / (mip_chain_texels * channels)`. Payload is the same numerator as `total_bpp`. Vaidyanathan et al. 2023 Table 3 reports bits/pixel/channel including mips and weights, as a 20-material average: 0.23 -> 32.71 dB, 0.56 -> 36.12, 1.13 -> 39.92, 2.51 -> 45.30. Those points are a different material set, not a matched comparison.
+
+`header_bytes` is 96. One header covers the material and every mip in the chain. `network_bytes` is the integer MLP weights plus the fp16 bias and the fp16 weight scales. It is inside `total_bpp` and `bppc`, and it is outside `latent_bpp_mip0`. The header layout is unchanged.
 
 ## Network
 
@@ -267,7 +269,11 @@ Initialization is coarse-to-fine PCA of the residual into each grid, then a leas
 
 Loss is mean squared error. Channel weights and a normal-cosine term exist and are off by default.
 
-Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_coder = best`, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them. On the locked seed-3 metal network after 40 Adam steps (mip 0 loss, PSNR 35.7492), the plain latent is 131104 bytes. Deflate stores 79269 bytes (9.7565 bpp). The range coder stores 71365 bytes (8.7916 bpp). `best` selects the range stream. The C++ decoder matches the Python image to 2.98e-7 max abs on that file. A steps-0 PCA latent of the same grids is 78880 deflate bytes versus 71006 range bytes. On an artificial 64x64 grid of repeated 8x8 blocks, deflate is smaller (396 vs 1961), and `best` keeps deflate.
+Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_coder = best`, `rd_lambda = 0`, `target_psnr` unset, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them. On the locked seed-3 metal network after 40 Adam steps (mip 0 loss, PSNR 35.7492), the plain latent is 131104 bytes. Deflate stores 79269 bytes (9.7565 bpp). The range coder stores 71365 bytes (8.7916 bpp). `best` selects the range stream. The C++ decoder matches the Python image to 2.98e-7 max abs on that file. A steps-0 PCA latent of the same grids is 78880 deflate bytes versus 71006 range bytes. On an artificial 64x64 grid of repeated 8x8 blocks, deflate is smaller (396 vs 1961), and `best` keeps deflate.
+
+Weights are int8 with straight-through quantization while training (`qat_weights`, `weight_bits = 8`). That is the same int8 the packed decode path multiplies. Each latent channel has its own learned step, `exp(log_scales)`, stored as fp16 and clamped to `[1e-4, 5]`. The reconstructed value is `(code - mid) * scale`. `rd_lambda` defaults to 0, which leaves that loss graph unchanged. When it is positive, each step adds `rd_lambda * sum over channels of log2(1 + mean neighbor residual) * grid_texels / image_texels`. The residual is the absolute code step to the left texel and to the upper texel, and those neighbors are detached. A constant channel adds 0. The scale parameters are outside the rate term. `ntc-encode --rd-lambda` sets it. `bench/rd_curve.py --rd-lambdas` sweeps it. On a 32x32 image, fixed grids `32x32x2@4`, hidden 32, 40 steps, `best_all`: lambda 0 stored 346 latent bytes at 25.244 dB (entropy 3.545). Lambda `1e-2` stored 342 bytes at 25.647 dB (entropy 3.530). Lambda `0.1` stored 341 bytes at 25.223 dB. The saving on that image is 4 bytes.
+
+`ntc-encode --target-psnr D` searches target rates 2, 4, 6, 8, 10, 12, 16, and 20 (plus `--bpp` when that value is outside the list). Each probe trains `search_steps` steps, or `min(20, --steps)` when `--search-steps` is 0, with `adaptive_pool = 1` and `seed_pool = 1`. The grid family is the one in `select_grids`: one and two grids, shifts 0 through 5, channel counts 2, 4, 8, and 12, latent bits 2, 4, and 8. The smallest file whose 8-bit PSNR meets D is then trained with the caller's step count and pool sizes. If no probe meets D, the highest PSNR is kept. The search stays off unless `--target-psnr` is set. `train_max` does not set it, and it does not set `rd_lambda`.
 
 ## Measurements
 
@@ -562,6 +568,21 @@ powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
 ```
 
 The new rows are in `results\hw\<gpu-slug>\*_vulkan.txt`.
+
+## Rate curves
+
+`bench/rd_curve.py` writes `results/rd_curve.json` and `results/rd_curve.svg`. The rate list is 2, 4, 6, 8, 10, 12, 16, 20. The SVG has three panels: `latent_bpp_mip0` (domain at least 2 to 20), `file_bpp_chain` (domain at least 2 to 20), and `bppc`. Ours is blue. BC1, BC5, and BC7 from `bench/bc_pack.py` (mode 6, DXT1, BC4) are gray. ASTC 4x4, 5x5, 6x6, and 8x8 are green when `astcenc` is on PATH; otherwise those rows keep the nominal bpp (8, 5.12, 3.555..., 2 bits per texel per texture) and a null PSNR. Black squares are Table 3, labeled as a different material set. Orange points are filled from `results/rtxntc_compare/*/report.json` after `bench/rtxntc_compare` runs on the NVIDIA laptop. Until that file exists the measured RTXNTC list is empty.
+
+PSNR on every row that has one comes from `bench/score_mips.py`: pooled 8-bit MSE over the mip chain both sides actually wrote. Block rates are the nominal codec rates. BC5 normal reconstructs Z from XY. The 16 bpp bundle is BC1 albedo, BC5 normal, and one BC1 of roughness, metalness, and ao.
+
+`bd_rate` in the JSON is percent bits saved at equal PSNR. Positive means ours uses fewer bits than that baseline. Curves that overlap in PSNR use a piecewise-linear integral of `ln(rate)` over PSNR. A baseline with one point interpolates our curve at that PSNR. The comparison is kept when both sides scored the same channel groups. It is reported on `file_bpp_chain` and on `bppc` for BC and ASTC, and on `latent_bpp_mip0`, `file_bpp_chain`, and `bppc` for measured RTXNTC. The Table 3 entry is present with a null number because that table is a different 20-material average.
+
+```bash
+python bench/rd_curve.py --demo --size 32 --steps 40 --hidden 32 --rates 4 8 16 --out results/rd_curve_cpu.json
+python bench/rd_curve.py --material data/materials/MetalPlates013_2K --size 2048 --steps 4000 --rate latent --latent-coder best_all --rd-lambdas 0 1e-4 1e-3
+```
+
+`results/rd_curve_cpu.json` is that first command: a 32x32 CPU check with `sdk_2048_measured` false. Ours at 40 steps scored 18.70 dB at 4.13 `file_bpp_chain`, 24.14 dB at 5.02, and 29.97 dB at 11.41. BC1 albedo on the same chain was 27.89 dB at 4 bpp, BC7 albedo 28.03 dB at 8 bpp. Equal-PSNR interpolation on `file_bpp_chain` is -112.69% bits saved versus BC1 and -8.48% versus BC7 (negative means ours spends more bits at that PSNR). On `bppc` versus BC7 the figure is +8.34%. ASTC rows in that file are bpp anchors (`astcenc` was absent). Table 3 is plotted and its BD-rate entry is null. The 2048 curves come from the second command on the SDK materials. `train_max` is a separate resumable sweep and is unchanged.
 
 ## Limitations
 

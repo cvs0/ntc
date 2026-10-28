@@ -80,7 +80,9 @@ class TrainConfig:
     seed_pool: int = 4
     with_ssim: bool = True
     latent_deflate: bool = True
-    # "deflate", "range", "best" (smaller of the two, same pixels), or "raw".
+    # "deflate", "range", "best" (smaller of deflate and order-1 range),
+    # "context" (256-context range), "best_all" (smallest of the three), or "raw".
+    # "best" does not emit the context coder. train_max sets "best".
     latent_coder: str = "best"
     tile_size: int = 0
     layer_bits: tuple = ()
@@ -96,6 +98,14 @@ class TrainConfig:
     early_stop: int = 0
     resume: str = ""
     ckpt: str = ""
+    # 0 leaves the loss unchanged. Above 0, each step adds
+    # rd_lambda * (latent code rate in bits per image texel).
+    rd_lambda: float = 0.0
+    # When set, encode_arrays probes the grid family at several rates and
+    # trains the smallest file whose 8-bit PSNR meets this value.
+    target_psnr: float | None = None
+    # 0 selects min(20, steps) for those probes.
+    search_steps: int = 0
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
@@ -212,6 +222,46 @@ def _loss(pred, tgt, sems, cfg: TrainConfig) -> torch.Tensor:
     return loss
 
 
+def _code_rate_per_texel(net: NtcNet, texels: int) -> torch.Tensor:
+    """Bits per image texel of a code-unit rate proxy.
+
+    Each latent channel pays ``log2(1 + mean neighbor residual)`` times its
+    grid texel count. The residual is the absolute step to the left texel
+    and to the upper texel. Those neighbors are detached, so the penalty
+    pulls each code toward the code beside it. That is the dependence the
+    256-context range coder models (previous byte, plus a position band that
+    needs no side info). The learned per-channel scale (``exp(log_scales)``)
+    is outside this term. A constant channel costs 0.
+    """
+    bits = net.latents[0].new_zeros(())
+    for lat in net.latents:
+        gh, gw = int(lat.shape[1]), int(lat.shape[2])
+        parts = []
+        if gw > 1:
+            parts.append((lat[:, :, 1:] - lat[:, :, :-1].detach()).abs().mean(dim=(1, 2)))
+        if gh > 1:
+            parts.append((lat[:, 1:, :] - lat[:, :-1, :].detach()).abs().mean(dim=(1, 2)))
+        if not parts:
+            dev = (lat - lat.detach()).abs().mean(dim=(1, 2))
+        elif len(parts) == 1:
+            dev = parts[0]
+        else:
+            dev = 0.5 * (parts[0] + parts[1])
+        bits = bits + (torch.log2(1.0 + dev) * float(gh * gw)).sum()
+    return bits / float(max(int(texels), 1))
+
+
+_SEARCH_BPPS = (2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0)
+
+
+def _search_bpps(target_bpp: float) -> list[float]:
+    vals = [float(v) for v in _SEARCH_BPPS]
+    if all(abs(float(target_bpp) - v) > 1e-6 for v in vals):
+        vals.append(float(target_bpp))
+    vals.sort()
+    return vals
+
+
 def _subset_psnr(pred: torch.Tensor, tgt: torch.Tensor) -> float:
     d = (pred.detach() - tgt).float()
     mse = torch.mean(d * d).clamp(min=1e-20)
@@ -303,12 +353,79 @@ def export_network(
     )
 
 
+def _encode_for_psnr(
+    images: np.ndarray,
+    semantics: list[int],
+    cfg: TrainConfig,
+) -> tuple[bytes, dict]:
+    """Probe rates, then train the smallest file that meets ``target_psnr``.
+
+    Probes call ``encode_arrays`` with ``target_psnr`` cleared, so this does
+    not recurse. Each probe uses one grid from ``select_grids`` (size, latent
+    bits, channel count) at that rate. The full train keeps the caller's
+    step count, adaptive pool, and seed pool, at the picked rate.
+    """
+    steps = cfg.search_steps if cfg.search_steps > 0 else min(20, cfg.steps)
+    rows = []
+    for bpp in _search_bpps(cfg.target_bpp):
+        probe = replace(
+            cfg,
+            target_bpp=float(bpp),
+            target_psnr=None,
+            grids=None,
+            steps=int(steps),
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            eval_every=0,
+            early_stop=0,
+            resume="",
+            ckpt="",
+        )
+        _blob, stats = encode_arrays(images, semantics, probe)
+        rows.append(
+            {
+                "target_bpp": float(bpp),
+                "psnr_u8": float(stats["metrics"]["psnr_u8"]),
+                "file_bytes": int(stats["file_bytes"]),
+                "total_bpp": float(stats["total_bpp"]),
+                "latent_bpp_mip0": float(stats["latent_bpp_mip0"]),
+                "file_bpp_chain": float(stats["file_bpp_chain"]),
+                "bppc": float(stats["bppc"]),
+                "network_bytes": int(stats["network_bytes"]),
+                "grids": stats["grids"],
+            }
+        )
+    meeting = [r for r in rows if r["psnr_u8"] >= float(cfg.target_psnr)]
+    if meeting:
+        meeting.sort(key=lambda r: (r["file_bytes"], r["target_bpp"]))
+        picked = meeting[0]
+    else:
+        picked = sorted(rows, key=lambda r: (-r["psnr_u8"], r["file_bytes"]))[0]
+    full = replace(
+        cfg,
+        target_bpp=float(picked["target_bpp"]),
+        target_psnr=None,
+        grids=None,
+    )
+    blob, stats = encode_arrays(images, semantics, full)
+    stats = dict(stats)
+    stats["rate_search"] = rows
+    stats["rate_search_picked_bpp"] = float(picked["target_bpp"])
+    stats["target_psnr"] = float(cfg.target_psnr)
+    stats["search_steps"] = int(steps)
+    return blob, stats
+
+
 def encode_arrays(
     images: np.ndarray,
     semantics: list[int],
     cfg: TrainConfig,
 ) -> tuple[bytes, dict]:
     """``images`` is float32 ``[C,H,W]`` in ``[0,1]``."""
+    if cfg.target_psnr is not None:
+        return _encode_for_psnr(images, semantics, cfg)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = pick_device(cfg.device)
@@ -557,6 +674,8 @@ def encode_arrays(
             loss = loss + _mip_weight(cfg, m) * _loss(pred.float(), tgt, semantics, cfg)
             if m == 0 and (step % cfg.log_every == 0 or step == cfg.steps - 1):
                 monitor_psnr = _subset_psnr(pred.float(), tgt)
+        if cfg.rd_lambda > 0.0:
+            loss = loss + float(cfg.rd_lambda) * _code_rate_per_texel(net, h * w)
         if scaler is not None:
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -676,6 +795,7 @@ def encode_arrays(
         "activation_requant": cfg.activation_requant,
         "latent_deflate": cfg.latent_deflate,
         "latent_coder": cfg.latent_coder if cfg.latent_deflate else "raw",
+        "rd_lambda": cfg.rd_lambda,
         "precision": cfg.precision,
         "warmup_steps": cfg.warmup_steps,
         "schedule": cfg.schedule,

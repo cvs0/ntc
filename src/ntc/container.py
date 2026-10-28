@@ -36,7 +36,10 @@ FLAG_LATENT_DEFLATE = 1 << 2
 # Order-1 nibble range coder of the same plain latent bytes. Mutually
 # exclusive with FLAG_LATENT_DEFLATE. Offset 84 is the plain length.
 FLAG_LATENT_RANGE = 1 << 3
-FLAG_LATENT_COMPRESSED = FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE
+# Neighbor- and position-conditioned nibble range coder. Not selected by
+# ``latent_coder="best"``, so train_max files stay on deflate or order-1 range.
+FLAG_LATENT_CTX = 1 << 5
+FLAG_LATENT_COMPRESSED = FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE | FLAG_LATENT_CTX
 # Hidden inputs to each MLP layer are int8 with one fp16 scale per layer,
 # stored as a tail of float16 values (one per layer, input side). Default
 # files do not set this bit. train_max does not set it.
@@ -446,6 +449,20 @@ def build_texture_set(
         else:
             stored_latent = deflated
             flags = flags | FLAG_LATENT_DEFLATE
+    elif coder in ("context", "best_all"):
+        from ntc.range_coder import range_encode, range_encode_ctx
+
+        coded = range_encode_ctx(plain)
+        flags_here = FLAG_LATENT_CTX
+        if coder == "best_all":
+            deflated = deflate_raw(plain)
+            ranged = range_encode(plain)
+            coded, flags_here = min(
+                ((coded, FLAG_LATENT_CTX), (ranged, FLAG_LATENT_RANGE), (deflated, FLAG_LATENT_DEFLATE)),
+                key=lambda item: len(item[0]),
+            )
+        stored_latent = coded
+        flags = flags | flags_here
     elif coder == "raw":
         stored_latent = plain
     else:
@@ -604,8 +621,9 @@ def parse_texture_set(blob: bytes) -> TextureSet:
     if _HEADER.size != HEADER_BYTES:
         raise RuntimeError("struct size")
 
-    if (flags & FLAG_LATENT_DEFLATE) and (flags & FLAG_LATENT_RANGE):
-        raise ValueError("deflate and range flags are mutually exclusive")
+    nflags = bin(flags & (FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE | FLAG_LATENT_CTX)).count("1")
+    if nflags > 1:
+        raise ValueError("latent coder flags are mutually exclusive")
     code_src: bytes | memoryview = blob
     if flags & FLAG_LATENT_COMPRESSED:
         if latent_plain <= 0:
@@ -613,6 +631,10 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         packed = blob[latent_off : latent_off + latent_bytes]
         if flags & FLAG_LATENT_DEFLATE:
             code_src = inflate_raw(packed, latent_plain)
+        elif flags & FLAG_LATENT_CTX:
+            from ntc.range_coder import range_decode_ctx
+
+            code_src = range_decode_ctx(packed, latent_plain)
         else:
             from ntc.range_coder import range_decode
 
@@ -783,4 +805,16 @@ def rate_report(ts: TextureSet) -> dict:
         "latent_scale_bytes": _scale_bytes(ts),
         "payload_bytes": payload,
         "file_bytes": len(ts.raw),
+        "header_bytes": HEADER_BYTES,
+        "network_bytes": _network_bytes(ts),
     }
+
+
+def _network_bytes(ts: TextureSet) -> int:
+    """Integer weights plus fp16 bias and fp16 weight scales. Not the header."""
+    n = 0
+    for layer in ts.layers:
+        n += layer.weight_bytes
+        n += layer.out_features * 2
+        n += layer.out_features * layer.num_groups * 2
+    return n

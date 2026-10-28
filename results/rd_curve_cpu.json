@@ -1,0 +1,337 @@
+{
+  "scope": "cpu_proof_32",
+  "sdk_2048_measured": false,
+  "note": "2048 SDK materials are measured only when this script is run with --material on those directories at --size 2048. A demo run is a 32-wide CPU check of the scorer, the block codecs, and the encoder options.",
+  "definitions": {
+    "latent_bpp_mip0": "stored latent codes + fp16 latent scales, per mip 0 texel. Block codecs leave this null.",
+    "file_bpp_chain": "whole NTC file, or nominal block bits, per mip-chain texel",
+    "bppc": "NTC payload bits, or nominal block bits, per mip-chain texel per channel",
+    "header_bytes": 96,
+    "network_bytes": "int8 or int4 weights plus fp16 bias and fp16 weight scales"
+  },
+  "paper": {
+    "note": "Vaidyanathan et al. 2023 Table 3, 20-material average, bits/pixel/channel including mips and weights. A different material set, not a matched comparison.",
+    "table3_bppc_db": [
+      [
+        0.23,
+        32.71
+      ],
+      [
+        0.56,
+        36.12
+      ],
+      [
+        1.13,
+        39.92
+      ],
+      [
+        2.51,
+        45.3
+      ]
+    ]
+  },
+  "bd_rate_method": "bits_saved_percent is positive when the candidate uses fewer bits at equal PSNR. Overlapping curves use a piecewise-linear integral of ln(rate) over PSNR. A one-point baseline interpolates the candidate.",
+  "ours": [
+    {
+      "series": "ours_lambda_0",
+      "tool": "ours",
+      "requested_bpp": 4.0,
+      "rate_mode": "latent",
+      "rd_lambda": 0.0,
+      "latent_coder": "best",
+      "psnr_u8": 18.70187680918487,
+      "groups": [
+        "albedo"
+      ],
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "latent_bpp_mip0": 1.5234375,
+      "file_bpp_chain": 4.1260073260073264,
+      "bppc": 0.967032967032967,
+      "total_bpp": 3.8671875,
+      "header_bytes": 96,
+      "network_bytes": 300,
+      "file_bytes": 704,
+      "grids": [
+        [
+          32,
+          32,
+          2,
+          2
+        ]
+      ]
+    },
+    {
+      "series": "ours_lambda_0",
+      "tool": "ours",
+      "requested_bpp": 8.0,
+      "rate_mode": "latent",
+      "rd_lambda": 0.0,
+      "latent_coder": "best",
+      "psnr_u8": 24.14236845390491,
+      "groups": [
+        "albedo"
+      ],
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "latent_bpp_mip0": 2.7109375,
+      "file_bpp_chain": 5.016849816849817,
+      "bppc": 1.263980463980464,
+      "total_bpp": 5.0546875,
+      "header_bytes": 96,
+      "network_bytes": 300,
+      "file_bytes": 856,
+      "grids": [
+        [
+          32,
+          32,
+          2,
+          4
+        ]
+      ]
+    },
+    {
+      "series": "ours_lambda_0",
+      "tool": "ours",
+      "requested_bpp": 16.0,
+      "rate_mode": "latent",
+      "rd_lambda": 0.0,
+      "latent_coder": "best",
+      "psnr_u8": 29.965048233616884,
+      "groups": [
+        "albedo"
+      ],
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "latent_bpp_mip0": 11.234375,
+      "file_bpp_chain": 11.405128205128205,
+      "bppc": 3.3953601953601953,
+      "total_bpp": 13.578125,
+      "header_bytes": 96,
+      "network_bytes": 300,
+      "file_bytes": 1946,
+      "grids": [
+        [
+          32,
+          32,
+          2,
+          8
+        ]
+      ]
+    }
+  ],
+  "blocks": [
+    {
+      "name": "bc1_albedo",
+      "codec": "bc1",
+      "tool": "bc_pack.py",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": 27.887039808695956,
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "codec_bpp": 4.0,
+      "textures": 1,
+      "file_bpp_chain": 4.0,
+      "bppc": 1.3333333333333333,
+      "latent_bpp_mip0": null,
+      "note": "nominal codec bits per mip texel, summed over the textures in this row. Block codecs have no latent split.",
+      "chain_texels": 1365,
+      "payload_bits": 5460.0
+    },
+    {
+      "name": "bc7_albedo",
+      "codec": "bc7",
+      "tool": "bc_pack.py",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": 28.02809414718312,
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "codec_bpp": 8.0,
+      "textures": 1,
+      "file_bpp_chain": 8.0,
+      "bppc": 2.6666666666666665,
+      "latent_bpp_mip0": null,
+      "note": "nominal codec bits per mip texel, summed over the textures in this row. Block codecs have no latent split.",
+      "chain_texels": 1365,
+      "payload_bits": 10920.0
+    },
+    {
+      "name": "bc7_textures",
+      "codec": "bc7",
+      "tool": "bc_pack.py",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": 28.02809414718312,
+      "mips": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "codec_bpp": 8.0,
+      "textures": 1,
+      "file_bpp_chain": 8.0,
+      "bppc": 2.6666666666666665,
+      "latent_bpp_mip0": null,
+      "note": "nominal codec bits per mip texel, summed over the textures in this row. Block codecs have no latent split.",
+      "chain_texels": 1365,
+      "payload_bits": 10920.0
+    },
+    {
+      "name": "astc_4x4",
+      "codec": "astc",
+      "block": "4x4",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": null,
+      "codec_bpp": 8.0,
+      "textures": 1,
+      "file_bpp_chain": 8.0,
+      "bppc": 2.6666666666666665,
+      "latent_bpp_mip0": null,
+      "note": "astcenc is not on PATH. bpp anchor only."
+    },
+    {
+      "name": "astc_5x5",
+      "codec": "astc",
+      "block": "5x5",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": null,
+      "codec_bpp": 5.12,
+      "textures": 1,
+      "file_bpp_chain": 5.12,
+      "bppc": 1.7066666666666668,
+      "latent_bpp_mip0": null,
+      "note": "astcenc is not on PATH. bpp anchor only."
+    },
+    {
+      "name": "astc_6x6",
+      "codec": "astc",
+      "block": "6x6",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": null,
+      "codec_bpp": 3.5555555555555554,
+      "textures": 1,
+      "file_bpp_chain": 3.5555555555555554,
+      "bppc": 1.1851851851851851,
+      "latent_bpp_mip0": null,
+      "note": "astcenc is not on PATH. bpp anchor only."
+    },
+    {
+      "name": "astc_8x8",
+      "codec": "astc",
+      "block": "8x8",
+      "groups": [
+        "albedo"
+      ],
+      "psnr_u8": null,
+      "codec_bpp": 2.0,
+      "textures": 1,
+      "file_bpp_chain": 2.0,
+      "bppc": 0.6666666666666666,
+      "latent_bpp_mip0": null,
+      "note": "astcenc is not on PATH. bpp anchor only."
+    }
+  ],
+  "rtxntc_measured": [],
+  "bd_rate": [
+    {
+      "baseline": "paper_table3",
+      "axis": "bppc",
+      "bits_saved_percent": null,
+      "method": null,
+      "reason": "different material set",
+      "series": null
+    },
+    {
+      "baseline": "bc1_albedo",
+      "axis": "file_bpp_chain",
+      "bits_saved_percent": -112.69215963971052,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    },
+    {
+      "baseline": "bc1_albedo",
+      "axis": "bppc",
+      "bits_saved_percent": -78.97521883527125,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    },
+    {
+      "baseline": "bc7_albedo",
+      "axis": "file_bpp_chain",
+      "bits_saved_percent": -8.483025491353647,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    },
+    {
+      "baseline": "bc7_albedo",
+      "axis": "bppc",
+      "bits_saved_percent": 8.34441152699642,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    },
+    {
+      "baseline": "bc7_textures",
+      "axis": "file_bpp_chain",
+      "bits_saved_percent": -8.483025491353647,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    },
+    {
+      "baseline": "bc7_textures",
+      "axis": "bppc",
+      "bits_saved_percent": 8.34441152699642,
+      "method": "equal_psnr_interpolation",
+      "reason": null,
+      "series": "ours_lambda_0"
+    }
+  ]
+}

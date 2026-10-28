@@ -412,8 +412,11 @@ TextureSet parse(const uint8_t* data, size_t size) {
     ts.latent_stored_bytes = latent_bytes;
     ts.scale_stored_bytes = rd_u32(data + 72);
     const uint32_t plain_len = rd_u32(data + 84);
-    if ((ts.flags & kFlagLatentDeflate) && (ts.flags & kFlagLatentRange)) {
-        throw std::runtime_error("deflate and range flags are mutually exclusive");
+    const bool flag_deflate = (ts.flags & kFlagLatentDeflate) != 0;
+    const bool flag_range = (ts.flags & kFlagLatentRange) != 0;
+    const bool flag_ctx = (ts.flags & kFlagLatentCtx) != 0;
+    if ((flag_deflate && flag_range) || (flag_deflate && flag_ctx) || (flag_range && flag_ctx)) {
+        throw std::runtime_error("latent coder flags are mutually exclusive");
     }
     ts.latent_plain_bytes = (ts.flags & kFlagLatentCompressed) ? plain_len : latent_bytes;
     std::vector<uint8_t> inflated;
@@ -422,12 +425,15 @@ TextureSet parse(const uint8_t* data, size_t size) {
         if (plain_len == 0 || static_cast<size_t>(latent_off) + latent_bytes > size) {
             throw std::runtime_error("bad compressed latent span");
         }
-        if (ts.flags & kFlagLatentDeflate) {
+        if (flag_deflate) {
             inflated.assign(plain_len, 0);
             unsigned long dlen = plain_len;
             unsigned long slen = latent_bytes;
             const int rc = puff(inflated.data(), &dlen, data + latent_off, &slen);
             if (rc != 0 || dlen != plain_len) throw std::runtime_error("latent deflate");
+        } else if (flag_ctx) {
+            inflated = range_decode_ctx(data + latent_off, latent_bytes, plain_len);
+            if (inflated.size() != plain_len) throw std::runtime_error("latent context range");
         } else {
             inflated = range_decode(data + latent_off, latent_bytes, plain_len);
             if (inflated.size() != plain_len) throw std::runtime_error("latent range");
@@ -601,6 +607,16 @@ float bppc(const TextureSet& ts) {
     const int ch = std::max(1, ts.num_channels());
     return 8.f * static_cast<float>(payload_bytes(ts)) /
            static_cast<float>(mip_chain_texels(ts) * ch);
+}
+
+uint32_t network_bytes(const TextureSet& ts) {
+    uint32_t n = 0;
+    for (const auto& layer : ts.layers) {
+        n += layer.weight_bytes;
+        n += static_cast<uint32_t>(layer.out_features) * 2u;
+        n += static_cast<uint32_t>(layer.out_features) * layer.num_groups * 2u;
+    }
+    return n;
 }
 
 GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_mode,

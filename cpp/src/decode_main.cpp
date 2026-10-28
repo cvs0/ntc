@@ -35,7 +35,9 @@ int main(int argc, char** argv) {
                   << " total_bpp " << ntc::total_bpp(ts)
                   << " latent_bpp_mip0 " << ntc::latent_bpp_mip0(ts)
                   << " file_bpp_chain " << ntc::file_bpp_chain(ts)
-                  << " bppc " << ntc::bppc(ts) << "\n";
+                  << " bppc " << ntc::bppc(ts)
+                  << " header_bytes " << ntc::kHeaderBytes
+                  << " network_bytes " << ntc::network_bytes(ts) << "\n";
     } catch (const std::exception& ex) {
         std::cerr << ex.what() << "\n";
         return 1;

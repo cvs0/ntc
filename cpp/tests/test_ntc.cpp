@@ -44,6 +44,52 @@ static void test_range() {
     }
 }
 
+static void test_range_ctx() {
+    // Smooth ramp. The coded bytes are the Python range_encode_ctx stream.
+    uint8_t src[64];
+    for (int i = 0; i < 64; ++i) src[i] = static_cast<uint8_t>((i * 3) / 8);
+    const uint8_t py[] = {
+        0, 0, 98, 165, 12, 107, 37, 243, 31, 134, 244, 189, 88, 128, 78, 202,
+        22, 9, 233, 162, 9, 21, 130, 56, 143, 180, 20, 82, 152, 233, 64, 42,
+        131, 210, 62, 49, 193, 43, 251, 204, 251, 31, 112, 90, 162, 144, 68, 81,
+        62, 240, 253, 147, 205, 121, 172, 197, 33, 131, 163, 0,
+    };
+    auto enc = ntc::range_encode_ctx(src, sizeof(src));
+    expect(enc.size() == sizeof(py), "ctx length matches python");
+    if (enc.size() == sizeof(py)) {
+        for (size_t i = 0; i < sizeof(py); ++i) expect(enc[i] == py[i], "ctx byte matches python");
+    }
+    auto dec = ntc::range_decode_ctx(py, sizeof(py), sizeof(src));
+    expect(dec.size() == sizeof(src), "ctx decode length");
+    if (dec.size() == sizeof(src)) {
+        for (size_t i = 0; i < sizeof(src); ++i) expect(dec[i] == src[i], "ctx decode byte");
+    }
+}
+
+static void test_ctx_file(const std::string& dir) {
+    const auto bytes = read_bin(dir + "/ctx.ntc");
+    expect(!bytes.empty(), "ctx fixture present");
+    if (bytes.empty()) return;
+    ntc::TextureSet ts = ntc::parse(bytes.data(), bytes.size());
+    expect((ts.flags & ntc::kFlagLatentCtx) != 0, "ctx flag");
+    expect((ts.flags & ntc::kFlagLatentRange) == 0, "ctx not order-1");
+    expect((ts.flags & ntc::kFlagLatentDeflate) == 0, "ctx not deflate");
+    expect(ntc::network_bytes(ts) > 0, "network bytes");
+    auto img = ntc::decode_mip(ts, 0);
+    std::ifstream ref(dir + "/ctx_mip0.f32", std::ios::binary);
+    uint32_t hdr[4];
+    ref.read(reinterpret_cast<char*>(hdr), sizeof(hdr));
+    expect(hdr[0] == ts.width && hdr[1] == ts.height, "ctx ref size");
+    std::vector<float> want(img.size());
+    ref.read(reinterpret_cast<char*>(want.data()), static_cast<std::streamsize>(want.size() * 4));
+    float max_abs = 0.f;
+    for (size_t i = 0; i < img.size() && i < want.size(); ++i) {
+        max_abs = std::max(max_abs, std::fabs(img[i] - want[i]));
+    }
+    std::cout << "ctx file max abs " << max_abs << "\n";
+    expect(max_abs < 1e-4f, "ctx file matches python");
+}
+
 static void test_fixture(const std::string& dir) {
     const auto bytes = read_bin(dir + "/tiny.ntc");
     expect(!bytes.empty(), "fixture present");
@@ -85,6 +131,8 @@ int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "tests/fixtures";
     test_quant();
     test_range();
+    test_range_ctx();
+    test_ctx_file(dir);
     test_fixture(dir);
     if (g_fails) {
         std::cerr << g_fails << " failures\n";

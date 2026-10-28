@@ -29,7 +29,10 @@ constexpr uint32_t kFlagActInt8 = 1u << 4;
 constexpr uint32_t kFlagLatentDeflate = 1u << 2;
 // Order-1 nibble range coder. Same plain bytes as deflate. Offset 84 is the length.
 constexpr uint32_t kFlagLatentRange = 1u << 3;
-constexpr uint32_t kFlagLatentCompressed = kFlagLatentDeflate | kFlagLatentRange;
+// 256-context nibble range coder (previous nibble, left-byte high bits, position band).
+// Not written by latent_coder "best". Offset 84 is the plain length.
+constexpr uint32_t kFlagLatentCtx = 1u << 5;
+constexpr uint32_t kFlagLatentCompressed = kFlagLatentDeflate | kFlagLatentRange | kFlagLatentCtx;
 
 constexpr int kActIdentity = 0;
 constexpr int kActRelu = 1;
@@ -121,6 +124,8 @@ float file_bpp_chain(const TextureSet& ts);
 // Paper rate: payload bits / (mip-chain texels * channel count).
 float bppc(const TextureSet& ts);
 int mip_chain_texels(const TextureSet& ts);
+// Integer MLP weights plus fp16 bias and fp16 weight scales. Not the 96-byte header.
+uint32_t network_bytes(const TextureSet& ts);
 
 // GPU descriptor. 84 uvec4s, matching the layout in shaders/ntc_decode.glsl.
 // `blob` is the file bytes followed by packed derived-mip payloads.
