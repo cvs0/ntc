@@ -168,6 +168,56 @@ def cheaper_better(out: Path, job: dict, psnr: float) -> dict | None:
     return max(rows, key=lambda row: row["psnr"])
 
 
+def ladder_step_budget(count: int, full: int) -> list[int]:
+    """First label keeps ``full`` steps. Each later label gets half.
+
+    Five labels at 4000 steps were 20000 steps. The budget is 12000, which
+    is 40 percent less. The first point is trained from scratch. The rest
+    warm-start, which measured +1.6 dB and 1.95 bpp less at equal steps.
+    """
+    if count <= 0:
+        return []
+    half = max(1, int(full) // 2)
+    return [int(full)] + [half] * (count - 1)
+
+
+def _higher_rows(out: Path, job: dict) -> list[dict]:
+    parsed = _rate_family(str(job.get("name") or ""))
+    if parsed is None or not out.is_dir():
+        return []
+    stem, bpp = parsed
+    rows = []
+    for path in out.glob(f"{stem}_b*.json"):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not row.get("done") or not row.get("grids"):
+            continue
+        other = _rate_family(str(row.get("name") or path.stem))
+        if other is None or other[0] != stem or other[1] <= bpp + 1e-6:
+            continue
+        score = row.get("psnr_u8")
+        if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
+            continue
+        rows.append({
+            "name": str(row.get("name") or path.stem),
+            "psnr": float(score),
+            "bpp": other[1],
+            "checkpoint": row.get("checkpoint"),
+        })
+    return rows
+
+
+def best_higher_sibling(out: Path, job: dict) -> dict | None:
+    rows = _higher_rows(out, job)
+    if not rows:
+        return None
+    neighbor_bpp = min(row["bpp"] for row in rows)
+    neighbors = [row for row in rows if abs(row["bpp"] - neighbor_bpp) < 1e-6]
+    return max(neighbors, key=lambda row: row["psnr"])
+
+
 def apply_rate_neighbor(job: dict, out: Path) -> dict:
     """Point a latent job at its lower-rate neighbor before the first step.
 
@@ -183,6 +233,13 @@ def apply_rate_neighbor(job: dict, out: Path) -> dict:
         return job
     lower = best_lower_sibling(out, job)
     if lower is None or not lower.get("grids"):
+        higher = best_higher_sibling(out, job)
+        if higher is None:
+            return job
+        prior = out / f"{higher['name']}.pt"
+        if prior.is_file() and higher.get("checkpoint") == "trained" and not job.get("warm_start"):
+            job["warm_start"] = str(prior)
+            print(f"warm start {job['name']} downward from {higher['name']}", flush=True)
         return job
     from ntc.grids import grow_grids
 
@@ -842,11 +899,12 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
     jobs.append(base("wood_floor_2k_b16_s1000", root / "wood_floor_2k", 1000, 16, 0, grids=None, size=2048, batch_pixels=1024 * 1024, adaptive_pool=2, seed_pool=2, halve_steps=250))
     jobs.append(base("aerial_rocks_2k_b16_s1000", root / "aerial_rocks_01_2k", 1000, 16, 0, grids=None, size=2048, batch_pixels=1024 * 1024, adaptive_pool=2, seed_pool=2, halve_steps=250))
     for name in ("MetalPlates013_2K", "PavingStones070_2K", "Tiles135D_2K"):
-        for bpp in (2.5, 5, 10, 15, 20):
+        budgets = ladder_step_budget(5, 4000)
+        for steps, bpp in zip(budgets, (2.5, 5, 10, 15, 20), strict=True):
             jobs.append(base(
                 f"sdk_{name}_b{bpp}",
                 root / name,
-                4000,
+                steps,
                 bpp,
                 0,
                 size=2048,

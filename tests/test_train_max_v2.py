@@ -97,6 +97,9 @@ def test_job_cost_and_cost_balanced_shards():
     assert sdk["latent_rate_scale"] == 0.0
     assert sdk["entropy_rate"] is True
     assert sdk["quant_schedule"] is True
+    assert by_name["sdk_MetalPlates013_2K_b2.5"]["steps"] == 4000
+    assert by_name["sdk_MetalPlates013_2K_b5"]["steps"] == 2000
+    assert by_name["sdk_MetalPlates013_2K_b20"]["steps"] == 2000
     assert job_cost(sdk) == (256 * 1024) * 4000
     assert by_name["wood_floor_2k_b16_s1000"]["batch_pixels"] == 256 * 1024
     assert by_name["wood_floor_2k_b16_s1000"]["min_latent_bits"] == 0
@@ -289,6 +292,37 @@ def test_nan_stats_do_not_write_a_done_json(tmp_path: Path, monkeypatch):
         v2._run_claimed(job, out, "fp32", "t", dest, out / "tiny_nan.ntc", out / "tiny_nan.pt")
     assert not dest.is_file()
     assert not (out / "tiny_nan.ntc").is_file()
+
+
+def test_ladder_budget_cuts_warm_started_labels():
+    from bench.train_max_v2 import ladder_step_budget
+
+    budget = ladder_step_budget(5, 4000)
+    assert budget == [4000, 2000, 2000, 2000, 2000]
+    assert sum(budget) <= 0.7 * 5 * 4000
+
+
+def test_lowest_label_warm_starts_downward(tmp_path: Path):
+    (tmp_path / "sdk_Metal_b5.json").write_text(json.dumps({
+        "name": "sdk_Metal_b5",
+        "done": True,
+        "grids": [[8, 8, 4, 4]],
+        "psnr_u8": 30.0,
+        "checkpoint": "trained",
+    }))
+    (tmp_path / "sdk_Metal_b5.pt").write_bytes(b"pt")
+    job = apply_rate_neighbor(
+        {
+            "name": "sdk_Metal_b2.5",
+            "rate": "latent",
+            "bpp": 2.5,
+            "size": 16,
+            "grids": None,
+            "latent_rate_scale": 0.5,
+        },
+        tmp_path,
+    )
+    assert str(job["warm_start"]).endswith("sdk_Metal_b5.pt")
 
 
 def test_dense_pass_below_init_is_not_retried():
