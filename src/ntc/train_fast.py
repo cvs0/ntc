@@ -146,6 +146,15 @@ class StackedTrain(nn.Module):
                 for i in range(len(ref.linears))
             ]
         )
+        requires = [p.requires_grad for p in ref.linears.parameters()]
+        # linears are weight, bias, weight, bias, ...
+        flat = []
+        for weight, bias in zip(self.weights, self.biases, strict=True):
+            flat.append(weight)
+            flat.append(bias)
+        for param, flag in zip(flat, requires, strict=True):
+            param.requires_grad_(flag)
+        self.quantize = True
 
     def layer_bits_of(self, index: int) -> int:
         if self.layer_bits:
@@ -160,10 +169,14 @@ class StackedTrain(nn.Module):
             mid = float((1 << bits) - 1) / 2.0
             qmax = (1 << bits) - 1
             scale = fp16_round(torch.exp(self.log_scales[i]).clamp(1e-4, 5.0))
-            q = torch.round(lat).clamp(0, qmax)
-            q_ste = lat + (q - lat).detach()
-            deq = (q_ste - mid) * scale[:, :, None, None]
-            if mip <= 0:
+            if self.quantize:
+                q = torch.round(lat).clamp(0, qmax)
+                q_ste = lat + (q - lat).detach()
+                deq = (q_ste - mid) * scale[:, :, None, None]
+            else:
+                q = None
+                deq = (lat - mid) * scale[:, :, None, None]
+            if mip <= 0 or q is None:
                 sampled = bilinear_batched(deq, uv)
             else:
                 code = q.detach().to(torch.int64)
@@ -197,7 +210,10 @@ class StackedTrain(nn.Module):
         """fp32 master weights. ``amp_dtype`` autocasts the GEMM only."""
         last = len(self.weights) - 1
         for li, (weight, bias) in enumerate(zip(self.weights, self.biases, strict=True)):
-            ste = quantize_weight_batched(weight, self.layer_bits_of(li), self.group_size)
+            if self.quantize:
+                ste = quantize_weight_batched(weight, self.layer_bits_of(li), self.group_size)
+            else:
+                ste = weight
             bb = fp16_round(bias)
             if amp_dtype is None:
                 hidden = torch.bmm(hidden, ste.transpose(1, 2)) + bb[:, None, :]
@@ -324,8 +340,16 @@ def _build_nets(
             layer_bits=cfg.layer_bits,
             act_int8=cfg.act_int8,
         ).to(device)
-        if cfg.pca_init:
+        if cfg.pca_init or cfg.latent_init == "analytic":
             _pca_init(net, target)
+        if cfg.warm_start:
+            from ntc.train_steps import apply_warm_start
+
+            apply_warm_start(net, cfg.warm_start, cfg.freeze_decoder)
+        if cfg.latent_init == "analytic":
+            from ntc.train_steps import analytic_project
+
+            analytic_project(net, target)
         nets.append(net)
     return nets
 
@@ -371,17 +395,23 @@ def _clip_no_sync(params, max_norm: float) -> None:
         grad.mul_(coef)
 
 
-def _adam_on(stacked: StackedTrain, cfg: TrainConfig, capturable: bool) -> torch.optim.Adam:
-    latent = list(stacked.latents.parameters()) + list(stacked.log_scales.parameters())
-    mlp = list(stacked.weights.parameters()) + list(stacked.biases.parameters())
+def _adam_on(stacked: StackedTrain, cfg: TrainConfig, capturable: bool):
+    latent = [p for p in list(stacked.latents.parameters()) + list(stacked.log_scales.parameters()) if p.requires_grad]
+    mlp = [p for p in list(stacked.weights.parameters()) + list(stacked.biases.parameters()) if p.requires_grad]
+    groups = []
+    if latent:
+        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult, "name": "latent"})
+    if mlp:
+        groups.append({"params": mlp, "lr": cfg.lr, "name": "mlp"})
+    if not groups:
+        raise ValueError("no trainable parameters")
+    if cfg.optimizer == "lion":
+        from ntc.train_steps import Lion
+
+        # Lion's stable step size is smaller than Adam's. The caller sets lr.
+        return Lion(groups, lr=groups[0]["lr"])
     kwargs = {"capturable": capturable} if capturable else {}
-    return torch.optim.Adam(
-        [
-            {"params": latent, "lr": cfg.lr * cfg.latent_lr_mult},
-            {"params": mlp, "lr": cfg.lr},
-        ],
-        **kwargs,
-    )
+    return torch.optim.Adam(groups, **kwargs)
 
 
 def _copy_adam_slice(src: torch.optim.Optimizer, dst: torch.optim.Optimizer, index: torch.Tensor) -> None:
@@ -401,6 +431,14 @@ def _copy_adam_slice(src: torch.optim.Optimizer, dst: torch.optim.Optimizer, ind
 
 
 def _step_lr(cfg: TrainConfig, step: int) -> float:
+    if cfg.schedule == "onecycle":
+        peak = cfg.lr * max(float(cfg.onecycle_peak), 1.0)
+        t = step / max(cfg.steps - 1, 1)
+        if t < 0.3:
+            return peak * (t / 0.3) if t > 0 else peak * 0.05
+        u = (t - 0.3) / 0.7
+        cos = 0.5 * (1.0 + math.cos(math.pi * u))
+        return max(peak * cos, cfg.lr * 0.05)
     if cfg.warmup_steps <= 0 and cfg.schedule == "cosine":
         cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
         return max(cfg.lr * cos, cfg.lr * 0.05)
@@ -427,14 +465,27 @@ def _loss_from_mips(
     semantics: list[int],
     amp_dtype: torch.dtype | None,
     batch_pixels: int,
+    step: int = 0,
 ) -> torch.Tensor:
     total = None
-    for mip, slot in enumerate(mips):
+    chosen = list(enumerate(mips))
+    if cfg.coarse_to_fine and step < int(cfg.steps * 0.4) and len(chosen) > 1:
+        chosen = chosen[-1:]
+    for mip, slot in chosen:
         uv = slot["uv"]
         tgt = slot["tgt"]
         count = uv.shape[0]
         if batch_pixels and batch_pixels < count:
-            idx = torch.randint(0, count, (batch_pixels,), device=uv.device)
+            if cfg.importance and mip == 0:
+                from ntc.train_steps import importance_index
+
+                cache = getattr(stacked, "_importance", None)
+                if cache is None:
+                    cache = {}
+                    stacked._importance = cache
+                idx = importance_index(stacked, uv, tgt, batch_pixels, step, cache)
+            else:
+                idx = torch.randint(0, count, (batch_pixels,), device=uv.device)
             uv = uv.index_select(0, idx)
             tgt = tgt.index_select(1, idx)
         pred = stacked.predict(
@@ -485,10 +536,23 @@ def _run_loop(
 
     def one_step(step: int, replay: bool) -> torch.Tensor:
         lr = _step_lr(cfg, step) * lr_scale
-        opt.param_groups[0]["lr"] = lr * cfg.latent_lr_mult
-        opt.param_groups[1]["lr"] = lr
+        for group in opt.param_groups:
+            if group.get("name") == "latent":
+                group["lr"] = lr * cfg.latent_lr_mult
+            else:
+                group["lr"] = lr
+        if cfg.qat_late:
+            stacked.quantize = step >= int(cfg.steps * 0.7)
+        if cfg.coarse_to_fine:
+            from ntc.train_steps import coarse_lowpass
+
+            state = getattr(stacked, "_coarse", None)
+            if state is None:
+                state = {}
+                stacked._coarse = state
+            coarse_lowpass(stacked, step, cfg.steps, state)
         opt.zero_grad(set_to_none=not replay)
-        per = _loss_from_mips(stacked, mips, cfg, semantics, amp_dtype, batch)
+        per = _loss_from_mips(stacked, mips, cfg, semantics, amp_dtype, batch, step)
         loss = per.sum()
         if amp_dtype == torch.float16 and device_type == "cuda":
             # GradScaler is constructed by the caller and stashed on cfg via a
@@ -502,6 +566,10 @@ def _run_loop(
                 scaler.update()
                 return loss
         loss.backward()
+        if cfg.optimizer == "shampoo":
+            from ntc.train_steps import shampoo_precondition
+
+            shampoo_precondition(params)
         _clip_no_sync(params, 1.0)
         opt.step()
         return loss
@@ -524,12 +592,19 @@ def _run_loop(
             # The compiled function replaces the fp32 loss path only.
             def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
                 lr = _step_lr(cfg, step) * lr_scale
-                opt.param_groups[0]["lr"] = lr * cfg.latent_lr_mult
-                opt.param_groups[1]["lr"] = lr
+                for group in opt.param_groups:
+                    if group.get("name") == "latent":
+                        group["lr"] = lr * cfg.latent_lr_mult
+                    else:
+                        group["lr"] = lr
                 opt.zero_grad(set_to_none=True)
-                per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
+                per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
                 loss = per.sum()
                 loss.backward()
+                if cfg.optimizer == "shampoo":
+                    from ntc.train_steps import shampoo_precondition
+
+                    shampoo_precondition(params)
                 _clip_no_sync(params, 1.0)
                 opt.step()
                 return loss
@@ -787,6 +862,7 @@ def encode_arrays_fast(
         "compile_error": None,
         "cuda_graph": False,
         "cuda_graph_error": None,
+        "hit_target": False,
     }
     stopped_early = False
     best_val = -1e9
@@ -858,6 +934,36 @@ def encode_arrays_fast(
             with torch.no_grad():
                 for p, src in zip(stacked.parameters(), best_state, strict=True):
                     p.copy_(src)
+    elif done_steps < cfg.steps and (cfg.stop_psnr > 0 or cfg.plateau_stop):
+        hit_target = False
+        plateau_hits = 0
+        prev_score = -1e9
+        check = max(1, int(cfg.check_every or 4))
+        while done_steps < cfg.steps:
+            span = min(check, cfg.steps - done_steps)
+            info = _run_loop(
+                stacked, opt, mips, cfg, semantics, span, done_steps, amp_dtype, device.type,
+                use_graph=False,
+            )
+            loop_info = _merge_info(loop_info, info)
+            done_steps += span
+            was = stacked.quantize
+            stacked.quantize = True
+            score = max(_psnr_per_seed(stacked, images_bank, device))
+            stacked.quantize = was
+            best_val = max(best_val, score)
+            if cfg.stop_psnr > 0 and score >= cfg.stop_psnr:
+                hit_target = True
+                break
+            if cfg.plateau_stop and score < prev_score + 0.02:
+                plateau_hits += 1
+                if plateau_hits >= 3:
+                    stopped_early = True
+                    break
+            else:
+                plateau_hits = 0
+            prev_score = score
+        loop_info["hit_target"] = hit_target
     elif done_steps < cfg.steps:
         info = _run_loop(
             stacked,
@@ -932,6 +1038,16 @@ def encode_arrays_fast(
         "cuda_graph_error": loop_info["cuda_graph_error"],
         "steps_per_s": (done_steps / loop_info["seconds"]) if loop_info["seconds"] else None,
         "seconds_train": loop_info["seconds"],
+        "steps_ran": done_steps,
+        "hit_target": bool(loop_info.get("hit_target")),
+        "latent_init": cfg.latent_init,
+        "optimizer": cfg.optimizer,
+        "warm_start": cfg.warm_start,
+        "freeze_decoder": cfg.freeze_decoder,
+        "coarse_to_fine": cfg.coarse_to_fine,
+        "qat_late": cfg.qat_late,
+        "importance": cfg.importance,
+        "plateau_stop": cfg.plateau_stop,
         "host_syncs_per_step": 0,
         "lr_scale": scaled_lr(1.0, int(cfg.batch_pixels or 0), int(cfg.lr_batch_ref or 0))
         if cfg.lr_batch_ref and cfg.batch_pixels

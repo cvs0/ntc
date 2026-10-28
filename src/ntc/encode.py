@@ -117,6 +117,23 @@ class TrainConfig:
     cuda_graph: str = "auto"
     # Linear LR scale batch_pixels / lr_batch_ref when both are positive.
     lr_batch_ref: int = 0
+    # The fields below are read only by the fast path. encode_arrays ignores them.
+    warm_start: str = ""
+    freeze_decoder: bool = False
+    # "pca" is the historical initializer. "analytic" projects the image
+    # through the linearized MLP after that PCA.
+    latent_init: str = "pca"
+    coarse_to_fine: bool = False
+    optimizer: str = "adam"
+    qat_late: bool = False
+    importance: bool = False
+    # 0 disables the check. Above 0, the fast path stops once mip-0 8-bit
+    # PSNR reaches this value.
+    stop_psnr: float = 0.0
+    check_every: int = 0
+    plateau_stop: bool = False
+    # Used when schedule == "onecycle". Peak learning rate is lr * onecycle_peak.
+    onecycle_peak: float = 5.0
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

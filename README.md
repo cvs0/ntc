@@ -603,6 +603,22 @@ Use the same ROCm 7.2.1 / torch 2.9.1 environment as the c33648b run. The script
 
 `results/train_speed/cpu.json` is a 32x32, 8-step run on this CPU (torch 2.14.1+cpu). Eager and fast one-model PSNR both 17.709 dB. One-model wall 0.031 s versus 0.027 s (1.16x). Inner steps/s 471 versus 518. A pool of 4 seeds: 0.122 s versus 0.035 s (3.48x). `gpu_idle_fraction` is null. `launch_cpu_fraction` is 0 because the CPU profiler has no CUDA launch keys. The top self-CPU ops were `aten::_to_copy`, `aten::index`, and `Adam.step`.
 
+Step count is a separate measurement. `bench/train_speed.py --ablate` trains until an 8-bit PSNR target, or until `--ablate-steps`, and keeps an idea only when it reaches the target and its train time is under 90% of the fast-path baseline. On the 24x24 CPU probe (`results/train_speed/ablation_cpu.json`, target 24.43 dB) the baseline stopped at 16 steps, 0.029 s. Warm-start fine-tune, frozen decoder, analytic latent projection, coarse-to-fine, one-cycle, warmup cosine at 3x peak LR, latent LR x8, diagonal shampoo, late QAT, importance sampling, and plateau checks did not clear that bar. Lion reached the target in 4 steps on that image and missed a higher target on one of three repeat images, so it stays behind `optimizer=lion` and is not the v2 default. Successive halving of a 4-seed pool reached the target in 12 steps and 0.026 s, against 24 steps and 0.054 s with halving off. Halving was already the fast-path behavior for `seed_pool > 1`. `train_max_v2` still uses it.
+
+The shared MLP prior is `src/ntc/priors/decoder_small.pt` (3 channels, 4 latent channels, hidden 16) and `src/ntc/priors/decoder_g16.pt` (9 channels, 6 latent channels, hidden 32). Both were trained by `bench/pretrain_decoder.py` at seed 0 on eight procedural images, because this tree has no CC0 checkout. Pass `--materials data/materials` on a machine that has the manifests and the script uses those folders instead.
+
+Two machines share one queue directory. `bench/train_queue.py enqueue --demo` writes `pending/demo-synthetic.json`. `work --worker amd-desktop` and `work --worker nvidia-laptop` claim by atomic rename into `running/<worker>/`. `merge` writes `merged.json` from `done/`. A job left in `running/` longer than `--steal-after-s` goes back to `pending`. The queue does not read or write `results/train_max`.
+
+```powershell
+python bench/pretrain_decoder.py --preset small --out src/ntc/priors/decoder_small.pt
+python bench/pretrain_decoder.py --preset g16 --out src/ntc/priors/decoder_g16.pt
+python bench/train_speed.py --ablate --ablate-steps 24 --prior src/ntc/priors/decoder_small.pt --out results/train_speed/ablation_rx9070.json
+python bench/train_queue.py enqueue --out \\share\train_queue --demo
+python bench/train_queue.py work --worker amd-desktop --out \\share\train_queue
+python bench/train_queue.py work --worker nvidia-laptop --out \\share\train_queue
+python bench/train_queue.py merge --out \\share\train_queue
+```
+
 ## Limitations
 
 The 40-step deflated network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The 4000-step footprint points on the RX 9070 are 38.81 dB at 11.49 bpp (metal) and 33.92 dB at 11.99 bpp (paving), against ASTC 6x6 at 38.28 dB and 33.73 dB, both at 17.78 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight. The 4K sample pass is documented above. It is not the RTX 4090 fragment timing from Vaidyanathan et al. 2023.

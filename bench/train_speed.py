@@ -76,6 +76,130 @@ def _timed(fn) -> tuple[dict, float]:
     return stats, time.perf_counter() - t0
 
 
+def _ablation_image() -> tuple[np.ndarray, list[int]]:
+    """24x24 image that is not one of the eight prior images."""
+    torch = __import__("torch")
+    torch.manual_seed(7)
+    ys = torch.linspace(0, 1, 24)
+    xs = torch.linspace(0, 1, 24)
+    gy, gx = torch.meshgrid(ys, xs, indexing="ij")
+    image = torch.stack(
+        [
+            (gx * 0.8 + 0.2 * torch.sin(gy * 9)).clamp(0, 1),
+            (gy * 0.7 + 0.15 * torch.cos(gx * 8)).clamp(0, 1),
+            ((gx - gy).abs()).clamp(0, 1),
+        ],
+        0,
+    )
+    return image.numpy().astype(np.float32), [0, 1, 2]
+
+
+def run_ablation(max_steps: int, check_every: int, prior: Path) -> dict:
+    """Time to a fixed PSNR for each step-reduction idea.
+
+    The baseline is the fast path with the historical PCA init, Adam, cosine,
+    and QAT on every step. An idea is kept when it reaches the target and its
+    train wall is at most 90% of the baseline train wall. Ties and misses stay off.
+    """
+    from dataclasses import replace
+
+    images, sems = _ablation_image()
+    common = dict(
+        steps=max_steps,
+        hidden=(16,),
+        grids=[(12, 12, 4, 4)],
+        adaptive_pool=1,
+        seed_pool=1,
+        with_ssim=False,
+        log_every=10**9,
+        mip_levels=2,
+        seed=0,
+        compile_step="off",
+        cuda_graph="off",
+        fast=True,
+        check_every=check_every,
+        lr=5e-3,
+    )
+
+    def once(extra: dict) -> dict:
+        cfg = replace(TrainConfig(**common), **extra)
+        stats, wall = _timed(lambda: encode_arrays_fast(images, sems, cfg))
+        return {
+            "wall_s": wall,
+            "seconds_train": stats.get("seconds_train"),
+            "steps_ran": stats.get("steps_ran"),
+            "psnr_u8": stats["metrics"]["psnr_u8"],
+            "train_psnr_u8": stats.get("psnr_u8_trained"),
+            "hit_target": stats.get("hit_target"),
+            "checkpoint": stats.get("checkpoint"),
+        }
+
+    probe = once({"stop_psnr": 0.0})
+    # Aim just under the full-budget export PSNR so the baseline still has to train.
+    target = float(probe["psnr_u8"]) - 0.3
+    if target < 10:
+        target = float(probe["psnr_u8"])
+    base = once({"stop_psnr": target})
+    ideas = {
+        "warm_finetune": {"stop_psnr": target, "warm_start": str(prior), "freeze_decoder": False},
+        "warm_freeze": {"stop_psnr": target, "warm_start": str(prior), "freeze_decoder": True},
+        "analytic": {"stop_psnr": target, "latent_init": "analytic"},
+        "coarse_to_fine": {"stop_psnr": target, "coarse_to_fine": True},
+        "onecycle": {"stop_psnr": target, "schedule": "onecycle", "onecycle_peak": 5.0},
+        "warmup_cosine_3x": {"stop_psnr": target, "schedule": "cosine", "warmup_steps": 4, "lr": 1.5e-2},
+        "latent_lr_8": {"stop_psnr": target, "latent_lr_mult": 8.0},
+        "lion": {"stop_psnr": target, "optimizer": "lion", "lr": 1e-4},
+        "shampoo": {"stop_psnr": target, "optimizer": "shampoo"},
+        "qat_late": {"stop_psnr": target, "qat_late": True},
+        "importance": {"stop_psnr": target, "importance": True, "batch_pixels": 128},
+        "uniform_batch_128": {"stop_psnr": target, "batch_pixels": 128},
+        "plateau": {"stop_psnr": target, "plateau_stop": True},
+        "pool4_no_halve": {"stop_psnr": target, "seed_pool": 4, "halve_steps": 0},
+        "halving_pool4": {"stop_psnr": target, "seed_pool": 4, "halve_steps": 4},
+    }
+    rows = {"baseline_fixed_budget": probe, "baseline_stop_at_target": base}
+    winners = []
+    base_train = base.get("seconds_train") or base["wall_s"]
+    for name, extra in ideas.items():
+        row = once(extra)
+        reached = bool(row["hit_target"]) or (
+            row["psnr_u8"] is not None and row["psnr_u8"] + 1e-3 >= target
+        )
+        train_s = row.get("seconds_train") or row["wall_s"]
+        faster = base_train > 0 and train_s < 0.9 * base_train
+        # Halving is compared to the unhalved pool, not to the single model.
+        if name == "halving_pool4":
+            other = rows.get("pool4_no_halve")
+            if other is None:
+                faster = False
+            else:
+                other_s = other.get("seconds_train") or other["wall_s"]
+                faster = other_s > 0 and train_s < 0.9 * other_s
+        row["reached"] = reached
+        row["faster_than_baseline"] = bool(reached and faster)
+        rows[name] = row
+        if row["faster_than_baseline"]:
+            winners.append(name)
+        print(
+            f"{name} steps {row['steps_ran']} train {train_s:.3f}s psnr {row['psnr_u8']:.3f} "
+            f"hit {row['hit_target']} keep {row['faster_than_baseline']}",
+            flush=True,
+        )
+    return {
+        "measured_on_this_process": True,
+        "device": "cpu",
+        "image": "24x24 procedural, not in the prior set",
+        "architecture": {"hidden": [16], "grids": [[12, 12, 4, 4]], "channels": 3},
+        "max_steps": max_steps,
+        "check_every": check_every,
+        "target_psnr_u8": target,
+        "keep_rule": "reached the target and train seconds under 90% of the baseline",
+        "winners": winners,
+        "rows": rows,
+        "prior": str(prior),
+    }
+
+
 def main() -> None:
     p = argparse.ArgumentParser(description="Eager vs fast training throughput")
     p.add_argument("--material", type=Path, default=None)
@@ -86,8 +210,20 @@ def main() -> None:
     p.add_argument("--profile-steps", type=int, default=4)
     p.add_argument("--probe-steps", type=int, default=0)
     p.add_argument("--g16", action="store_true", help="use the train_max 256 g16 grids and hidden 32")
+    p.add_argument("--ablate", action="store_true")
+    p.add_argument("--ablate-steps", type=int, default=24)
+    p.add_argument("--prior", type=Path, default=Path("src/ntc/priors/decoder_small.pt"))
     p.add_argument("--out", type=Path, default=Path("results/train_speed/cpu.json"))
     args = p.parse_args()
+    if args.ablate:
+        if not args.prior.is_file():
+            raise SystemExit(f"missing prior {args.prior}. Run bench/pretrain_decoder.py --preset small first.")
+        report = run_ablation(args.ablate_steps, 4, args.prior)
+        args.out.parent.mkdir(parents=True, exist_ok=True)
+        args.out.write_text(json.dumps(report, indent=2))
+        print("winners", report["winners"])
+        print("wrote", args.out)
+        return
     images, sems = _image(args.size, args.material)
     profile_cfg = _cfg(args, steps=args.profile_steps, seed_pool=1)
     profile = profile_historical_step(images, sems, profile_cfg, args.profile_steps)
