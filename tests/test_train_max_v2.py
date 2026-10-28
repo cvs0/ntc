@@ -12,6 +12,7 @@ from bench.train_max_v2 import (
     _job_blocked,
     apply_rate_neighbor,
     assign_shards,
+    below_init,
     build_jobs,
     cheaper_better,
     claim_job,
@@ -299,12 +300,17 @@ def test_dense_pass_below_init_is_not_retried():
     reason = collapse_reason(11.70, 13.57, 1_048_576, pixels)
     assert "fell below" in reason
     assert "not retrying" in reason
-    # b5's first pass was still on the 256K area batch and within 4 dB.
-    assert dense_retry_batch(11.91, 10.58, 262_144, pixels, False) == pixels // 4
-    assert dense_retry_batch(11.91, 10.58, 262_144, pixels, True) is None
+    # A sparse pass that lost to its init still gets one denser batch.
+    assert dense_retry_batch(11.70, 13.57, 262_144, pixels, False) == pixels // 4
+    assert dense_retry_batch(11.70, 13.57, 262_144, pixels, True) is None
+    # PavingStones b2.5 gained 2.40 dB on the area batch and 2.71 dB after
+    # the flat retry. That is above the init, so it is not retried and not
+    # collapsed. The 4 dB band was rejecting a finished low-rate fit.
+    assert dense_retry_batch(27.13, 24.73, 262_144, pixels, False) is None
+    assert dense_retry_batch(27.44, 24.73, 1_048_576, pixels, True) is None
+    assert below_init(27.44, 24.73) is False
+    assert below_init(11.70, 13.57) is True
     assert dense_retry_batch(33.07, 12.0, 1_048_576, pixels, False) is None
-    stayed = collapse_reason(12.0, 10.0, 1_048_576, pixels)
-    assert "stayed within" in stayed
 
 
 def test_grow_grids_adds_channels_without_moving_the_lattice():

@@ -24,6 +24,7 @@ from ntc.train_fast import (
     _adam_on,
     _assign_lr,
     _better_psnr,
+    _cover_mip_recompiles,
     _mesh_uv,
     _psnr_from_mse,
     _reported_best_val,
@@ -503,6 +504,21 @@ def test_nonfinite_checkpoint_is_not_resumed(tmp_path: Path):
     assert np.isfinite(stats["psnr_u8_init"])
     assert np.isfinite(stats["psnr_u8_trained"])
     assert np.isfinite(stats["metrics"]["psnr_u8"])
+
+
+def test_recompile_limit_covers_every_mip_sample_count():
+    import torch._dynamo.config as dyn
+
+    previous = dyn.recompile_limit
+    try:
+        dyn.recompile_limit = 8
+        assert _cover_mip_recompiles(12) >= 16
+        assert dyn.recompile_limit >= 16
+        # A higher limit already set for another run is left alone.
+        dyn.recompile_limit = 32
+        assert _cover_mip_recompiles(12) == 32
+    finally:
+        dyn.recompile_limit = previous
 
 
 def test_code_scale_uses_a_percentile_not_one_spike():

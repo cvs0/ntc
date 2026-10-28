@@ -32,7 +32,7 @@ from bench.train_max import G16
 from ntc.device import device_report, pick_device
 from ntc.encode import TrainConfig
 from ntc.materials import load_material
-from ntc.train_fast import NEAR_INIT_DB, choose_precision, encode_arrays_fast
+from ntc.train_fast import choose_precision, encode_arrays_fast
 
 
 def parse_shard(text: str) -> tuple[int, int]:
@@ -69,7 +69,10 @@ def dense_retry_batch(
         return None
     if not math.isfinite(float(trained)) or not math.isfinite(float(init)):
         return None
-    if float(trained) >= float(init) + NEAR_INIT_DB:
+    # Any gain over the init is a finished low-rate point. The 4 dB band
+    # retried PavingStones b2.5 (27.13 vs 24.73 on the area batch) onto a
+    # flat quarter frame, which added 0.31 dB and was then marked collapsed.
+    if float(trained) >= float(init):
         return None
     if fallback or pixels <= 0:
         return None
@@ -78,15 +81,28 @@ def dense_retry_batch(
     return int(pixels) // 4
 
 
+def below_init(trained: object, init: object) -> bool:
+    """True when training lost to the PCA file.
+
+    A gain under 4 dB is still a fit. PavingStones b2.5 finished at 27.44
+    against an init of 24.73 and had already plateaued. That file is kept.
+    """
+    if not isinstance(trained, (int, float)) or not isinstance(init, (int, float)):
+        return False
+    if not math.isfinite(float(trained)) or not math.isfinite(float(init)):
+        return False
+    return float(trained) < float(init)
+
+
 def collapse_reason(trained: float, init: float, effective: int, pixels: int) -> str:
-    """Why a near-init json is left ``done`` false."""
-    if float(trained) < float(init) and int(effective) >= max(int(pixels) // 4, 1):
+    """Why a below-init json is left ``done`` false."""
+    if int(effective) >= max(int(pixels) // 4, 1):
         return (
             f"trained PSNR {float(trained):.2f} fell below init {float(init):.2f} "
             f"on dense batch {int(effective)}; not retrying the same run"
         )
     return (
-        f"trained PSNR {float(trained):.2f} stayed within {NEAR_INIT_DB:.0f} dB of init {float(init):.2f}"
+        f"trained PSNR {float(trained):.2f} fell below init {float(init):.2f}"
     )
 
 
@@ -694,11 +710,7 @@ def _run_claimed(
         fallback["batch_mip"] = "flat"
         fallback["_fallback"] = True
         return _run_claimed(fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
-    near_init = (
-        isinstance(trained, (int, float))
-        and isinstance(init, (int, float))
-        and float(trained) < float(init) + NEAR_INIT_DB
-    )
+    near_init = below_init(trained, init)
     if near_init:
         row["done"] = False
         row["collapsed"] = True

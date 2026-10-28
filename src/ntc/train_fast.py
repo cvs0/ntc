@@ -48,7 +48,10 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
     return float(lr) * (float(batch_pixels) / float(ref_pixels))
 
 
-# A run that finishes within this many dB of its init did not train the latent.
+# Early-stop patience does not increment while the live score is still
+# within this many dB of the init. The queue does not use it to reject a
+# finished file: PavingStones b2.5 gained 2.7 dB, plateaued, and was a real
+# low-rate fit. A result is rejected only when trained PSNR is below init.
 NEAR_INIT_DB = 4.0
 
 # A mean loss over a 2048 frame puts per-texel code gradients near 1e-10
@@ -148,6 +151,25 @@ def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat"
     if budget >= count:
         return 0
     return budget
+
+
+def _cover_mip_recompiles(mip_levels: int) -> int:
+    """Allow one static compile per mip sample count.
+
+    ``predict`` guards on ``uv.shape[0]``. An area batch of 262144 across
+    12 mips is 262144, 65536, 16384, 4096, 1024, 256, 64, 16, 4, and then
+    1. The default limit of 8 stops on the 16-versus-4 guard and runs the
+    coarser mips eager. The limit stays a static specialization, not a
+    dynamic shape, so the reduce-overhead CUDA graph is unchanged. The
+    large mips are the first specializations either way: a flat quarter
+    frame is four times the area batch, and 31 steps/s divided by four is
+    the 7.1 steps/s the dense retry measured.
+    """
+    needed = max(16, int(mip_levels) + 4)
+    current = int(getattr(torch._dynamo.config, "recompile_limit", 8))
+    if current < needed:
+        torch._dynamo.config.recompile_limit = needed
+    return int(torch._dynamo.config.recompile_limit)
 
 
 def _state_matches_grids(state: dict, grids: list) -> bool:
@@ -967,6 +989,7 @@ def _run_loop(
             attempts.append("default")
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
+        _cover_mip_recompiles(int(cfg.mip_levels))
         for compile_mode in attempts:
             try:
                 compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
