@@ -26,6 +26,7 @@ import os
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import traceback
@@ -416,6 +417,23 @@ CLOUD_BATCH = 2 * 1024 * 1024
 # The seed pool is three wide for 500 steps and one wide after two halvings.
 CLOUD_STEPS_PER_S = 20.0
 CLOUD_SEED_FACTOR = 1.25
+# Short cloud run: four train materials, five labels. 5 sits between 2.5
+# and 10 so the curve has a point near BC1 and BC7 without the full ladder.
+CLOUD_FAST_TRAIN = ("MetalPlates013", "PavingStones070", "Tiles135D", "Bark001")
+CLOUD_FAST_BPP = (1.0, 2.5, 5.0, 10.0, 20.0)
+# Every profile that trains the cloud 2K latent ladder.
+CLOUD_PROFILES = ("cloud5090", "cloudfast")
+# A card at or above this size runs several dense 2K processes at once.
+# One dense 2K process at a 2,097,152 batch held about 6 GB.
+DENSE_WORKERS_MIN_VRAM_GB = 80.0
+
+
+def is_cloud_profile(profile: str | None) -> bool:
+    return str(profile or "") in CLOUD_PROFILES
+
+
+def cloud_profile_bpp(profile: str | None) -> tuple[float, ...]:
+    return CLOUD_FAST_BPP if str(profile or "") == "cloudfast" else CLOUD_BPP
 
 
 _CLOUD_FIT: dict[tuple, dict[float, tuple]] = {}
@@ -426,6 +444,7 @@ def cloud_latent_setups(
     semantics: list[int],
     size: int,
     min_bits: int = 4,
+    labels: tuple[float, ...] | None = None,
 ) -> dict[float, tuple]:
     """Fit every cloud label for one image. Later jobs read this table.
 
@@ -434,13 +453,20 @@ def cloud_latent_setups(
     """
     from ntc.train_fast import _image_rate_key, fit_latent_grids
 
-    key = (_image_rate_key(images), int(size), int(min_bits), int(images.shape[0]))
+    labels = CLOUD_BPP if labels is None else tuple(labels)
+    key = (
+        _image_rate_key(images),
+        int(size),
+        int(min_bits),
+        int(images.shape[0]),
+        tuple(round(float(b), 4) for b in labels),
+    )
     found = _CLOUD_FIT.get(key)
     if found is not None:
         return found
     table: dict[float, tuple] = {}
     started = time.perf_counter()
-    for bpp in CLOUD_BPP:
+    for bpp in labels:
         grids, ratio = fit_latent_grids(
             images,
             semantics,
@@ -454,7 +480,7 @@ def cloud_latent_setups(
         table[round(float(bpp), 4)] = (grids, float(ratio))
     _CLOUD_FIT[key] = table
     print(
-        f"latent setups {len(CLOUD_BPP)} labels {time.perf_counter() - started:.2f}s",
+        f"latent setups {len(labels)} labels {time.perf_counter() - started:.2f}s",
         flush=True,
     )
     return table
@@ -689,6 +715,13 @@ def release_job(out: Path, name: str) -> None:
 
 
 GPU_DENSE_LOCK = "gpu_dense"
+# Chain workers on a large card set this to 0 so dense 2K jobs train side
+# by side. The per-job lock files still stop a job from running twice.
+_DENSE_LOCK_ENV = "NTC_DENSE_LOCK"
+
+
+def dense_lock_enabled() -> bool:
+    return os.environ.get(_DENSE_LOCK_ENV, "1") != "0"
 
 
 def _select_job_grids(job: dict) -> list:
@@ -756,9 +789,16 @@ def _unfinished_jobs(jobs: list[dict], out: Path) -> list[dict]:
     return pending
 
 
-def planned_workers(requested: int, jobs: list[dict], out: Path) -> int:
-    """Use one process when every remaining job is a dense 2K run."""
+def planned_workers(requested: int, jobs: list[dict], out: Path, dense_ok: bool = False) -> int:
+    """Use one process when every remaining job is a dense 2K run.
+
+    ``dense_ok`` is set when the card has room for several dense processes
+    (``--dense-workers`` or a card with at least 80 GB). Then ``requested``
+    is kept.
+    """
     if requested <= 1:
+        return requested
+    if dense_ok:
         return requested
     pending = _unfinished_jobs(jobs, out)
     if pending and all(is_dense_2k(job) for job in pending):
@@ -821,8 +861,10 @@ def _run_claimed(
         and float(job.get("latent_rate_scale") or 0) <= 0
     ):
         bits = int(job.get("min_latent_bits") or 0)
-        if str(job.get("profile") or "") == "cloud5090":
-            table = cloud_latent_setups(images, sems, int(job["size"]), bits)
+        if is_cloud_profile(job.get("profile")):
+            table = cloud_latent_setups(
+                images, sems, int(job["size"]), bits, cloud_profile_bpp(job.get("profile"))
+            )
             grids, ratio = table[round(float(job["bpp"]), 4)]
         else:
             from ntc.train_fast import fit_latent_grids
@@ -841,7 +883,7 @@ def _run_claimed(
         job["latent_rate_scale"] = ratio
         job["grids"] = [list(g) for g in grids]
         print(f"latent rate scale {job['name']} {ratio:.3f} grids {grids}", flush=True)
-    if not job.get("_gpu_held") and is_dense_2k(job):
+    if not job.get("_gpu_held") and dense_lock_enabled() and is_dense_2k(job):
         _wait_dense_gpu(out, stale_s)
         held = dict(job)
         held["_gpu_held"] = True
@@ -1041,19 +1083,30 @@ def _run_claimed(
     return row
 
 
-def build_cloud_jobs(root: Path) -> list[dict]:
+def build_cloud_jobs(root: Path, profile: str = "cloud5090") -> list[dict]:
     """2K latent ladder for 32 GB Blackwell. Does not include the 256 sweep.
 
     Held-out names are not jobs. Laptop ``build_jobs`` is a different list.
+    ``cloudfast`` is the same ladder on ``CLOUD_FAST_TRAIN`` and
+    ``CLOUD_FAST_BPP``.
     """
+    if profile == "cloudfast":
+        train, labels = CLOUD_FAST_TRAIN, CLOUD_FAST_BPP
+    elif profile == "cloud5090":
+        train, labels = CLOUD_TRAIN, CLOUD_BPP
+    else:
+        raise SystemExit(f"unknown cloud profile {profile}")
+    missing = [name for name in train if name not in CLOUD_TRAIN]
+    if missing:
+        raise RuntimeError(f"not a cloud train material: {missing}")
     held = {f"{name}_2K" for name in CLOUD_HOLDOUT}
-    budgets = ladder_step_budget(len(CLOUD_BPP), CLOUD_FULL_STEPS)
+    budgets = ladder_step_budget(len(labels), CLOUD_FULL_STEPS)
     jobs = []
-    for name in CLOUD_TRAIN:
+    for name in train:
         folder = f"{name}_2K"
         if folder in held:
             raise RuntimeError(f"train name is held out: {name}")
-        for steps, bpp in zip(budgets, CLOUD_BPP, strict=True):
+        for steps, bpp in zip(budgets, labels, strict=True):
             label = int(bpp) if float(bpp).is_integer() else bpp
             jobs.append({
                 "name": f"cloud_{folder}_b{label}",
@@ -1080,7 +1133,7 @@ def build_cloud_jobs(root: Path) -> list[dict]:
                 "entropy_rate": True,
                 "quant_schedule": True,
                 "quant_freeze_at": 0.90,
-                "profile": "cloud5090",
+                "profile": profile,
             })
     return jobs
 
@@ -1090,8 +1143,8 @@ def build_jobs(root: Path, batch_pixels: int | None, profile: str = "laptop") ->
 
     ``batch_pixels`` overrides 256 jobs only. It does not change the cloud list.
     """
-    if profile == "cloud5090":
-        return build_cloud_jobs(root)
+    if is_cloud_profile(profile):
+        return build_cloud_jobs(root, profile)
     if profile != "laptop":
         raise SystemExit(f"unknown profile {profile}")
     metal = root / "metal_plate"
@@ -1272,11 +1325,95 @@ def _ensure_precision(args: argparse.Namespace) -> str:
         release_job(args.out, "precision")
 
 
+def worker_env(index: int, base: dict | None = None, root: str | None = None) -> dict:
+    """Environment for chain worker ``index``: private compile caches.
+
+    Workers that share one Inductor cache and its compile pool deadlock, so
+    each gets its own directory and compiles in its own process.
+    """
+    env = dict(os.environ if base is None else base)
+    top = root or env.get("NTC_ROOT") or os.path.join(tempfile.gettempdir(), "ntc")
+    cache = os.path.join(top, ".cache", f"worker_{int(index)}")
+    env["TORCHINDUCTOR_CACHE_DIR"] = os.path.join(cache, "inductor")
+    env["TRITON_CACHE_DIR"] = os.path.join(cache, "triton")
+    env["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
+    env["NTC_SHARD"] = f"worker_{int(index)}"
+    env[_DENSE_LOCK_ENV] = "0"
+    return env
+
+
+def material_chains(jobs: list[dict]) -> list[list[dict]]:
+    """One chain per material, rates ascending so each label warm-starts.
+
+    Chains keep the order of first appearance in ``jobs``.
+    """
+    chains: dict[str, list[dict]] = {}
+    for job in jobs:
+        chains.setdefault(str(job["material"]), []).append(job)
+    return [sorted(chain, key=lambda job: float(job.get("bpp") or 0)) for chain in chains.values()]
+
+
+def assign_chains(jobs: list[dict], workers: int) -> list[list[list[dict]]]:
+    """Static plan: chain ``i`` goes to worker ``i % workers``.
+
+    The live queue claims chains through lock files instead, so a worker
+    that finishes early takes the next one. This is the dry-run view.
+    """
+    if workers < 1:
+        raise SystemExit("workers must be >= 1")
+    plan: list[list[list[dict]]] = [[] for _ in range(workers)]
+    for index, chain in enumerate(material_chains(jobs)):
+        plan[index % workers].append(chain)
+    return plan
+
+
+def _chain_lock(chain: list[dict]) -> str:
+    return "chain_" + Path(str(chain[0]["material"])).name
+
+
+def _chain_loop(jobs: list[dict], out: Path, precision: str, stale_s: float, label: str) -> None:
+    """Claim one whole material chain at a time and train it in rate order."""
+    for chain in material_chains(jobs):
+        lock = _chain_lock(chain)
+        if not claim_job(out, lock, stale_s):
+            continue
+        try:
+            print("chain", lock, " ".join(job["name"] for job in chain), flush=True)
+            for job in chain:
+                try:
+                    _run(job, out, precision, label, stale_s)
+                except Exception as exc:
+                    traceback.print_exc()
+                    dest = out / f"{job['name']}.json"
+                    dest.write_text(json.dumps({"name": job["name"], "done": False, "error": str(exc)}, indent=2))
+                    print("fail", job["name"], exc, flush=True)
+        finally:
+            release_job(out, lock)
+
+
+def _gpu_total_gb() -> float:
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _spawn_workers(args: argparse.Namespace) -> int:
-    """N processes share the lock pool. They do not get a fixed ``--shard``."""
+    """N processes share the lock pool. They do not get a fixed ``--shard``.
+
+    With ``args.chains`` each process claims whole material chains, gets its
+    own compile caches, skips the dense GPU lock, and starts
+    ``args.stagger_s`` after the previous one.
+    """
     script = str(Path(__file__).resolve())
+    chains = bool(getattr(args, "chains", False))
+    stagger = float(getattr(args, "stagger_s", 0.0) or 0.0)
     procs = []
-    for _i in range(args.workers):
+    for i in range(args.workers):
         cmd = [
             sys.executable,
             script,
@@ -1284,7 +1421,7 @@ def _spawn_workers(args: argparse.Namespace) -> int:
             "--materials", str(args.materials),
             "--probe-steps", str(args.probe_steps),
             "--stale-lock-s", str(args.stale_lock_s),
-            "--queue",
+            "--chain-queue" if chains else "--queue",
             "--profile", args.profile,
         ]
         if args.batch_pixels is not None:
@@ -1293,7 +1430,15 @@ def _spawn_workers(args: argparse.Namespace) -> int:
             cmd.append("--no-pack")
         if args.dry_run:
             cmd.append("--dry-run")
-        procs.append(subprocess.Popen(cmd))
+        if chains:
+            if i and stagger > 0:
+                time.sleep(stagger)
+            env = worker_env(i)
+            os.makedirs(env["TORCHINDUCTOR_CACHE_DIR"], exist_ok=True)
+            os.makedirs(env["TRITON_CACHE_DIR"], exist_ok=True)
+            procs.append(subprocess.Popen(cmd, env=env))
+        else:
+            procs.append(subprocess.Popen(cmd))
     rc = 0
     for proc in procs:
         code = proc.wait()
@@ -1592,7 +1737,7 @@ def _run_packed(jobs: list[dict], out: Path, precision: str, shard_label: str, s
 def main() -> None:
     install_fault_hooks()
     p = argparse.ArgumentParser()
-    p.add_argument("--profile", choices=("laptop", "cloud5090"), default="laptop")
+    p.add_argument("--profile", choices=("laptop", *CLOUD_PROFILES), default="laptop")
     p.add_argument("--out", type=Path, default=Path("results/train_max_v2"))
     p.add_argument("--materials", type=Path, default=Path("data/materials"))
     p.add_argument("--probe-steps", type=int, default=400)
@@ -1600,13 +1745,32 @@ def main() -> None:
     p.add_argument("--shard", default="", help="I/N. Split by pixels*steps, longest job first. Does not steal.")
     p.add_argument("--workers", type=int, default=0, help="Spawn N processes on one shared lock queue and wait. Dense 2K jobs stay at 1 process.")
     p.add_argument("--queue", action="store_true", help="Claim the next undone job from the lock pool until none remain.")
+    p.add_argument(
+        "--dense-workers",
+        type=int,
+        default=0,
+        help="Spawn N processes that each train whole material chains side by side on one large GPU. "
+        "No shared dense lock. Same as --workers N on a card with >= 80 GB.",
+    )
+    p.add_argument("--chain-queue", action="store_true", help="Internal: claim whole material chains until none remain.")
+    p.add_argument("--stagger-s", type=float, default=20.0, help="Seconds between dense worker starts.")
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
     p.add_argument("--stale-lock-s", type=float, default=86400.0)
     args = p.parse_args()
-    if args.profile == "cloud5090" and int(args.probe_steps) == 400:
+    if is_cloud_profile(args.profile) and int(args.probe_steps) == 400:
         args.probe_steps = 800
     args.out.mkdir(parents=True, exist_ok=True)
+    args.chains = False
+    if args.dense_workers:
+        if args.workers:
+            raise SystemExit("pass --workers or --dense-workers, not both")
+        if args.dense_workers < 1:
+            raise SystemExit("--dense-workers must be >= 1")
+        args.workers = int(args.dense_workers)
+        args.chains = True
+    if args.chain_queue and (args.queue or args.shard or args.workers):
+        raise SystemExit("--chain-queue runs alone")
     if args.workers and args.shard:
         raise SystemExit("pass --workers or --shard, not both")
     if args.workers and args.queue:
@@ -1617,7 +1781,12 @@ def main() -> None:
         if args.workers < 1:
             raise SystemExit("--workers must be >= 1")
         jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
-        planned = planned_workers(int(args.workers), jobs, args.out)
+        if not args.chains and int(args.workers) > 1 and not args.dry_run:
+            total = _gpu_total_gb()
+            if total >= DENSE_WORKERS_MIN_VRAM_GB:
+                print(f"gpu {total:.0f} GB: dense workers run side by side", flush=True)
+                args.chains = True
+        planned = planned_workers(int(args.workers), jobs, args.out, dense_ok=args.chains)
         if planned != int(args.workers):
             print(
                 f"dense 2K jobs run one at a time on this GPU "
@@ -1625,6 +1794,16 @@ def main() -> None:
                 flush=True,
             )
             args.workers = planned
+        if args.dry_run and args.chains:
+            for index, worker in enumerate(assign_chains(jobs, int(args.workers))):
+                for chain in worker:
+                    print(
+                        f"plan worker {index} {_chain_lock(chain)} "
+                        + " ".join(job["name"] for job in chain),
+                        flush=True,
+                    )
+            print(f"would spawn {args.workers} chain workers", flush=True)
+            return
         if args.dry_run:
             jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
             for job in sorted(jobs, key=job_cost, reverse=True):
@@ -1635,7 +1814,7 @@ def main() -> None:
             print(f"would spawn {args.workers} queue workers", flush=True)
             return
         # Download before the probe so a missing 2K set stops the parent.
-        if args.profile == "cloud5090":
+        if is_cloud_profile(args.profile):
             from bench.download_materials import cloud_materials
 
             cloud_materials(args.materials)
@@ -1646,16 +1825,17 @@ def main() -> None:
         _ensure_precision(args)
         raise SystemExit(_spawn_workers(args))
     shard_i, shard_n = (None, None)
-    shard_label = "queue" if args.queue else ""
+    shard_label = "queue" if args.queue else ("chain" if args.chain_queue else "")
     if args.shard:
         shard_i, shard_n = parse_shard(args.shard)
         shard_label = args.shard
     from ntc.train_fast import configure_inductor_process
 
-    os.environ["NTC_SHARD"] = shard_label or str(os.getpid())
+    inherited = os.environ.get("NTC_SHARD") if args.chain_queue else None
+    os.environ["NTC_SHARD"] = inherited or shard_label or str(os.getpid())
     configure_inductor_process(os.environ["NTC_SHARD"])
     if not args.dry_run:
-        if args.profile == "cloud5090":
+        if is_cloud_profile(args.profile):
             from bench.download_materials import cloud_materials
 
             cloud_materials(args.materials)
@@ -1685,6 +1865,10 @@ def main() -> None:
                 )
         return
     precision = _ensure_precision(args)
+    if args.chain_queue:
+        _chain_loop(jobs, args.out, precision, args.stale_lock_s, os.environ.get("NTC_SHARD") or "chain")
+        print("wrote", args.out, "chain", flush=True)
+        return
     if args.queue:
         _queue_loop(jobs, args.out, precision, args.stale_lock_s, args.pack)
         print("wrote", args.out, "queue", flush=True)
