@@ -20,6 +20,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -65,6 +66,8 @@ def dense_retry_batch(
     trainer actually used is still under a quarter of the frame.
     """
     if not isinstance(trained, (int, float)) or not isinstance(init, (int, float)):
+        return None
+    if not math.isfinite(float(trained)) or not math.isfinite(float(init)):
         return None
     if float(trained) >= float(init) + NEAR_INIT_DB:
         return None
@@ -114,7 +117,7 @@ def _lower_rows(out: Path, job: dict) -> list[dict]:
         if other is None or other[0] != stem or other[1] >= bpp - 1e-6:
             continue
         score = row.get("psnr_u8")
-        if not isinstance(score, (int, float)):
+        if not isinstance(score, (int, float)) or not math.isfinite(float(score)):
             continue
         rows.append({
             "name": str(row.get("name") or path.stem),
@@ -331,6 +334,42 @@ def ensure_sdk_materials(root: Path) -> None:
             except OSError:
                 pass
         return
+
+
+def precision_identity(info: dict | None = None) -> dict:
+    """Device name and backend that ``precision.json`` must match."""
+    if info is None:
+        info = device_report(pick_device("auto"))
+    return {
+        "device_name": str(info.get("name") or ""),
+        "backend": str(info.get("backend") or ""),
+    }
+
+
+def precision_matches(report: dict, identity: dict) -> bool:
+    """True when this process may reuse a stored precision probe.
+
+    A file written on the RX 9070 must not choose bf16 for an RTX 5070.
+    A file with no device key is the old format and is not reused.
+    """
+    if not isinstance(report, dict) or not isinstance(identity, dict):
+        return False
+    if report.get("device_name") != identity.get("device_name"):
+        return False
+    if report.get("backend") != identity.get("backend"):
+        return False
+    return report.get("equal_wall_choice") in ("fp32", "bf16", "fp16")
+
+
+def nonfinite_score(row: dict) -> str | None:
+    """Name of the first PSNR field that cannot be ranked, or None."""
+    for key in ("psnr_u8", "psnr_u8_init", "psnr_u8_trained", "best_val_psnr"):
+        value = row.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            return f"non-finite {key}"
+    return None
 
 
 def _job_blocked(out: Path, job: dict) -> bool:
@@ -589,7 +628,6 @@ def _run_claimed(
     )
     blob, stats = encode_arrays_fast(images, sems, cfg)
     wall = time.perf_counter() - t0
-    ntc_path.write_bytes(blob)
     row = {
         "name": job["name"],
         "done": True,
@@ -630,6 +668,10 @@ def _run_claimed(
         "halving": stats.get("halving"),
         "device": stats.get("device"),
     }
+    reason = nonfinite_score(row)
+    if reason:
+        raise RuntimeError(reason)
+    ntc_path.write_bytes(blob)
     trained = row.get("psnr_u8_trained")
     init = row.get("psnr_u8_init")
     pixels = int(job["size"]) * int(job["size"])
@@ -797,13 +839,34 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
     return jobs
 
 
+def _read_precision(path: Path, identity: dict) -> str | None:
+    if not path.is_file():
+        return None
+    try:
+        report = json.loads(path.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not precision_matches(report, identity):
+        return None
+    return str(report["equal_wall_choice"])
+
+
 def _ensure_precision(args: argparse.Namespace) -> str:
     path = args.out / "precision.json"
-    if path.is_file():
-        report = json.loads(path.read_text())
-        choice = report.get("equal_wall_choice", "fp32")
-        print("precision", choice, "from", path, flush=True)
+    identity = precision_identity()
+    choice = _read_precision(path, identity)
+    if choice is not None:
+        print("precision", choice, "from", path, identity["device_name"], flush=True)
         return choice
+    if path.is_file():
+        print(
+            "precision re-probe",
+            identity["backend"],
+            identity["device_name"],
+            "file",
+            path,
+            flush=True,
+        )
     metal = args.materials / "metal_plate"
     if not (metal / "manifest.json").is_file():
         print("missing", metal)
@@ -825,17 +888,29 @@ def _ensure_precision(args: argparse.Namespace) -> str:
     if not claim_job(args.out, "precision", stale_s=args.stale_lock_s):
         for _ in range(60):
             time.sleep(1.0)
-            if path.is_file():
-                return json.loads(path.read_text()).get("equal_wall_choice", "fp32")
+            choice = _read_precision(path, identity)
+            if choice is not None:
+                return choice
         print("precision lock held, using fp32", flush=True)
         return "fp32"
     try:
-        if path.is_file():
-            return json.loads(path.read_text()).get("equal_wall_choice", "fp32")
+        choice = _read_precision(path, identity)
+        if choice is not None:
+            return choice
         precision_report = choose_precision(images, _sems, probe_cfg, args.probe_steps)
+        precision_report["device_name"] = identity["device_name"]
+        precision_report["backend"] = identity["backend"]
         path.write_text(json.dumps(precision_report, indent=2))
         precision = precision_report["equal_wall_choice"]
-        print("precision", precision, "historical", precision_report["historical_equal_steps_choice"], flush=True)
+        print(
+            "precision",
+            precision,
+            identity["backend"],
+            identity["device_name"],
+            "historical",
+            precision_report["historical_equal_steps_choice"],
+            flush=True,
+        )
         return precision
     finally:
         release_job(args.out, "precision")
@@ -1048,7 +1123,6 @@ def _train_claimed_pack(claimed: list[dict], out: Path, precision: str, shard_la
             seeds_per_image=[int(job["seed"]) for job, _image, _sems in items],
         )
         for (job, _image, _sems), (blob, stats) in zip(items, packed, strict=True):
-            (out / f"{job['name']}.ntc").write_bytes(blob)
             sps = stats.get("steps_per_s")
             row = {
                 "name": job["name"],
@@ -1084,6 +1158,10 @@ def _train_claimed_pack(claimed: list[dict], out: Path, precision: str, shard_la
                 "batch_pixels": int(job.get("batch_pixels", 0)),
                 "lr_batch_ref": int(job.get("lr_batch_ref", 0)),
             }
+            reason = nonfinite_score(row)
+            if reason:
+                raise RuntimeError(reason)
+            (out / f"{job['name']}.ntc").write_bytes(blob)
             (out / f"{job['name']}.json").write_text(json.dumps(row, indent=2))
             sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
             packed_wall = float(stats.get("seconds_train") or 0.0)

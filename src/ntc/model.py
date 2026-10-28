@@ -242,7 +242,7 @@ class NtcNet(nn.Module):
                 lin.weight.data.copy_(0.5 * lin.weight.data + 0.5 * eye)
 
     def scales(self, index: int) -> torch.Tensor:
-        s = torch.exp(self.log_scales[index]).clamp(1e-4, 5.0)
+        s = torch.exp(self.log_scales[index].float()).clamp(1e-4, 5.0)
         return fp16_round(s).view(-1, 1, 1)
 
     def quant_grid(self, index: int):

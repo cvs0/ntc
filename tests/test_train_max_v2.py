@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 
+import pytest
+
 import bench.train_max_v2 as v2
 from bench.train_max_v2 import (
     _job_blocked,
@@ -225,6 +227,65 @@ def test_workers_spawn_a_queue(monkeypatch, tmp_path: Path):
     calls.clear()
     assert v2._spawn_workers(args) == 0
     assert "--no-pack" in calls[0]
+
+
+def test_nan_psnr_is_not_a_near_init_retry_and_not_a_sibling(tmp_path: Path):
+    assert dense_retry_batch(float("nan"), 13.57, 1000, 2048 * 2048, False) is None
+    assert dense_retry_batch(11.0, float("nan"), 1000, 2048 * 2048, False) is None
+    ident = {"device_name": "NVIDIA GeForce RTX 5070 Laptop GPU", "backend": "cuda"}
+    other = {"device_name": "AMD Radeon RX 9070", "backend": "rocm"}
+    assert not v2.precision_matches({"equal_wall_choice": "bf16", **other}, ident)
+    assert not v2.precision_matches({"equal_wall_choice": "bf16"}, ident)
+    assert v2.precision_matches({"equal_wall_choice": "bf16", **ident}, ident)
+    assert v2.nonfinite_score({
+        "psnr_u8": float("nan"),
+        "psnr_u8_init": float("nan"),
+        "psnr_u8_trained": float("nan"),
+        "best_val_psnr": 100.0,
+    }) == "non-finite psnr_u8"
+    assert v2.nonfinite_score({"psnr_u8": 30.0, "psnr_u8_init": None, "best_val_psnr": 30.0}) is None
+    (tmp_path / "sdk_x_b2.5.json").write_text(json.dumps({
+        "name": "sdk_x_b2.5",
+        "done": True,
+        "grids": [[4, 4, 2, 4]],
+        "psnr_u8": float("nan"),
+        "checkpoint": "trained",
+    }))
+    assert v2.best_lower_sibling(tmp_path, {"name": "sdk_x_b5"}) is None
+
+
+def test_nan_stats_do_not_write_a_done_json(tmp_path: Path, monkeypatch):
+    mat = tmp_path / "mat"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _nan_encode(*_args, **_kwargs):
+        return b"ntc", {
+            "metrics": {"psnr_u8": float("nan")},
+            "total_bpp": 0.0063,
+            "psnr_u8_init": float("nan"),
+            "psnr_u8_trained": float("nan"),
+            "best_val_psnr": 100.0,
+            "latent_stored_bytes": 2557,
+        }
+
+    monkeypatch.setattr(v2, "load_material", lambda *_a, **_k: (None, [0, 1, 2], {}))
+    monkeypatch.setattr(v2, "encode_arrays_fast", _nan_encode)
+    job = {
+        "name": "tiny_nan",
+        "material": str(mat),
+        "size": 8,
+        "steps": 1,
+        "bpp": 2.5,
+        "seed": 1,
+    }
+    dest = out / "tiny_nan.json"
+    with pytest.raises(RuntimeError, match="non-finite"):
+        v2._run_claimed(job, out, "fp32", "t", dest, out / "tiny_nan.ntc", out / "tiny_nan.pt")
+    assert not dest.is_file()
+    assert not (out / "tiny_nan.ntc").is_file()
 
 
 def test_dense_pass_below_init_is_not_retried():

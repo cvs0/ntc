@@ -3,9 +3,17 @@
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
-from ntc.encode import TrainConfig, _code_scale, _ridge_lstsq, encode_arrays
+from ntc.encode import (
+    TrainConfig,
+    _code_scale,
+    _fit_readout,
+    _ridge_lstsq,
+    encode_arrays,
+    export_network,
+)
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
     LATENT_ADAM_EPS,
@@ -13,7 +21,11 @@ from ntc.train_fast import (
     StackedTrain,
     _adam_on,
     _assign_lr,
+    _better_psnr,
     _mesh_uv,
+    _psnr_from_mse,
+    _reported_best_val,
+    _require_finite_stats,
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
@@ -368,6 +380,53 @@ def test_wide_checker_stays_above_init():
         ),
     )
     assert narrow["fast"] is True
+
+
+def test_nan_mse_is_not_a_perfect_psnr():
+    with pytest.raises(RuntimeError, match="non-finite PSNR"):
+        _psnr_from_mse(float("nan"))
+    assert _psnr_from_mse(0.0) == 100.0
+    # abs(100 - NaN) > 1 is false, which is how best_val_psnr stayed 100
+    # while the file PSNR was NaN.
+    assert not torch.tensor(_reported_best_val(100.0, float("nan"))).isfinite()
+    assert _reported_best_val(12.67, 33.07) == 33.07
+    assert _reported_best_val(float("nan"), 33.0) == 33.0
+    assert _better_psnr(float("nan"), 10.0) is False
+    assert _better_psnr(12.0, float("nan")) is True
+    with pytest.raises(RuntimeError, match="non-finite"):
+        _require_finite_stats({"psnr_u8_init": float("nan"), "metrics": {"psnr_u8": 30.0}})
+
+
+def test_quiet_bf16_forward_is_finite():
+    torch.manual_seed(0)
+    net = _net()
+    with torch.no_grad():
+        net.linears[0].weight.mul_(0.0)
+    stacked = StackedTrain([net])
+    uv = torch.tensor([[0.25, 0.75]])
+    pred = stacked.predict(uv, 0, 1, torch.bfloat16, "cpu")
+    assert torch.isfinite(pred).all()
+
+
+def test_export_rejects_a_nan_latent():
+    net = _net()
+    with torch.no_grad():
+        net.latents[0].fill_(float("nan"))
+    with pytest.raises(RuntimeError, match="non-finite latent"):
+        export_network(net, [0, 1, 2], 8, 8, 2)
+
+
+def test_non_finite_readout_does_not_write_the_layer(monkeypatch):
+    net = _net()
+    before = net.linears[-1].weight.detach().clone()
+
+    def _nan_solve(*_args, **_kwargs):
+        return torch.full((8, 3), float("nan"))
+
+    monkeypatch.setattr("ntc.encode._ridge_lstsq", _nan_solve)
+    with pytest.raises(RuntimeError, match="non-finite readout"):
+        _fit_readout(net, torch.rand(3, 8, 8))
+    assert torch.equal(net.linears[-1].weight, before)
 
 
 def test_code_scale_uses_a_percentile_not_one_spike():

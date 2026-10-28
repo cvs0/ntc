@@ -296,7 +296,11 @@ class StackedTrain(nn.Module):
             bits = int(self.grid_bits[i])
             mid = float((1 << bits) - 1) / 2.0
             qmax = (1 << bits) - 1
-            scale = fp16_round(torch.exp(self.log_scales[i]).clamp(1e-4, 5.0))
+            # exp and the fp16 scale stay fp32. A compiled bf16 region
+            # that picks up this exp overflows a large log-scale to inf.
+            kind = lat.device.type if lat.device.type in ("cuda", "cpu", "mps") else "cpu"
+            with torch.autocast(device_type=kind, enabled=False):
+                scale = fp16_round(torch.exp(self.log_scales[i].float()).clamp(1e-4, 5.0))
             if self.quantize:
                 q = torch.round(lat).clamp(0, qmax)
                 q_ste = lat + (q - lat).detach()
@@ -364,14 +368,18 @@ class StackedTrain(nn.Module):
                 ste = weight
             bb = fp16_round(bias)
             if amp_dtype is None:
-                hidden = torch.bmm(hidden, ste.transpose(1, 2)) + bb[:, None, :]
+                hidden = torch.bmm(hidden.float(), ste.transpose(1, 2)) + bb[:, None, :]
                 if li != last and self.activation == 1:
                     hidden = F.relu(hidden)
             else:
+                # The quantizer and the fp16 bias already ran in fp32.
+                # Only the GEMM is reduced. Cast back so the next layer's
+                # quantizer is not fused into the bf16 region.
                 with torch.autocast(device_type=device_type, dtype=amp_dtype):
                     hidden = torch.bmm(hidden, ste.transpose(1, 2)) + bb[:, None, :]
                     if li != last and self.activation == 1:
                         hidden = F.relu(hidden)
+                hidden = hidden.float()
             if li != last and self.activation not in (0, 1):
                 raise ValueError("stacked path supports identity and relu")
         return hidden
@@ -845,6 +853,8 @@ def _log_progress(
     left = max(total - step, 0)
     eta = _format_eta(left / sps) if sps > 0 else "?"
     loss_v = float(loss.detach().float().mean())
+    if not math.isfinite(loss_v):
+        raise RuntimeError("non-finite loss")
     psnr_txt = ""
     if images is not None and step % (every * 5) == 0:
         device = stacked.latents[0].device
@@ -962,8 +972,19 @@ def _run_loop(
                 # Touch it once outside the timed region of the caller. A failure
                 # here is recorded and the eager function stays in use.
                 probe = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
+                # A bf16 compile that flushes a weight scale produces a NaN
+                # here, before any Adam step. Drop that compile and try the
+                # next mode. Eager bf16 still runs if every mode fails.
+                if not torch.isfinite(probe.detach()).all():
+                    compile_error = "non-finite loss"
+                    compiled = False
+                    opt.zero_grad(set_to_none=True)
+                    if device_type == "cuda":
+                        torch.cuda.empty_cache()
+                    continue
                 probe.sum().backward()
                 opt.zero_grad(set_to_none=True)
+                _require_finite_params(stacked)
                 compiled = True
                 if compile_mode == "reduce-overhead":
                     # Inductor reduce-overhead replays the step as a CUDA/HIP graph.
@@ -1060,6 +1081,7 @@ def _run_loop(
             _log_progress(cfg, step + 1, total_steps, loss, t0, start_step, stacked, progress_images)
     if device_type == "cuda":
         torch.cuda.synchronize()
+    _require_finite_params(stacked)
     elapsed = time.perf_counter() - t0
     return {
         "seconds": elapsed,
@@ -1090,29 +1112,74 @@ def _psnr_per_seed(
     tq = torch.round(tgt.clamp(0, 1) * 255.0) / 255.0
     mse = (q - tq).square().mean(dim=(1, 2))
     mse_cpu = mse.detach().float().cpu()
-    out = []
-    for value in mse_cpu.tolist():
-        if value <= 0.0:
-            out.append(100.0)
-        else:
-            out.append(float(min(100.0, 10.0 * math.log10(1.0 / value))))
-    return out
+    return [_psnr_from_mse(float(value)) for value in mse_cpu.tolist()]
+
+
+def _psnr_from_mse(value: float) -> float:
+    """8-bit PSNR from a mean square error. A NaN mse is a failed step.
+
+    ``value <= 0`` used to mean a perfect match and return 100. NaN is not
+    ``<= 0``, so it fell through into ``log10`` or, when the file score was
+    the NaN, ``abs(100 - NaN) > 1`` was false and ``best_val_psnr`` stayed 100.
+    """
+    if not math.isfinite(value):
+        raise RuntimeError("non-finite PSNR")
+    if value <= 0.0:
+        return 100.0
+    return float(min(100.0, 10.0 * math.log10(1.0 / value)))
+
+
+def _better_psnr(candidate: float, current: float) -> bool:
+    """True when ``candidate`` should replace ``current``. NaN never wins."""
+    if not math.isfinite(candidate):
+        return False
+    if not math.isfinite(current):
+        return True
+    return float(candidate) > float(current)
 
 
 def _reported_best_val(loop_best: float, file_psnr: float) -> float:
-    if loop_best < -1e8:
-        return file_psnr
+    """File score when the loop score is missing or more than 1 dB off.
+
+    A non-finite file score is not close to 100. Callers refuse the job.
+    """
+    if not math.isfinite(file_psnr):
+        return float("nan")
+    if not math.isfinite(loop_best) or loop_best < -1e8:
+        return float(file_psnr)
     if abs(float(loop_best) - float(file_psnr)) > 1.0:
         return float(file_psnr)
     return float(loop_best)
 
 
 def _loop_best_if_different(loop_best: float, file_psnr: float):
+    if not math.isfinite(loop_best) or not math.isfinite(file_psnr):
+        return None
     if loop_best < -1e8:
         return None
     if abs(float(loop_best) - float(file_psnr)) > 1.0:
         return float(loop_best)
     return None
+
+
+def _require_finite_params(module: nn.Module) -> None:
+    for param in module.parameters():
+        if not torch.isfinite(param.detach()).all():
+            raise RuntimeError("non-finite parameter")
+
+
+def _require_finite_stats(stats: dict) -> None:
+    """Refuse a result whose PSNR cannot be ranked. Does not write a file."""
+    for key in ("psnr_u8_init", "psnr_u8_trained", "best_val_psnr"):
+        value = stats.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, (int, float)) or not math.isfinite(float(value)):
+            raise RuntimeError(f"non-finite {key}")
+    metrics = stats.get("metrics") or {}
+    psnr = metrics.get("psnr_u8")
+    if psnr is not None and (not isinstance(psnr, (int, float)) or not math.isfinite(float(psnr))):
+        raise RuntimeError("non-finite PSNR")
 
 
 def _halving_rung(cfg: TrainConfig) -> int:
@@ -1292,7 +1359,13 @@ def encode_arrays_fast(
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
         nets[0].load_state_dict(ckpt["model"])
-    init_states = [{k: v.detach().clone() for k, v in net.state_dict().items()} for net in nets]
+    for net in nets:
+        _require_finite_params(net)
+    # CPU copy before the compiled loop. The init file is this snapshot.
+    # A CUDA graph pool must not be able to reuse its storage.
+    init_states = [
+        {k: v.detach().cpu().clone() for k, v in net.state_dict().items()} for net in nets
+    ]
     stacked = StackedTrain(nets)
     amp_dtype = None
     if cfg.precision == "bf16":
@@ -1411,11 +1484,11 @@ def encode_arrays_fast(
             loop_info = _merge_info(loop_info, info)
             done_steps += span
             score = _psnr_per_seed(stacked, images_bank, device)[0]
-            if score > best_val + 0.01:
+            if math.isfinite(score) and score > best_val + 0.01:
                 best_val = score
                 stall = 0
                 best_state = [p.detach().clone() for p in stacked.parameters()]
-            elif score < init_score + NEAR_INIT_DB:
+            elif math.isfinite(score) and score < init_score + NEAR_INIT_DB:
                 # Still within a few dB of the init. A sparse batch climbs
                 # slower than 0.01 dB per eval, and patience would keep the
                 # near-init weights. Do not stop yet.
@@ -1446,7 +1519,8 @@ def encode_arrays_fast(
             score = max(_psnr_per_seed(stacked, images_bank, device))
             stacked.quantize = was
             stacked.quantize_weights = was_w
-            best_val = max(best_val, score)
+            if math.isfinite(score) and score > best_val:
+                best_val = score
             if cfg.stop_psnr > 0 and score >= cfg.stop_psnr:
                 hit_target = True
                 break
@@ -1513,7 +1587,7 @@ def encode_arrays_fast(
             for param, src in zip(stacked.parameters(), best_state, strict=True):
                 param.copy_(src)
         blob_b, recon_b, psnr_b = _export_current()
-        if psnr_b > trained_psnr:
+        if _better_psnr(psnr_b, trained_psnr):
             blob, recon, trained_psnr = blob_b, recon_b, psnr_b
         else:
             with torch.no_grad():
@@ -1532,7 +1606,7 @@ def encode_arrays_fast(
         )
         recon_i = _decode(parse_texture_set(blob_i), 0)
         init_psnr = psnr_u8(recon_i, ref)
-        if init_psnr > trained_psnr:
+        if _better_psnr(init_psnr, trained_psnr):
             blob, recon, kept = blob_i, recon_i, "init"
             ts = parse_texture_set(blob)
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
@@ -1592,6 +1666,7 @@ def encode_arrays_fast(
         "fused_kernel_reason": "enabled only when a CUDA profile names the bilinear gather as the busy op",
         **rates,
     }
+    _require_finite_stats(stats)
     if cfg.ckpt and stacked.n_seeds == 1:
         _save_resume_ckpt(stacked, opt, cfg, done_steps - 1)
     return blob, stats
@@ -1858,6 +1933,7 @@ def encode_bank(
             "device": device_report(device),
             **rate_report(ts),
         }
+        _require_finite_stats(stats)
         out.append((blob, stats))
     return out
 
@@ -1927,7 +2003,12 @@ def choose_precision(
     chosen = "fp32"
     if bf_psnr_equal_wall is not None and bf_psnr_equal_wall >= fp_psnr:
         chosen = "bf16"
+    from ntc.device import device_report, pick_device
+
+    ident = device_report(pick_device(cfg.device))
     return {
+        "device_name": str(ident.get("name") or ""),
+        "backend": str(ident.get("backend") or ""),
         "probe_steps": int(probe_steps),
         "fp32_wall_s": fp_wall,
         "fp32_psnr_u8": fp_psnr,

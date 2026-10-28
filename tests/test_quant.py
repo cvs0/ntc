@@ -1,6 +1,6 @@
 import torch
 
-from ntc.quant import quantize_latent, quantize_weight
+from ntc.quant import FP16_MAX, FP16_MIN_POS, fp16_round, quantize_latent, quantize_weight
 
 
 def test_latent_roundtrip_endpoints():
@@ -43,3 +43,27 @@ def test_weight_group_int4_and_int8():
         assert torch.allclose(rec, deq, atol=1e-4)
         # fp16 scale is exactly representable as fp16
         assert torch.equal(scales, scales.half().float())
+
+
+def test_quiet_and_huge_groups_stay_finite():
+    """A flushed fp16 scale used to make the zero taps 0/0.
+
+    amax 1e-6 with an 8-bit group rounded to scale 0, and the dequant was
+    NaN. The bf16 step trained that NaN. uint8(NaN) is 0, so the coder
+    stored a near-empty latent. A scale past 65504 used to be inf.
+    """
+    assert int(torch.tensor(float("nan")).to(torch.uint8)) == 0
+    quiet = torch.zeros(2, 8)
+    quiet[0, 0] = 1e-6
+    huge = torch.zeros(1, 8)
+    huge[0, 0] = 1e8
+    for weight in (quiet, huge, torch.zeros(1, 4)):
+        deq, codes, scales = quantize_weight(weight, 8, 0)
+        assert torch.isfinite(deq).all()
+        assert torch.isfinite(scales).all()
+        assert int(codes.abs().max()) <= 127
+        assert float(scales.min()) >= FP16_MIN_POS - 1e-12
+        assert float(scales.max()) <= FP16_MAX
+        assert torch.equal(scales, scales.half().float())
+    assert float(fp16_round(torch.tensor(1e6))) == FP16_MAX
+    assert torch.isfinite(fp16_round(torch.tensor(float("inf"))))

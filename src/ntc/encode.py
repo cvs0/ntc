@@ -206,6 +206,8 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
             except RuntimeError:
                 lat.normal_(0, 0.1)
                 continue
+            if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(vh).all()):
+                raise RuntimeError("non-finite PCA")
             k = min(ch, int(s.shape[0]))
             coeff = vh[:k] * s[:k].unsqueeze(1)
             if k < ch:
@@ -268,6 +270,10 @@ def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
         if was:
             net.train()
         return
+    if not torch.isfinite(sol).all():
+        if was:
+            net.train()
+        raise RuntimeError("non-finite readout")
     with torch.no_grad():
         out_f, in_f = net.linears[-1].weight.shape
         net.linears[-1].weight.copy_(sol.T[:out_f, :in_f])
@@ -367,6 +373,8 @@ def export_network(
         bits = net.grid_bits[i]
         z = net.latents[i].detach().float().cpu()
         code = torch.round(z).clamp(0, (1 << bits) - 1)
+        if not torch.isfinite(scale).all() or not torch.isfinite(code).all():
+            raise RuntimeError("non-finite latent")
         item = {
             "codes": code.to(torch.uint8).numpy(),
             "bits": bits,
@@ -386,6 +394,12 @@ def export_network(
             lin.weight.detach().float().cpu(), bits_l, net.group_size
         )
         bias = lin.bias.detach().float().cpu()
+        if (
+            not torch.isfinite(codes).all()
+            or not torch.isfinite(scales).all()
+            or not torch.isfinite(bias).all()
+        ):
+            raise RuntimeError("non-finite weight")
         gs = net.group_size
         inn = codes.shape[1]
         if gs <= 0 or gs >= inn:
