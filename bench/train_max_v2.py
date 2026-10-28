@@ -415,6 +415,48 @@ CLOUD_STEPS_PER_S = 20.0
 CLOUD_SEED_FACTOR = 1.25
 
 
+_CLOUD_FIT: dict[tuple, dict[float, tuple]] = {}
+
+
+def cloud_latent_setups(
+    images,
+    semantics: list[int],
+    size: int,
+    min_bits: int = 4,
+) -> dict[float, tuple]:
+    """Fit every cloud label for one image. Later jobs read this table.
+
+    The per-label probe used to range-code a full 1024 grid on one CPU
+    core between jobs. One pass fills the table. A second call is a lookup.
+    """
+    from ntc.train_fast import _image_rate_key, fit_latent_grids
+
+    key = (_image_rate_key(images), int(size), int(min_bits), int(images.shape[0]))
+    found = _CLOUD_FIT.get(key)
+    if found is not None:
+        return found
+    table: dict[float, tuple] = {}
+    started = time.perf_counter()
+    for bpp in CLOUD_BPP:
+        grids, ratio = fit_latent_grids(
+            images,
+            semantics,
+            int(size),
+            int(size),
+            float(bpp),
+            [32],
+            int(images.shape[0]),
+            int(min_bits),
+        )
+        table[round(float(bpp), 4)] = (grids, float(ratio))
+    _CLOUD_FIT[key] = table
+    print(
+        f"latent setups {len(CLOUD_BPP)} labels {time.perf_counter() - started:.2f}s",
+        flush=True,
+    )
+    return table
+
+
 def cloud_queue_gpu_hours(jobs: list[dict] | None = None) -> float:
     """GPU-hours for the cloud queue on the 30 steps/s budget."""
     if jobs is None:
@@ -730,18 +772,23 @@ def _run_claimed(
         and job.get("grids") is None
         and float(job.get("latent_rate_scale") or 0) <= 0
     ):
-        from ntc.train_fast import fit_latent_grids
+        bits = int(job.get("min_latent_bits") or 0)
+        if str(job.get("profile") or "") == "cloud5090":
+            table = cloud_latent_setups(images, sems, int(job["size"]), bits)
+            grids, ratio = table[round(float(job["bpp"]), 4)]
+        else:
+            from ntc.train_fast import fit_latent_grids
 
-        grids, ratio = fit_latent_grids(
-            images,
-            sems,
-            int(job["size"]),
-            int(job["size"]),
-            float(job["bpp"]),
-            [32],
-            int(images.shape[0]),
-            int(job.get("min_latent_bits") or 0),
-        )
+            grids, ratio = fit_latent_grids(
+                images,
+                sems,
+                int(job["size"]),
+                int(job["size"]),
+                float(job["bpp"]),
+                [32],
+                int(images.shape[0]),
+                bits,
+            )
         job = dict(job)
         job["latent_rate_scale"] = ratio
         job["grids"] = [list(g) for g in grids]

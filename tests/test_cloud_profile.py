@@ -32,6 +32,26 @@ from ntc.materials import load_material
 from ntc.train_fast import StackedTrain, _build_nets, _sync_quant_schedule, encode_arrays_fast
 
 
+def test_cloud_labels_are_fit_once_per_image():
+    """Ten labels share one pass. The old per-job probe was the idle GPU."""
+    import time
+
+    from bench.train_max_v2 import CLOUD_BPP, cloud_latent_setups
+
+    rng = np.random.default_rng(2)
+    n = 96
+    img = rng.random((6, n, n), dtype=np.float32)
+    started = time.perf_counter()
+    table = cloud_latent_setups(img, list(range(6)), n, 4)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 10.0, elapsed
+    assert set(table) == {round(float(bpp), 4) for bpp in CLOUD_BPP}
+    again = time.perf_counter()
+    second = cloud_latent_setups(img, list(range(6)), n, 4)
+    assert time.perf_counter() - again < 0.05
+    assert second is table
+
+
 def test_precision_probe_uses_a_cloud_material_when_metal_plate_is_absent(tmp_path: Path):
     """The cloud tree has no ``metal_plate``. The probe must not require it."""
     cloud = tmp_path / "MetalPlates013_2K"

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
 from dataclasses import replace
 
@@ -30,6 +31,7 @@ from ntc.encode import (
     _ACT,
     _PE,
     TrainConfig,
+    _code_scale,
     _color_mip,
     _loss,
     _mip_weight,
@@ -73,6 +75,11 @@ RATE_OVERSHOOT = 1.10
 COARSE_LOSS_FRACTION = 0.25
 _RATE_RATIO: dict[tuple, float] = {}
 _GRID_RATIO: dict[tuple, float] = {}
+_FIT_CACHE: dict[tuple, tuple] = {}
+# Packed bytes fed to the coder during a rate probe. The full latent of a
+# 1024x12 grid is about 6 MB, and the Python range coder on that buffer is
+# what held a 5090 at 0% for 8 to 14 minutes between jobs.
+_RATIO_SAMPLE_BYTES = 32 * 1024
 
 # A mean loss over a 2048 frame puts per-texel code gradients near 1e-10
 # to 1e-11. Adam's default eps of 1e-8 then keeps only a few percent of the
@@ -1707,43 +1714,95 @@ def _probe_grids(width: int, height: int) -> list[tuple[int, int, int, int]]:
     return [(gw, gh, 4, 4), (max(4, gw // 2), max(4, gh // 2), 4, 4)]
 
 
+def _raise_torch_threads() -> None:
+    """A container that left intra-op threads at 1 pegs one core for the probe.
+
+    Do not lower a count the process already raised. Training on the GPU
+    does not need this, and the determinism test sets one thread itself.
+    """
+    cores = os.cpu_count() or 1
+    if cores <= 1 or torch.get_num_threads() > 1:
+        return
+    torch.set_num_threads(min(cores, 16))
+
+
+def _probe_device() -> torch.device:
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def _pca_quant_codes(images: np.ndarray, gw: int, gh: int, channels: int, bits: int) -> np.ndarray:
+    """Integer codes ``[channels, gh, gw]`` from one area downsample and an SVD."""
+    _raise_torch_threads()
+    device = _probe_device()
+    target = torch.from_numpy(np.ascontiguousarray(images, dtype=np.float32)).to(device)
+    field = F.interpolate(target.unsqueeze(0), size=(int(gh), int(gw)), mode="area")[0]
+    flat = field.reshape(field.shape[0], -1)
+    _u, s, vh = torch.linalg.svd(flat, full_matrices=False)
+    k = min(int(channels), int(s.shape[0]))
+    coeff = vh[:k] * s[:k].unsqueeze(1)
+    if k < int(channels):
+        coeff = torch.cat(
+            [coeff, torch.zeros(int(channels) - k, coeff.shape[1], device=device)],
+            0,
+        )
+    values = coeff.reshape(int(channels), int(gh), int(gw))
+    scale = _code_scale(values, int(bits))
+    mid = ((1 << int(bits)) - 1) / 2.0
+    qmax = (1 << int(bits)) - 1
+    stored = torch.round(values / scale.view(-1, 1, 1) + mid).clamp(0, qmax)
+    return stored.to(torch.uint8).cpu().numpy()
+
+
+def _thin_codes(codes: np.ndarray, max_values: int) -> np.ndarray:
+    """Drop rows or columns until the coder sees about ``max_values`` texels."""
+    out = codes
+    while int(np.prod(out.shape)) > int(max_values) and (out.shape[1] > 1 or out.shape[2] > 1):
+        if out.shape[1] >= out.shape[2] and out.shape[1] > 1:
+            out = out[:, ::2, :]
+        else:
+            out = out[:, :, ::2]
+    return np.ascontiguousarray(out)
+
+
+def _packed_coder_ratio(parts: list[bytes]) -> float:
+    """Stored/plain of a short sample. Deflate is C. The range coder sees 32 KB."""
+    from ntc.container import deflate_raw
+    from ntc.range_coder import range_encode
+
+    packed = b"".join(parts)
+    if not packed:
+        return 0.5
+    sample = packed[:_RATIO_SAMPLE_BYTES]
+    stored = min(len(deflate_raw(sample)), len(range_encode(sample)))
+    return float(stored) / float(len(sample))
+
+
 def grid_coder_ratio(images: np.ndarray, semantics: list[int], grids) -> float:
-    """Stored/plain ratio of these grids' PCA codes, not of the probe grid."""
+    """Stored/plain ratio of these grids' PCA codes, not of the probe grid.
+
+    The sample is a thinned copy of the codes. Measuring the full latent
+    went through ``encode_arrays_fast`` and the Python range coder, which
+    took 8 to 14 minutes on a 1024-wide grid and left the GPU idle.
+    """
+    del semantics
     key = (_image_rate_key(images), _grids_key(grids))
     cached = _GRID_RATIO.get(key)
     if cached is not None:
         return cached
-    cfg = TrainConfig(
-        steps=0,
-        grids=[tuple(g) for g in grids],
-        target_bpp=1.0,
-        latent_deflate=True,
-        latent_coder="best",
-        rate="latent",
-        latent_rate_scale=1.0,
-        fast=True,
-        compile_step="off",
-        cuda_graph="off",
-        log_every=10**9,
-        mip_levels=1,
-        seed=0,
-        precision="fp32",
-        with_ssim=False,
-        adaptive_pool=1,
-        seed_pool=1,
-        eval_every=0,
-        early_stop=0,
-        pca_init=True,
-        min_latent_bits=0,
-    )
     try:
-        _blob, stats = encode_arrays_fast(images, semantics, cfg)
-        plain = int(stats.get("latent_plain_bytes") or 0)
-        stored = int(stats.get("latent_stored_bytes") or 0)
-        if plain <= 0 or stored <= 0:
-            ratio = 0.5
-        else:
-            ratio = float(stored) / float(plain)
+        parts = []
+        from ntc.container import pack_codes
+
+        # 4-bit sample of 32 KB is 64K values. 8-bit is 32K. Use the larger
+        # cap and let the byte slice below bound the coder.
+        for gw, gh, channels, bits in grids:
+            codes = _pca_quant_codes(images, int(gw), int(gh), int(channels), int(bits))
+            thin = _thin_codes(codes, _RATIO_SAMPLE_BYTES * 2)
+            packed, _stride, _plane = pack_codes(thin, int(bits))
+            parts.append(packed)
+        ratio = _packed_coder_ratio(parts)
     except Exception as exc:
         print("latent rate probe failed, using 0.5", exc, flush=True)
         ratio = 0.5
@@ -1805,6 +1864,18 @@ def fit_latent_grids(
     """
     from ntc.grids import latent_payload_bits, select_grids
 
+    cache_key = (
+        _image_rate_key(images),
+        round(float(target_bpp), 4),
+        int(width),
+        int(height),
+        int(min_bits),
+        int(out_features),
+    )
+    cached = _FIT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    started = time.perf_counter()
     ratio = latent_coder_ratio(images, semantics)
 
     def _pick(scale: float):
@@ -1844,7 +1915,14 @@ def fit_latent_grids(
                 measured = ratio
             else:
                 measured = grid_coder_ratio(images, semantics, grids)
-    return grids, float(measured)
+    result = (grids, float(measured))
+    _FIT_CACHE[cache_key] = result
+    print(
+        f"latent grid setup {time.perf_counter() - started:.2f}s "
+        f"scale {float(measured):.3f} grids {grids}",
+        flush=True,
+    )
+    return result
 
 
 def encode_arrays_fast(

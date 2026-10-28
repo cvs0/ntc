@@ -1150,6 +1150,41 @@ def test_uv_batch_dim_does_not_recompile_per_mip():
     assert recompiles <= 2
 
 
+def test_latent_grid_setup_is_a_short_cpu_probe():
+    """A 1024-wide reselect used to range-code the full latent for minutes.
+
+    The probe thins the codes and reuses the fit for the same image and label.
+    """
+    import os
+    import time
+
+    rng = np.random.default_rng(1)
+    n = 256
+    img = rng.random((9, n, n), dtype=np.float32)
+    img[0] = np.linspace(0.0, 1.0, n, dtype=np.float32)[None, :]
+    torch.set_num_threads(1)
+    started = time.perf_counter()
+    grids, scale = fit_latent_grids(img, list(range(9)), n, n, 16.0, [32], 9, 4)
+    elapsed = time.perf_counter() - started
+    assert elapsed < 10.0, elapsed
+    assert grids
+    assert 0.15 <= float(scale) <= 0.95
+    if (os.cpu_count() or 1) > 1:
+        assert torch.get_num_threads() > 1
+    again = time.perf_counter()
+    grids_b, scale_b = fit_latent_grids(img, list(range(9)), n, n, 16.0, [32], 9, 4)
+    assert time.perf_counter() - again < 0.05
+    assert grids_b == grids
+    assert scale_b == scale
+    from ntc.train_fast import grid_coder_ratio
+
+    # The 5090 hang was this shape: 1024x12 plus a coarse grid, full-file coded.
+    wide = time.perf_counter()
+    ratio = grid_coder_ratio(img, list(range(9)), [(512, 512, 12, 4), (128, 128, 8, 4)])
+    assert time.perf_counter() - wide < 10.0
+    assert 0.15 <= float(ratio) <= 0.95
+
+
 def test_fit_latent_grids_measures_the_grid_it_keeps():
     n = 32
     smooth = np.zeros((3, n, n), np.float32)
