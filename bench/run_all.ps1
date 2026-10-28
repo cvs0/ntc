@@ -71,4 +71,12 @@ if (-not (Test-Path $gl)) { $gl = "build\Release\ntc_gl.exe" }
 $shader = "build\shaders"
 if (-not (Test-Path $shader)) { $shader = "build\Release\shaders" }
 & $py bench/gpu_bench.py --encode data/materials --vk-bin $vk --gl-bin $gl --shader-dir $shader --gl-shader-dir shaders --warmup 8 --iters 30
-exit $LASTEXITCODE
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+$view = "build\ntc_view.exe"
+if (-not (Test-Path $view)) { $view = "build\Release\ntc_view.exe" }
+if (Test-Path $view) {
+    & $view --benchmark --shader-dir $shader --ntc-dir results/hw_encode --ntc-dir results/train_sweep --ntc-dir results/train_max
+    exit $LASTEXITCODE
+}
+Write-Host "ntc_view was not built. Vulkan SDK was not found at configure time."
+exit 0

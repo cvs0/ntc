@@ -481,7 +481,16 @@ powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
 sh bench/run_all.sh
 ```
 
-`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (Ninja, or the VS 2022 generator if Ninja configure fails), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. ASTC panels are skipped unless `astcenc` is on `PATH`; the skip reason is in the report. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
+`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (the VS 2022 generator when Visual Studio is installed, otherwise Ninja), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. ASTC panels are skipped unless `astcenc` is on `PATH`; the skip reason is in the report. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
+
+`ntc_view` is `examples/realtime_viewer`. It is Vulkan 1.3 with dynamic rendering. The window is Win32 or X11. There is no second OpenGL scene renderer. The fragment shader includes `ntc_decode.glsl` and calls `ntc_eval_filtered` with lod `log2(max(|dFdx(uv)|, |dFdy(uv)|) * max(width, height))` and filter mode 4 (feature trilinear). The scene is a sphere, a plane, and a cube, orbit camera, one directional light, GGX specular, tangent frame from `dFdx/dFdy` of world position. Channel slots come from the file semantics (albedo 0..2, normal 3..5, roughness 6, metalness 7, ao 8). Keys: `1` inference-on-sample, `2` BC7 albedo plus BC5 normal plus BC7 ORM packed at load from the CPU decode, `3` the same with BC1 albedo and BC1 ORM, `4` ASTC (white placeholder; the binary has no ASTC encoder, and the format is reported unsupported when the device lacks `VK_FORMAT_ASTC_4x4_UNORM_BLOCK`), `5` the CPU decode uploaded as RGBA8, `h` albedo error heatmap against that upload, `j` wipe (left NTC, right the CPU decode), mouse drag orbits, wheel zooms. The timestamp pair is around the three draws. The overlay text (mode, resolution, GPU milliseconds, FPS from that time, bpp, material VRAM) is drawn into the readback after the timestamp, so it is not inside the query. `--benchmark` is offscreen at 1920x1080 and 2560x1440 for NTC, the BC7 transcode, and the CPU-decode reference, plus a heatmap at 1080p. A CPU device skips those sizes, renders one 256x256 NTC frame, and tags `not_a_performance_claim`. Output is `results/hw/<gpu-slug>/realtime/report.json` and `screenshots/<gpu-slug>/realtime/`. `run_all` passes `--ntc-dir results/hw_encode`, `results/train_sweep`, and `results/train_max`.
+
+```text
+build\Release\ntc_view.exe --shader-dir build\shaders
+build\Release\ntc_view.exe --benchmark --shader-dir build\shaders --ntc-dir results\train_sweep --ntc-dir results\train_max
+```
+
+A Ninja build puts the executable at `build\ntc_view.exe`.
 
 The 2000-step and 4000-step rows, and every millisecond in `results/hw/`, stay out of this file until those directories are measured.
 
@@ -502,7 +511,7 @@ RTXNTC: https://github.com/NVIDIA-RTX/RTXNTC . License is the NVIDIA RTX SDKs li
 | `src/ntc` | encoder, container, reference decoder, metrics |
 | `cpp` | C++20 reader and reference decoder |
 | `shaders` | GLSL library and entry points |
-| `examples` | Vulkan 1.3 and OpenGL hosts |
+| `examples` | Vulkan 1.3 host, OpenGL host, realtime viewer |
 | `bench` | block codecs, ablations, `train_sweep`, `run_all`, GPU report |
 | `third_party/expcode` | vendored bf16 exponent codec, not on the decode path |
 | `third_party/puff` | puff 2.3, inflate of raw deflate latents. The header in `puff.h` is the copyright. |

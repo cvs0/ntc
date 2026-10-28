@@ -25,4 +25,8 @@ if [ "${NTC_SOFTWARE:-}" = "1" ] || [ ! -e /dev/dri ]; then
     SOFT="--software"
 fi
 # shellcheck disable=SC2086
-exec "$PY" bench/gpu_bench.py $SOFT --encode data/materials --warmup 8 --iters 30
+"$PY" bench/gpu_bench.py $SOFT --encode data/materials --warmup 8 --iters 30
+if [ -x build/ntc_view ]; then
+    ./build/ntc_view --benchmark --shader-dir build/shaders \
+        --ntc-dir results/hw_encode --ntc-dir results/train_sweep --ntc-dir results/train_max
+fi
