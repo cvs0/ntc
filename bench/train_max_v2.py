@@ -247,14 +247,15 @@ def apply_rate_neighbor(job: dict, out: Path) -> dict:
     target = float(job["bpp"])
     if 0 < scale < 1:
         target = target / scale
-    if job.get("grids") is None:
-        grown = grow_grids(
-            [tuple(g) for g in lower["grids"]],
-            int(job["size"]),
-            int(job["size"]),
-            target,
-        )
-        job["grids"] = [list(g) for g in grown]
+    # A calibrated grid on this label is replaced. Higher labels keep the
+    # lower neighbor's lattice and only add channels.
+    grown = grow_grids(
+        [tuple(g) for g in lower["grids"]],
+        int(job["size"]),
+        int(job["size"]),
+        target,
+    )
+    job["grids"] = [list(g) for g in grown]
     prior = out / f"{lower['name']}.pt"
     if prior.is_file() and lower.get("checkpoint") == "trained" and not job.get("warm_start"):
         job["warm_start"] = str(prior)
@@ -662,12 +663,22 @@ def _run_claimed(
         and job.get("grids") is None
         and float(job.get("latent_rate_scale") or 0) <= 0
     ):
-        from ntc.train_fast import latent_coder_ratio
+        from ntc.train_fast import fit_latent_grids
 
-        ratio = latent_coder_ratio(images, sems)
+        grids, ratio = fit_latent_grids(
+            images,
+            sems,
+            int(job["size"]),
+            int(job["size"]),
+            float(job["bpp"]),
+            [32],
+            int(images.shape[0]),
+            int(job.get("min_latent_bits") or 0),
+        )
         job = dict(job)
         job["latent_rate_scale"] = ratio
-        print(f"latent rate scale {job['name']} {ratio:.3f}", flush=True)
+        job["grids"] = [list(g) for g in grids]
+        print(f"latent rate scale {job['name']} {ratio:.3f} grids {grids}", flush=True)
     if not job.get("_gpu_held") and is_dense_2k(job):
         _wait_dense_gpu(out, stale_s)
         held = dict(job)

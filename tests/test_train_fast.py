@@ -33,10 +33,12 @@ from ntc.train_fast import (
     _rewind_if_below_init,
     bilinear_batched,
     encode_arrays_fast,
+    fit_latent_grids,
     fullres_batch_floor,
     latent_coder_ratio,
     portable_step_plan,
     preferred_compile_mode,
+    rate_overshoots,
     refill_sample_indices,
     scaled_lr,
     static_sample_indices,
@@ -242,6 +244,20 @@ def test_fullres_grid_raises_a_sparse_batch():
     )
     assert narrow == 256 * 1024
     assert narrow_mode == "area"
+    # MetalPlates b2.5 at scale 0.397: 8 channels on the coarse grid, 4 on
+    # the finest. The dense batch is for an 8-channel finest lattice.
+    coarse8, coarse8_mode = fullres_batch_floor(
+        2048, 2048, [(1024, 1024, 4, 4), (512, 512, 8, 4)], 256 * 1024, "area"
+    )
+    assert coarse8 == 256 * 1024
+    assert coarse8_mode == "area"
+    # PavingStones b2.5: 12 channels is the finest lattice, so the flat
+    # quarter frame stays.
+    paving, paving_mode = fullres_batch_floor(
+        2048, 2048, [(512, 512, 12, 4), (256, 256, 12, 4)], 256 * 1024, "area"
+    )
+    assert paving == image // 4
+    assert paving_mode == "flat"
 
 
 def test_fullres_sparse_batch_trains_above_init():
@@ -575,7 +591,13 @@ def test_pca_code_ratio_aims_each_material_at_its_label():
             seed_pool=1,
         ),
     )
-    assert abs(float(stats["latent_rate_scale"]) - smooth_ratio) < 1e-6
+    # The reported scale is stored/plain on the grid that was kept, which
+    # is not the half-resolution probe when the search picked a wider grid.
+    from ntc.train_fast import grid_coder_ratio
+
+    assert abs(float(stats["latent_rate_scale"]) - grid_coder_ratio(smooth, sems, stats["grids"])) < 1e-6
+    kept_raw = latent_payload_bits(stats["grids"]) / float(n * n)
+    assert kept_raw * float(stats["latent_rate_scale"]) <= label * 1.10 + 1e-6
     assert np.isfinite(stats["metrics"]["psnr_u8"])
 
 
@@ -880,3 +902,157 @@ def test_transplant_matches_the_smaller_grid(tmp_path: Path):
     apply_warm_start(dst, str(path), False)
     uv = torch.rand(6, 2)
     assert torch.allclose(src(uv, mip=0, max_mip=1), dst(uv, mip=0, max_mip=1), atol=1e-5)
+
+
+def test_metalplates_probe_does_not_keep_a_17_percent_overshoot():
+    """Scale 0.397 selects 4+8 raw 6 bpp. That file stored 2.93, not 2.5.
+
+    The extra coarse channels do not compress at the 4+4 probe ratio.
+    Measuring them and selecting again at that ratio returns 4+4.
+    PavingStones at 2.68 bpp is 7% over 2.5 and stays on its 512x12 grid.
+    25.32 dB at 2.68 bpp versus 27.4 dB at 3.89 bpp is 1.7 dB per bpp.
+    """
+    from ntc.grids import latent_payload_bits, select_grids
+
+    def _pick(raw: float):
+        return select_grids(
+            2048, 2048, raw, [32], 9, 0, 0, 8, 0, rate="latent", min_bits=4
+        )[0]
+
+    label = 2.5
+    pixels = 2048 * 2048
+    first = _pick(label / 0.397)
+    assert [list(g) for g in first] == [[1024, 1024, 4, 4], [512, 512, 8, 4]]
+    raw = latent_payload_bits(first) / pixels
+    assert abs(raw - 6.0) < 1e-3
+    realized = 2.9265 / raw
+    assert rate_overshoots(raw * realized, label)
+    second = _pick(label / realized)
+    assert [list(g) for g in second] == [[1024, 1024, 4, 4], [512, 512, 4, 4]]
+    paving = _pick(label / 0.643)
+    assert [list(g) for g in paving] == [[512, 512, 12, 4], [256, 256, 12, 4]]
+    assert rate_overshoots(2.6826, label) is False
+    slope = (27.4 - 25.32) / (3.89 - 2.6826)
+    assert 1.5 < slope < 2.0
+
+
+def test_halfres_8ch_coarse_grid_trains_above_its_init():
+    """The MetalPlates b2.5 grid walked a 30 dB init down when coarse matched mip 0.
+
+    Same shape on a 48 stand-in: 4 channels at half resolution, 8 at quarter.
+    The file has to finish above the init, and the run must not need a rewind.
+    """
+    n = 48
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+    bases = [
+        0.55 + 0.35 * np.sin(xx / 9.0) * np.cos(yy / 11.0),
+        0.45 + 0.25 * np.sin((xx + yy) / 14.0),
+        0.50 + 0.20 * np.cos(xx / 18.0),
+        0.40 + 0.30 * np.sin(yy / 8.0),
+        0.60 + 0.20 * np.cos((xx - yy) / 10.0),
+        0.35 + 0.25 * np.sin(xx / 6.0) * np.sin(yy / 6.0),
+        0.50 + 0.15 * np.cos(xx / 12.0),
+        0.48 + 0.22 * np.sin((xx + 2 * yy) / 16.0),
+        0.52 + 0.18 * np.cos(yy / 9.0),
+    ]
+    img = np.stack(bases, 0).astype(np.float32)
+    _blob, stats = encode_arrays_fast(
+        img,
+        list(range(9)),
+        TrainConfig(
+            steps=120,
+            hidden=(32,),
+            grids=[(n // 2, n // 2, 4, 4), (n // 4, n // 4, 8, 4)],
+            seed=0,
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=6,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            batch_pixels=(n * n) // 4,
+            batch_mip="flat",
+            pca_init=True,
+            rate="latent",
+            target_bpp=2.5,
+            latent_deflate=False,
+            warmup_steps=12,
+            schedule="cosine",
+            entropy_rate=False,
+            quant_schedule=False,
+            eval_every=0,
+        ),
+    )
+    assert stats["batch_mip"] == "flat"
+    assert stats["lr_rewinds"] == 0
+    assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"]
+    assert stats["checkpoint"] == "trained"
+
+
+def test_uv_batch_dim_does_not_recompile_per_mip():
+    """65536 versus 16384 used to be the guard that hit recompile_limit 16.
+
+    The batch dim is marked on the mip buffers before compile. A second
+    step with the same pyramid must not compile once per mip.
+    """
+    from ntc.train_fast import _build_nets, _loss_from_mips, _mark_sample_shapes, _prep_mips
+
+    torch._dynamo.reset()
+    n = 32
+    yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+    img = np.stack(
+        [
+            0.5 + 0.2 * np.sin(xx / 3.0),
+            0.4 + 0.2 * np.cos(yy / 4.0),
+            0.3 + 0.1 * np.sin((xx + yy) / 5.0),
+        ],
+        0,
+    ).astype(np.float32)
+    target = torch.from_numpy(img)
+    grids = [(n // 2, n // 2, 4, 4), (n // 4, n // 4, 4, 4)]
+    cfg = TrainConfig(
+        steps=4,
+        hidden=(8,),
+        grids=grids,
+        seed=0,
+        mip_levels=6,
+        batch_pixels=n * n // 4,
+        batch_mip="area",
+        pca_init=True,
+        precision="fp32",
+        compile_step="off",
+        cuda_graph="off",
+        log_every=10**9,
+    )
+    device = target.device
+    nets = _build_nets(target, cfg, grids, [0], device)
+    stacked = StackedTrain(nets)
+    mips = _prep_mips(target, cfg, device)
+    indices = static_sample_indices(mips, int(cfg.batch_pixels), "area", device)
+    _mark_sample_shapes(mips, indices)
+    compiled = torch.compile(_loss_from_mips, backend="eager", dynamic=False)
+    torch._dynamo.utils.counters.clear()
+    compiled(stacked, mips, cfg, [0, 1, 2], None, int(cfg.batch_pixels), 0, indices)
+    refill_sample_indices(indices, mips, int(cfg.batch_pixels), "area")
+    compiled(stacked, mips, cfg, [0, 1, 2], None, int(cfg.batch_pixels), 1, indices)
+    recompiles = int(torch._dynamo.utils.counters["frames"]["recompile"])
+    assert recompiles <= 2
+
+
+def test_fit_latent_grids_measures_the_grid_it_keeps():
+    n = 32
+    smooth = np.zeros((3, n, n), np.float32)
+    smooth[0] = np.linspace(0.0, 1.0, n, dtype=np.float32)[None, :]
+    smooth[1] = np.linspace(1.0, 0.0, n, dtype=np.float32)[:, None]
+    smooth[2] = 0.4
+    grids, scale = fit_latent_grids(smooth, [0, 1, 2], n, n, 4.0, [32], 3, 4)
+    from ntc.grids import latent_payload_bits
+    from ntc.train_fast import grid_coder_ratio
+
+    measured = grid_coder_ratio(smooth, [0, 1, 2], grids)
+    assert abs(scale - measured) < 1e-6
+    predicted = latent_payload_bits(grids) / float(n * n) * scale
+    assert predicted <= 4.0 * 1.10 + 1e-6

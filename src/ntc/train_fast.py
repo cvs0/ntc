@@ -62,7 +62,17 @@ NEAR_INIT_DB = 4.0
 # for a huge grid and a noise field from asking for an empty one.
 RATE_SCALE_MIN = 0.15
 RATE_SCALE_MAX = 0.95
+# A measured file more than this far over the label used a grid the probe
+# ratio does not describe. MetalPlates at scale 0.397 selected a 4+8 grid
+# and stored 2.93 bpp (17% over 2.5). PavingStones stored 2.68 (7% over)
+# and is left on that grid: 25.32 dB at 2.68 bpp against the old 27.4 dB
+# at 3.89 bpp is 1.7 dB per bpp, with the init at 5.38, so the lower point
+# is the same fit.
+RATE_OVERSHOOT = 1.10
+# Coarse mip terms, summed, stay at or under this fraction of the mip-0 term.
+COARSE_LOSS_FRACTION = 0.25
 _RATE_RATIO: dict[tuple, float] = {}
+_GRID_RATIO: dict[tuple, float] = {}
 
 # A mean loss over a 2048 frame puts per-texel code gradients near 1e-10
 # to 1e-11. Adam's default eps of 1e-8 then keeps only a few percent of the
@@ -97,13 +107,15 @@ def fullres_batch_floor(
     """
     if not grids:
         return int(batch_pixels), str(batch_mip)
-    finest = max(int(g[0]) * int(g[1]) for g in grids)
+    finest_grid = max(grids, key=lambda g: int(g[0]) * int(g[1]))
+    finest = int(finest_grid[0]) * int(finest_grid[1])
     image = int(height) * int(width)
-    finest_ch = max(int(g[2]) for g in grids)
-    # 4 channels at 1024 with a 256K area batch reached 31.80 dB (b2.5).
-    # 8 channels at 1024 on that same batch stayed at 11.91 dB against an
-    # init of 10.58 (b5 after the 4-bit ranking). Full-resolution and 8-bit
-    # grids had the same failure mode.
+    # Channel count is the finest lattice only. 8 channels at 1024 (b5)
+    # stayed at 11.91 dB on a 256K area batch. 4 channels at 1024 reached
+    # 31.80 dB on that batch. MetalPlates b2.5 is 4 channels at 1024 plus
+    # 8 channels at 512: the coarse 8 is not that failure, and treating it
+    # as one forced a flat quarter frame (20 steps/s) onto the half-res grid.
+    finest_ch = int(finest_grid[2])
     wide_or_deep = (
         any(int(g[3]) >= 8 for g in grids)
         or finest >= max(image // 2, 1)
@@ -161,6 +173,31 @@ def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat"
     if budget >= count:
         return 0
     return budget
+
+
+def _mark_batch_dim(tensor: torch.Tensor, dim: int) -> None:
+    """One specialization for this dim. Call before ``torch.compile``.
+
+    ``mark_dynamic`` is forbidden inside the compiled frame. The sample
+    counts 65536 and 16384 are the area-batch mip pyramid (and a flat
+    quarter frame adds 1048576). Marking the buffers that ``predict``
+    reads keeps those sizes on one trace. Inductor still records a CUDA
+    graph per concrete size while ``cudagraph_skip_dynamic_graphs`` is
+    false, so reduce-overhead is not turned off.
+    """
+    if tensor.ndim > dim and int(tensor.shape[dim]) > 1:
+        torch._dynamo.mark_dynamic(tensor, dim)
+
+
+def _mark_sample_shapes(mips: list[dict], indices: list[torch.Tensor | None] | None) -> None:
+    for slot in mips:
+        _mark_batch_dim(slot["uv"], 0)
+        _mark_batch_dim(slot["tgt"], 1)
+    if not indices:
+        return
+    for buf in indices:
+        if buf is not None:
+            _mark_batch_dim(buf, 0)
 
 
 def _cover_mip_recompiles(mip_levels: int) -> int:
@@ -881,7 +918,8 @@ def _loss_from_mips(
         # checker the mip-1 term was 0.047 against a mip-0 term of 0.00094, and
         # the step left the PCA fit (11 dB under the init at step 200). The 4+4
         # grid's coarse terms were already smaller than mip 0 and are unchanged.
-        # Keep the sum of the coarser terms from exceeding the finest term.
+        # The coarser terms together stay at or under a quarter of mip 0.
+        # Matching mip 0 (the previous cap) still left a 30 dB init.
         fine = mip_terms[0]
         if len(mip_terms) == 1:
             distortion = fine
@@ -889,7 +927,13 @@ def _loss_from_mips(
             coarse = mip_terms[1]
             for term in mip_terms[2:]:
                 coarse = coarse + term
-            scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
+            # A cap of 1 lets the coarse sum equal mip 0. On a 30 dB PCA
+            # init that split walked the file down: MetalPlates b2.5 at
+            # 6bb5c7e finished 28.78 dB against an init of 30.02, and a
+            # 9-channel 4+8 stand-in dropped more than 1 dB by the quarter
+            # mark. A quarter of mip 0 still trains the chain. It does not
+            # match the mip-0 term.
+            scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=COARSE_LOSS_FRACTION)
             distortion = fine + coarse * scale
         if cfg.entropy_rate and float(cfg.target_bpp) > 0 and mips:
             from ntc.entropy import latent_rate_bits
@@ -1171,12 +1215,19 @@ def _run_loop(
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
         _cover_mip_recompiles(int(cfg.mip_levels))
+        if graph_idx is None and batch:
+            graph_idx = static_sample_indices(
+                mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+            )
+        _mark_sample_shapes(mips, graph_idx)
         for compile_mode in attempts:
             try:
                 compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
                 # Touch it once outside the timed region of the caller. A failure
                 # here is recorded and the eager function stays in use.
-                probe = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
+                probe = compiled_loss(
+                    stacked, mips, cfg, semantics, amp_dtype, batch, 0, graph_idx
+                )
                 # A bf16 compile that flushes a weight scale produces a NaN
                 # here, before any Adam step. Drop that compile and try the
                 # next mode. Eager bf16 still runs if every mode fails.
@@ -1200,7 +1251,11 @@ def _run_loop(
                     _sync_step_qat(stacked, cfg, step)
                     _sync_quant_schedule(stacked, cfg, step)
                     opt.zero_grad(set_to_none=True)
-                    per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
+                    if graph_idx is not None:
+                        refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+                    per = compiled_loss(
+                        stacked, mips, cfg, semantics, amp_dtype, batch, step, graph_idx
+                    )
                     loss = per.sum()
                     loss.backward()
                     _drop_latent_grads(stacked, opt)
@@ -1477,28 +1532,33 @@ def _load_resume_into_stack(stacked: StackedTrain, opt: torch.optim.Optimizer, c
     return opt
 
 
-def latent_coder_ratio(images: np.ndarray, semantics: list[int]) -> float:
-    """Stored/plain ratio of a PCA latent, one probe per image.
-
-    The probe grid is the half-resolution 4-bit pair the low-rate jobs use.
-    ``latent_rate_scale`` of 0 asks for this measurement. A positive scale
-    is left alone, which is how a process that already chose 0.5 keeps it.
-    """
-    channels, height, width = images.shape
-    del channels
+def _image_rate_key(images: np.ndarray) -> tuple:
     sample = np.ascontiguousarray(images).reshape(-1)
     step = max(1, sample.size // 4096)
     digest = hashlib.sha1(sample[::step].tobytes()).hexdigest()
-    key = (images.shape, digest)
-    cached = _RATE_RATIO.get(key)
+    return (images.shape, digest)
+
+
+def _grids_key(grids) -> tuple:
+    return tuple(tuple(int(x) for x in g) for g in grids)
+
+
+def _probe_grids(width: int, height: int) -> list[tuple[int, int, int, int]]:
+    """Half-resolution 4-bit pair. This is the ratio probe, not every label."""
+    gw = max(4, (int(width) // 2) // 2 * 2)
+    gh = max(4, (int(height) // 2) // 2 * 2)
+    return [(gw, gh, 4, 4), (max(4, gw // 2), max(4, gh // 2), 4, 4)]
+
+
+def grid_coder_ratio(images: np.ndarray, semantics: list[int], grids) -> float:
+    """Stored/plain ratio of these grids' PCA codes, not of the probe grid."""
+    key = (_image_rate_key(images), _grids_key(grids))
+    cached = _GRID_RATIO.get(key)
     if cached is not None:
         return cached
-    gw = max(4, (width // 2) // 2 * 2)
-    gh = max(4, (height // 2) // 2 * 2)
-    grids = [(gw, gh, 4, 4), (max(4, gw // 2), max(4, gh // 2), 4, 4)]
     cfg = TrainConfig(
         steps=0,
-        grids=grids,
+        grids=[tuple(g) for g in grids],
         target_bpp=1.0,
         latent_deflate=True,
         latent_coder="best",
@@ -1531,8 +1591,103 @@ def latent_coder_ratio(images: np.ndarray, semantics: list[int]) -> float:
         print("latent rate probe failed, using 0.5", exc, flush=True)
         ratio = 0.5
     ratio = float(min(RATE_SCALE_MAX, max(RATE_SCALE_MIN, ratio)))
+    _GRID_RATIO[key] = ratio
+    return ratio
+
+
+def latent_coder_ratio(images: np.ndarray, semantics: list[int]) -> float:
+    """Stored/plain ratio of a PCA latent, one probe per image.
+
+    The probe grid is the half-resolution 4-bit pair the low-rate jobs use.
+    ``latent_rate_scale`` of 0 asks for this measurement. A positive scale
+    is left alone, which is how a process that already chose 0.5 keeps it.
+    The probe does not describe a wider grid: MetalPlates measured 0.397
+    here and stored the 4+8 grid at about 0.49.
+    """
+    _channels, height, width = images.shape
+    key = _image_rate_key(images)
+    cached = _RATE_RATIO.get(key)
+    if cached is not None:
+        return cached
+    ratio = grid_coder_ratio(images, semantics, _probe_grids(width, height))
     _RATE_RATIO[key] = ratio
     return ratio
+
+
+def rate_overshoots(predicted_bpp: float, label_bpp: float) -> bool:
+    """True when a measured file is more than ``RATE_OVERSHOOT`` above the label."""
+    if label_bpp <= 0:
+        return False
+    return float(predicted_bpp) > float(label_bpp) * RATE_OVERSHOOT
+
+
+def fit_latent_grids(
+    images: np.ndarray,
+    semantics: list[int],
+    width: int,
+    height: int,
+    target_bpp: float,
+    hidden: list[int],
+    out_features: int,
+    min_bits: int,
+    pe_mode: int = 0,
+    pe_octaves: int = 0,
+    weight_bits: int = 8,
+    group_size: int = 0,
+) -> tuple[list, float]:
+    """Pick a latent grid whose measured PCA file is not far over the label.
+
+    The search starts at ``label / probe_ratio``. The probe is a 4-bit
+    half-resolution pair. A wider coarse grid does not compress at that
+    ratio: MetalPlates at 0.397 selected ``(1024, 4) + (512, 8)``, raw
+    6.0 bpp, and the file was 2.93 against a 2.5 label. When that
+    prediction is more than 10% over, the grid is selected again at the
+    ratio measured on the grid itself. PavingStones at 2.68 bpp is 7%
+    over and stays, which is the lower-rate point of the old 27.4 dB /
+    3.89 bpp fit (about 1.7 dB per bpp), not a stalled optimizer.
+    """
+    from ntc.grids import latent_payload_bits, select_grids
+
+    ratio = latent_coder_ratio(images, semantics)
+
+    def _pick(scale: float):
+        return select_grids(
+            int(width),
+            int(height),
+            float(target_bpp) / float(scale),
+            list(hidden),
+            int(out_features),
+            int(pe_mode),
+            int(pe_octaves),
+            int(weight_bits),
+            int(group_size),
+            adaptive_pool=1,
+            rate="latent",
+            min_bits=int(min_bits),
+        )[0]
+
+    grids = _pick(ratio)
+    probe = _probe_grids(width, height)
+    if _grids_key(grids) == _grids_key(probe):
+        measured = ratio
+    else:
+        measured = grid_coder_ratio(images, semantics, grids)
+    pixels = float(int(width) * int(height))
+    predicted = latent_payload_bits(grids) / pixels * measured
+    if rate_overshoots(predicted, float(target_bpp)):
+        alt = _pick(measured)
+        if _grids_key(alt) != _grids_key(grids):
+            print(
+                f"latent file {predicted:.3f} bpp over label {float(target_bpp):.3f}, "
+                f"reselect {alt}",
+                flush=True,
+            )
+            grids = alt
+            if _grids_key(grids) == _grids_key(probe):
+                measured = ratio
+            else:
+                measured = grid_coder_ratio(images, semantics, grids)
+    return grids, float(measured)
 
 
 def encode_arrays_fast(
@@ -1563,6 +1718,28 @@ def encode_arrays_fast(
     hidden = list(cfg.hidden)
     pe_mode = _PE[cfg.pe]
     if (
+        cfg.grids is None
+        and cfg.rate == "latent"
+        and float(cfg.latent_rate_scale) <= 0
+        and int(cfg.adaptive_pool) <= 1
+    ):
+        grids, ratio = fit_latent_grids(
+            images,
+            semantics,
+            width,
+            height,
+            float(cfg.target_bpp),
+            hidden,
+            channels,
+            int(cfg.min_latent_bits),
+            pe_mode,
+            cfg.pe_octaves,
+            cfg.weight_bits,
+            cfg.group_size,
+        )
+        print(f"latent rate scale {ratio:.3f} grids {grids}", flush=True)
+        cfg = replace(cfg, latent_rate_scale=ratio, grids=[tuple(g) for g in grids])
+    elif (
         cfg.grids is None
         and cfg.rate == "latent"
         and float(cfg.latent_rate_scale) <= 0
