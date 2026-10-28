@@ -215,6 +215,86 @@ def release_job(out: Path, name: str) -> None:
         pass
 
 
+GPU_DENSE_LOCK = "gpu_dense"
+
+
+def _select_job_grids(job: dict) -> list:
+    grids = job.get("grids")
+    if grids:
+        return [tuple(g) for g in grids]
+    from ntc.grids import select_grids
+
+    bpp = float(job["bpp"])
+    scale = float(job.get("latent_rate_scale") or 1.0)
+    if str(job.get("rate") or "payload") == "latent" and 0 < scale < 1:
+        bpp = bpp / scale
+    size = int(job["size"])
+    return select_grids(
+        size,
+        size,
+        bpp,
+        [32],
+        9,
+        0,
+        0,
+        8,
+        0,
+        rate=str(job.get("rate") or "payload"),
+        min_bits=int(job.get("min_latent_bits") or 0),
+    )[0]
+
+
+def is_dense_2k(job: dict) -> bool:
+    """True when this job trains at a flat quarter-frame batch.
+
+    One such step already fills the RX 9070. A second process on the same
+    GPU made each job about 3x slower and did not raise throughput.
+    """
+    size = int(job.get("size") or 0)
+    if size < 2048:
+        return False
+    from ntc.train_fast import fullres_batch_floor
+
+    grids = _select_job_grids(job)
+    batch, mode = fullres_batch_floor(
+        size,
+        size,
+        grids,
+        int(job.get("batch_pixels") or 0),
+        str(job.get("batch_mip") or "flat"),
+    )
+    return mode == "flat" and batch >= (size * size) // 4
+
+
+def _unfinished_jobs(jobs: list[dict], out: Path) -> list[dict]:
+    pending = []
+    for job in jobs:
+        dest = out / f"{job['name']}.json"
+        if dest.is_file():
+            try:
+                if json.loads(dest.read_text()).get("done"):
+                    continue
+            except (OSError, json.JSONDecodeError):
+                pass
+        pending.append(job)
+    return pending
+
+
+def planned_workers(requested: int, jobs: list[dict], out: Path) -> int:
+    """Use one process when every remaining job is a dense 2K run."""
+    if requested <= 1:
+        return requested
+    pending = _unfinished_jobs(jobs, out)
+    if pending and all(is_dense_2k(job) for job in pending):
+        return 1
+    return requested
+
+
+def _wait_dense_gpu(out: Path, stale_s: float) -> None:
+    while not claim_job(out, GPU_DENSE_LOCK, stale_s):
+        time.sleep(0.5)
+
+
 def _run(job: dict, out: Path, precision: str, shard_label: str, stale_s: float) -> dict:
     dest = out / f"{job['name']}.json"
     ntc_path = out / f"{job['name']}.ntc"
@@ -228,12 +308,29 @@ def _run(job: dict, out: Path, precision: str, shard_label: str, stale_s: float)
         print("locked", job["name"], flush=True)
         return {"name": job["name"], "done": False, "locked": True}
     try:
-        return _run_claimed(job, out, precision, shard_label, dest, ntc_path, ckpt)
+        return _run_claimed(job, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
     finally:
         release_job(out, job["name"])
 
 
-def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: Path, ntc_path: Path, ckpt: Path) -> dict:
+def _run_claimed(
+    job: dict,
+    out: Path,
+    precision: str,
+    shard_label: str,
+    dest: Path,
+    ntc_path: Path,
+    ckpt: Path,
+    stale_s: float = 86400.0,
+) -> dict:
+    if not job.get("_gpu_held") and is_dense_2k(job):
+        _wait_dense_gpu(out, stale_s)
+        held = dict(job)
+        held["_gpu_held"] = True
+        try:
+            return _run_claimed(held, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
+        finally:
+            release_job(out, GPU_DENSE_LOCK)
     if dest.is_file():
         prev = json.loads(dest.read_text())
         if prev.get("done"):
@@ -346,7 +443,7 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         fallback["batch_pixels"] = pixels // 4
         fallback["batch_mip"] = "flat"
         fallback["_fallback"] = True
-        return _run_claimed(fallback, out, precision, shard_label, dest, ntc_path, ckpt)
+        return _run_claimed(fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
     if near_init:
         row["done"] = False
         row["collapsed"] = True
@@ -800,7 +897,7 @@ def main() -> None:
     p.add_argument("--probe-steps", type=int, default=400)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--shard", default="", help="I/N. Split by pixels*steps, longest job first. Does not steal.")
-    p.add_argument("--workers", type=int, default=0, help="Spawn N processes on one shared lock queue and wait.")
+    p.add_argument("--workers", type=int, default=0, help="Spawn N processes on one shared lock queue and wait. Dense 2K jobs stay at 1 process.")
     p.add_argument("--queue", action="store_true", help="Claim the next undone job from the lock pool until none remain.")
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
@@ -816,6 +913,15 @@ def main() -> None:
     if args.workers:
         if args.workers < 1:
             raise SystemExit("--workers must be >= 1")
+        jobs = build_jobs(args.materials, args.batch_pixels)
+        planned = planned_workers(int(args.workers), jobs, args.out)
+        if planned != int(args.workers):
+            print(
+                f"dense 2K jobs run one at a time on this GPU "
+                f"(workers {args.workers} -> {planned})",
+                flush=True,
+            )
+            args.workers = planned
         if args.dry_run:
             jobs = build_jobs(args.materials, args.batch_pixels)
             for job in sorted(jobs, key=job_cost, reverse=True):

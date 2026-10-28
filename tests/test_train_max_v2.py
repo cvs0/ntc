@@ -12,9 +12,11 @@ from bench.train_max_v2 import (
     build_jobs,
     claim_job,
     claim_next,
+    is_dense_2k,
     job_cost,
     owns_index,
     parse_shard,
+    planned_workers,
     release_job,
 )
 from ntc.train_fast import mip_sample_count
@@ -57,7 +59,16 @@ def test_claim_is_exclusive_and_a_dead_pid_is_stale(tmp_path: Path):
     assert payload["pid"] == os.getpid()
 
 
-def test_area_batch_shrinks_coarser_mips():
+def test_dense_2k_jobs_use_one_worker(tmp_path: Path):
+    jobs = build_jobs(Path("data/materials"), None)
+    by_name = {job["name"]: job for job in jobs}
+    assert is_dense_2k(by_name["sdk_MetalPlates013_2K_b10"])
+    assert is_dense_2k(by_name["sdk_MetalPlates013_2K_b5"])
+    assert not is_dense_2k(by_name["sdk_MetalPlates013_2K_b2.5"])
+    assert not is_dense_2k(by_name["metal_g16_s20000"])
+    assert planned_workers(3, [by_name["sdk_MetalPlates013_2K_b10"], by_name["sdk_MetalPlates013_2K_b5"]], tmp_path) == 1
+    assert planned_workers(3, jobs, tmp_path) == 3
+    assert planned_workers(3, [by_name["sdk_MetalPlates013_2K_b2.5"]], tmp_path) == 3
     assert mip_sample_count(1048576, 1, 1048576, "flat") == 0
     assert mip_sample_count(262144, 0, 2048 * 2048, "area") == 262144
     assert mip_sample_count(262144, 1, 1024 * 1024, "area") == 65536

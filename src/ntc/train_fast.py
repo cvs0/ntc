@@ -614,6 +614,8 @@ def _run_loop(
     amp_dtype: torch.dtype | None,
     device_type: str,
     use_graph: bool,
+    warmup: int = 0,
+    compile_mode_override: str | None = None,
 ) -> dict:
     """Train ``steps`` Adam steps starting at ``start_step``. No ``.item()``."""
     batch = int(cfg.batch_pixels or 0)
@@ -676,7 +678,10 @@ def _run_loop(
     import sys as _sys
 
     linux_cuda = device_type == "cuda" and _sys.platform.startswith("linux")
-    compile_mode = "reduce-overhead" if linux_cuda else "default"
+    if compile_mode_override:
+        compile_mode = compile_mode_override
+    else:
+        compile_mode = "reduce-overhead" if linux_cuda else "default"
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
         try:
@@ -726,6 +731,17 @@ def _run_loop(
         except Exception as exc:
             graph_error = str(exc)
             graph = None
+
+    if warmup > 0:
+        if graph is not None:
+            for _ in range(warmup):
+                graph.replay()
+        else:
+            for step in range(start_step, start_step + warmup):
+                one_step(step, replay=False)
+            start_step = start_step + warmup
+        if device_type == "cuda":
+            torch.cuda.synchronize()
 
     t0 = time.perf_counter()
     if graph is not None:
