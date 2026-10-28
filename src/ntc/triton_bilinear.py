@@ -75,16 +75,25 @@ class _Bilinear(torch.autograd.Function):
         return grad, None, None, None
 
 
-def _forward(codes, uv, triton, tl):
-    seeds, channels, height, width = codes.shape
-    count = uv.shape[0]
-    out = torch.empty(seeds, count, channels, device=codes.device, dtype=codes.dtype)
-    grid = (seeds * count,)
+_KERNEL = None
+
+
+def _kernel(triton, tl):
+    """Build the gather kernel once per process.
+
+    The kernel used to be defined inside ``_forward``, so every call made a
+    new ``JITFunction``. It also called ``tl.math.mod``, which Triton does
+    not have: the first compile raised ``AttributeError`` and the numeric
+    check turned the Triton path off for the whole process.
+    """
+    global _KERNEL
+    if _KERNEL is not None:
+        return _KERNEL
 
     @triton.jit
     def kernel(codes_ptr, uv_ptr, out_ptr, channels, height, width, count, BLOCK: tl.constexpr):
         pid = tl.program_id(0)
-        s = pid // count
+        s = (pid // count).to(tl.int64)
         n = pid % count
         u = tl.load(uv_ptr + n * 2)
         v = tl.load(uv_ptr + n * 2 + 1)
@@ -94,18 +103,24 @@ def _forward(codes, uv, triton, tl):
         y0 = tl.math.floor(y)
         tx = x - x0
         ty = y - y0
-        x0i = tl.math.mod(x0, width)
-        x1i = tl.math.mod(x0 + 1, width)
-        y0i = tl.math.mod(y0, height)
-        y1i = tl.math.mod(y0 + 1, height)
-        # Negative modulo matches torch.remainder for the values we sample.
+        # Floor modulo, as torch.remainder: Triton % on signed ints truncates
+        # toward zero, so a negative remainder gets one divisor added back.
+        xi = x0.to(tl.int64)
+        yi = y0.to(tl.int64)
+        x0i = xi % width
+        x0i = tl.where(x0i < 0, x0i + width, x0i)
+        x1i = (x0i + 1) % width
+        y0i = yi % height
+        y0i = tl.where(y0i < 0, y0i + height, y0i)
+        y1i = (y0i + 1) % height
         offs = tl.arange(0, BLOCK)
         mask = offs < channels
-        base = s * channels * height * width
-        i00 = base + offs * height * width + y0i * width + x0i
-        i01 = base + offs * height * width + y0i * width + x1i
-        i10 = base + offs * height * width + y1i * width + x0i
-        i11 = base + offs * height * width + y1i * width + x1i
+        plane = height * width
+        base = s * channels * plane + offs.to(tl.int64) * plane
+        i00 = base + y0i * width + x0i
+        i01 = base + y0i * width + x1i
+        i10 = base + y1i * width + x0i
+        i11 = base + y1i * width + x1i
         c00 = tl.load(codes_ptr + i00, mask=mask, other=0)
         c01 = tl.load(codes_ptr + i01, mask=mask, other=0)
         c10 = tl.load(codes_ptr + i10, mask=mask, other=0)
@@ -115,8 +130,19 @@ def _forward(codes, uv, triton, tl):
         val = a + (b - a) * ty
         tl.store(out_ptr + (s * count + n) * channels + offs, val, mask=mask)
 
-    block = 16 if channels <= 16 else 32
-    kernel[grid](codes, uv, out, channels, height, width, count, BLOCK=block)
+    _KERNEL = kernel
+    return kernel
+
+
+def _forward(codes, uv, triton, tl):
+    seeds, channels, height, width = codes.shape
+    count = uv.shape[0]
+    codes = codes.contiguous()
+    uv = uv.contiguous()
+    out = torch.empty(seeds, count, channels, device=codes.device, dtype=codes.dtype)
+    grid = (seeds * count,)
+    block = max(16, triton.next_power_of_2(int(channels)))
+    _kernel(triton, tl)[grid](codes, uv, out, channels, height, width, count, BLOCK=block)
     return out
 
 

@@ -234,6 +234,16 @@ def _cover_mip_recompiles(mip_levels: int) -> int:
     current = int(getattr(torch._dynamo.config, "recompile_limit", 8))
     if current < needed:
         torch._dynamo.config.recompile_limit = needed
+    # Each mip sample count records its CUDA graph once and then replays it.
+    # Inductor warns past 8 distinct sizes; the set here is fixed and small.
+    try:
+        import torch._inductor.config as inductor_config
+
+        warn = getattr(inductor_config.triton, "cudagraph_dynamic_shape_warn_limit", None)
+        if warn is not None and int(warn) < needed:
+            inductor_config.triton.cudagraph_dynamic_shape_warn_limit = needed
+    except Exception:
+        pass
     return int(torch._dynamo.config.recompile_limit)
 
 
@@ -354,7 +364,10 @@ def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     wrapped with remainder. The backward sums taps in sorted index order.
     CUDA may use a Triton kernel after a numeric check.
     """
-    if codes.is_cuda and not codes.requires_grad:
+    # Inside torch.compile the eager gather below is what Inductor fuses.
+    # Tracing the Triton path there puts a user kernel and its global
+    # on/off flags into the graph, so only eager calls try it.
+    if codes.is_cuda and not codes.requires_grad and not torch.compiler.is_compiling():
         from ntc.triton_bilinear import try_triton_bilinear
 
         fused = try_triton_bilinear(codes, uv)
