@@ -143,8 +143,8 @@ precise float ntc_acc(float acc, float w, float x) {
 #else
     // NoContraction. This glslang has no denorm or rounding layout, so the
     // device default is what runs. The bench prints those properties.
-    precise float prod = acc * w;
-    return prod + x;
+    precise float prod = w * x;
+    return acc + prod;
 #endif
 }
 
