@@ -48,7 +48,9 @@ sudo apt-get install -y "/tmp/${ROCDXG_DEB}" || {
   sudo apt-get install -y -f
 }
 sudo ldconfig
-if ! find /opt/rocm /usr/lib /usr/local/lib -name 'librocdxg.so*' -print -quit 2>/dev/null | grep -q .; then
+# /opt/rocm is a symlink. find does not descend into a symlink unless -L
+# is set (a trailing slash on the start path has the same effect).
+if ! find -L /opt/rocm/ /usr/lib /usr/local/lib -name 'librocdxg.so*' -print -quit 2>/dev/null | grep -q .; then
   echo "librocdxg.so was not found after installing ${ROCDXG_DEB}"
   exit 1
 fi
@@ -60,11 +62,14 @@ if ! grep -q HSA_ENABLE_DXG_DETECTION "$HOME/.bashrc" 2>/dev/null; then
 fi
 
 python3 -m venv "$ROOT/.venv-wsl"
-# shellcheck disable=SC1091
-source "$ROOT/.venv-wsl/bin/activate"
 if ! grep -q HSA_ENABLE_DXG_DETECTION "$ROOT/.venv-wsl/bin/activate" 2>/dev/null; then
   echo 'export HSA_ENABLE_DXG_DETECTION=1' >> "$ROOT/.venv-wsl/bin/activate"
 fi
+# shellcheck disable=SC1091
+source "$ROOT/.venv-wsl/bin/activate"
+# libhsa reads this when torch loads it. Set it again here so a later
+# import cannot run with the variable unset.
+export HSA_ENABLE_DXG_DETECTION=1
 python -m pip install --upgrade pip wheel
 python -m pip install numpy pillow
 # torch 2.9.1+rocm6.4 from download.pytorch.org. The repo.radeon.com
@@ -81,7 +86,8 @@ python -m pip install \
 
 # Drop every libhsa-runtime64 the wheel unpacked. The dynamic linker then
 # uses the system libhsa, which is the one that loads librocdxg.
-TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
+export HSA_ENABLE_DXG_DETECTION=1
+TORCH_LIB="$(python -c 'import os; os.environ["HSA_ENABLE_DXG_DETECTION"] = "1"; import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
 mapfile -t HSA_BUNDLED < <(find "$TORCH_LIB" -name 'libhsa-runtime64.so*' -print)
 if ((${#HSA_BUNDLED[@]})); then
   rm -f "${HSA_BUNDLED[@]}"
@@ -97,7 +103,10 @@ fi
 echo "system libhsa-runtime64:"
 ldconfig -p | grep 'libhsa-runtime64' || echo "warning: ldconfig has no libhsa-runtime64"
 
+export HSA_ENABLE_DXG_DETECTION=1
 python - << 'PY'
+import os
+os.environ["HSA_ENABLE_DXG_DETECTION"] = "1"
 import torch
 print("torch", torch.__version__)
 print("hip", getattr(torch.version, "hip", None))
@@ -120,5 +129,8 @@ PY
 
 echo "venv: $ROOT/.venv-wsl"
 echo "If this user was just added to render and video, open a new shell before training."
-echo "Next: source .venv-wsl/bin/activate && export PYTHONPATH=src:. && export HSA_ENABLE_DXG_DETECTION=1"
-echo "Then: python bench/train_max_v2.py --workers 3 --out results/train_max_v2 --materials data/materials --probe-steps 400"
+echo "Next: source .venv-wsl/bin/activate"
+echo "Then: export HSA_ENABLE_DXG_DETECTION=1"
+echo "      export PYTHONPATH=src:."
+echo "      python bench/train_max_v2.py --workers 3 --out results/train_max_v2 --materials data/materials --probe-steps 400"
+echo "Set HSA_ENABLE_DXG_DETECTION before Python starts. torch.cuda.is_available() stays false if the variable is set after import torch."
