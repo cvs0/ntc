@@ -152,6 +152,10 @@ class TrainConfig:
     # Fast path only. When set, a Laplace rate above ``target_bpp`` is added
     # to the loss. encode_arrays does not read it.
     entropy_rate: bool = False
+    # Fast path only. Uniform noise for 70 percent of the steps, hard
+    # rounding until 95 percent, then the latents are frozen and the MLP
+    # trains on the rounded codes. encode_arrays does not read it.
+    quant_schedule: bool = False
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

@@ -402,7 +402,11 @@ class StackedTrain(nn.Module):
             kind = lat.device.type if lat.device.type in ("cuda", "cpu", "mps") else "cpu"
             with torch.autocast(device_type=kind, enabled=False):
                 scale = fp16_round(torch.exp(self.log_scales[i].float()).clamp(1e-4, 5.0))
-            if self.quantize:
+            proxy = getattr(self, "latent_proxy", "ste")
+            if proxy == "noise":
+                deq = (lat + (torch.rand_like(lat) - 0.5) - mid) * scale[:, :, None, None]
+                code = None
+            elif self.quantize:
                 q = torch.round(lat).clamp(0, qmax)
                 q_ste = lat + (q - lat).detach()
                 deq = (q_ste - mid) * scale[:, :, None, None]
@@ -904,6 +908,32 @@ def _loss_from_mips(
         stacked._mip_ready = None
 
 
+def _drop_latent_grads(stacked: StackedTrain, opt: torch.optim.Optimizer) -> None:
+    if not getattr(stacked, "freeze_latents", False):
+        return
+    for group in opt.param_groups:
+        if group.get("name") != "latent":
+            continue
+        for param in group["params"]:
+            param.grad = None
+
+
+def _sync_quant_schedule(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
+    """Noise, then hard codes, then a short MLP-only tail."""
+    if not cfg.quant_schedule or int(cfg.steps) <= 0:
+        return
+    frac = float(step + 1) / float(cfg.steps)
+    if frac <= 0.70:
+        stacked.latent_proxy = "noise"
+        stacked.freeze_latents = False
+    elif frac <= 0.95:
+        stacked.latent_proxy = "ste"
+        stacked.freeze_latents = False
+    else:
+        stacked.latent_proxy = "ste"
+        stacked.freeze_latents = True
+
+
 def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
     """``qat_late`` holds both STEs off until 70% of the run, then enables them."""
     if not cfg.qat_late:
@@ -1085,6 +1115,7 @@ def _run_loop(
         if apply_lr:
             _group_lr(step)
         _sync_step_qat(stacked, cfg, step)
+        _sync_quant_schedule(stacked, cfg, step)
         if cfg.coarse_to_fine:
             from ntc.train_steps import coarse_lowpass
 
@@ -1104,6 +1135,7 @@ def _run_loop(
             scaler = getattr(one_step, "scaler", None)
             if scaler is not None:
                 scaler.scale(loss).backward()
+                _drop_latent_grads(stacked, opt)
                 scaler.unscale_(opt)
                 _clip_no_sync(params, 1.0, skip_count)
                 scaler.step(opt)
@@ -1111,6 +1143,7 @@ def _run_loop(
                 _clamp_latents(stacked)
                 return loss
         loss.backward()
+        _drop_latent_grads(stacked, opt)
         if cfg.optimizer == "shampoo":
             from ntc.train_steps import shampoo_precondition
 
@@ -1165,10 +1198,12 @@ def _run_loop(
                 def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
                     _group_lr(step)
                     _sync_step_qat(stacked, cfg, step)
+                    _sync_quant_schedule(stacked, cfg, step)
                     opt.zero_grad(set_to_none=True)
                     per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
                     loss = per.sum()
                     loss.backward()
+                    _drop_latent_grads(stacked, opt)
                     if cfg.optimizer == "shampoo":
                         from ntc.train_steps import shampoo_precondition
 
@@ -1931,6 +1966,7 @@ def encode_arrays_fast(
         "checkpoint": kept,
         "psnr_u8_init": init_psnr,
         "psnr_u8_trained": trained_psnr,
+        "psnr_u8_loop": float(scores[winner]),
         "stopped_early": stopped_early,
         # The loop score is a live quantized forward. The file score is the
         # decoded 8-bit image. On b10 those two were 12.67 and 33.07. Report

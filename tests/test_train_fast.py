@@ -707,6 +707,33 @@ def test_w8_shaped_runs_do_not_ship_a_collapse():
         assert isinstance(stats["lr_rewinds"], int)
 
 
+def test_quant_schedule_file_stays_near_the_loop():
+    rng = np.random.default_rng(5)
+    img = rng.random((3, 16, 16), dtype=np.float32)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=40,
+            hidden=(8,),
+            grids=[(8, 8, 4, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=1,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            quant_schedule=True,
+            target_bpp=4.0,
+        ),
+    )
+    assert abs(float(stats["metrics"]["psnr_u8"]) - float(stats["psnr_u8_loop"])) < 0.1
+
+
 def test_same_seed_exports_the_same_bytes():
     import hashlib
 
