@@ -29,6 +29,9 @@ def encode_main(argv: list[str] | None = None) -> None:
     p.add_argument("--adaptive-pool", type=int, default=8)
     p.add_argument("--seed-pool", type=int, default=4)
     p.add_argument("--stats", type=Path, default=None)
+    p.add_argument("--no-deflate", action="store_true")
+    p.add_argument("--mip-levels", type=int, default=4)
+    p.add_argument("--mip-loss", default="footprint", choices=("geom", "footprint", "uniform"))
     args = p.parse_args(argv)
     images, sems, info = load_material(args.material, args.size)
     hidden = tuple(int(x) for x in args.hidden.split(",") if x.strip() != "")
@@ -40,6 +43,9 @@ def encode_main(argv: list[str] | None = None) -> None:
         seed=args.seed,
         adaptive_pool=args.adaptive_pool,
         seed_pool=args.seed_pool,
+        latent_deflate=not args.no_deflate,
+        mip_levels=args.mip_levels,
+        mip_loss=args.mip_loss,
     )
     blob, stats = encode_arrays(images, sems, cfg)
     args.output.write_bytes(blob)

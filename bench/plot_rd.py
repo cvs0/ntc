@@ -17,14 +17,28 @@ def main() -> None:
     blocks = json.loads(Path("results/blocks_metal_plate_256.json").read_text())["codecs"]
     ntc = [r for r in auto if r["material"] == "metal_plate" and r["tag"].startswith("auto_h32")]
     ntc.sort(key=lambda r: r["total_bpp"])
+    round2_path = Path("results/rd_round2.json")
+    round2 = []
+    if round2_path.is_file():
+        raw = json.loads(round2_path.read_text())["rows"]
+        round2 = [r for r in raw if r["material"] == "metal_plate" and r["tag"].startswith("auto_h32")]
+        round2.sort(key=lambda r: r["total_bpp"])
     fig, ax = plt.subplots(figsize=(7.2, 4.4), dpi=140)
     ax.plot(
         [r["total_bpp"] for r in ntc],
         [r["psnr_u8"] for r in ntc],
         "o-",
         color="#1f4e79",
-        label="NTC1 shipped encoder",
+        label="NTC1, plain latent, 40 steps",
     )
+    if round2:
+        ax.plot(
+            [r["total_bpp"] for r in round2],
+            [r["psnr_u8"] for r in round2],
+            "o-",
+            color="#c45911",
+            label="NTC1, deflate + footprint mips",
+        )
     ax.plot(
         [r["total_bpp"] for r in old],
         [r["psnr_u8"] for r in old],

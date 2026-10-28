@@ -55,6 +55,53 @@ def bilinear_codes_torch(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     return a + (b - a) * ty
 
 
+def bilinear_tiled_torch(
+    codes: torch.Tensor,
+    uv: torch.Tensor,
+    scale: torch.Tensor,
+    offset: torch.Tensor,
+    tile: int,
+    mid: float,
+    mip: int,
+) -> torch.Tensor:
+    """Dequantize each tap with the tile endpoint, then lerp. ``codes`` is ``[C,H,W]``."""
+    c, h, w = codes.shape
+    nty, ntx = scale.shape[1], scale.shape[2]
+    x = uv[:, 0] * w - 0.5
+    y = uv[:, 1] * h - 0.5
+    x0 = torch.floor(x)
+    y0 = torch.floor(y)
+    tx = (x - x0).unsqueeze(1)
+    ty = (y - y0).unsqueeze(1)
+    x0i = x0.to(torch.long)
+    y0i = y0.to(torch.long)
+    x0w = torch.remainder(x0i, w)
+    x1w = torch.remainder(x0i + 1, w)
+    y0w = torch.remainder(y0i, h)
+    y1w = torch.remainder(y0i + 1, h)
+    plane = codes.reshape(c, h * w)
+    shift = int(mip)
+
+    def deq(yy, xx):
+        idx = yy * w + xx
+        code = plane[:, idx].T
+        ox = xx.to(torch.long) << shift
+        oy = yy.to(torch.long) << shift
+        sx = torch.clamp(torch.div(ox, tile, rounding_mode="floor"), max=ntx - 1)
+        sy = torch.clamp(torch.div(oy, tile, rounding_mode="floor"), max=nty - 1)
+        s = scale[:, sy, sx].T
+        o = offset[:, sy, sx].T
+        return (code - mid) * s + o
+
+    c00 = deq(y0w, x0w)
+    c01 = deq(y0w, x1w)
+    c10 = deq(y1w, x0w)
+    c11 = deq(y1w, x1w)
+    a = c00 + (c01 - c00) * tx
+    b = c10 + (c11 - c10) * tx
+    return a + (b - a) * ty
+
+
 def _soft_box(values: torch.Tensor) -> torch.Tensor | None:
     """Differentiable 2x2 mean with the same crop as ``integer_box``."""
     c, h, w = values.shape
@@ -132,6 +179,8 @@ class NtcNet(nn.Module):
         activation_requant: bool,
         qat_latents: bool,
         qat_weights: bool,
+        tile_size: int = 0,
+        layer_bits: tuple = (),
     ):
         super().__init__()
         self.activation = activation
@@ -139,6 +188,8 @@ class NtcNet(nn.Module):
         self.pe_octaves = pe_octaves
         self.weight_bits = weight_bits
         self.group_size = group_size
+        self.tile_size = int(tile_size)
+        self.layer_bits = tuple(layer_bits)
         self.quant_proxy = quant_proxy
         self.activation_requant = activation_requant
         self.qat_latents = qat_latents
@@ -148,13 +199,26 @@ class NtcNet(nn.Module):
         self.grid_shapes = []
         latents = []
         log_scales = []
+        tile_logs = []
+        tile_offs = []
+        self._tile_param_of = []
         for gw, gh, ch, bits in grids:
             latents.append(nn.Parameter(torch.zeros(ch, gh, gw)))
             log_scales.append(nn.Parameter(torch.full((ch,), math.log(0.1))))
             self.grid_bits.append(bits)
             self.grid_shapes.append((gw, gh, ch, bits))
+            nty = math.ceil(gh / self.tile_size) if self.tile_size >= 2 else 0
+            ntx = math.ceil(gw / self.tile_size) if self.tile_size >= 2 else 0
+            if self.tile_size >= 2 and (gw > self.tile_size or gh > self.tile_size):
+                tile_logs.append(nn.Parameter(torch.full((ch, nty, ntx), math.log(0.1))))
+                tile_offs.append(nn.Parameter(torch.zeros(ch, nty, ntx)))
+                self._tile_param_of.append(len(tile_logs) - 1)
+            else:
+                self._tile_param_of.append(-1)
         self.latents = nn.ParameterList(latents)
         self.log_scales = nn.ParameterList(log_scales)
+        self.tile_log_scales = nn.ParameterList(tile_logs)
+        self.tile_offsets = nn.ParameterList(tile_offs)
         in_f = sum(g[2] for g in grids) + pe_feature_count(pe_mode, pe_octaves)
         dims = [in_f, *hidden, image_channels]
         self.linears = nn.ModuleList(
@@ -195,12 +259,17 @@ class NtcNet(nn.Module):
         deq = (q_ste - mid) * scale
         return deq, q.detach().to(torch.int64), scale
 
-    def _weight(self, linear: nn.Linear):
+    def layer_weight_bits(self, index: int) -> int:
+        if self.layer_bits:
+            return int(self.layer_bits[index])
+        return self.weight_bits
+
+    def _weight(self, linear: nn.Linear, index: int):
         w = linear.weight
         b = fp16_round(linear.bias)
         if not self.qat_weights:
             return w, b
-        ste, _codes, _scales = quantize_weight(w, self.weight_bits, self.group_size)
+        ste, _codes, _scales = quantize_weight(w, self.layer_weight_bits(index), self.group_size)
         return ste, b
 
     def positional(self, uv: torch.Tensor, mip: int, max_mip: int) -> torch.Tensor:
@@ -228,9 +297,47 @@ class NtcNet(nn.Module):
             cols.extend([lod, lod])
         return torch.stack(cols, dim=1)
 
+    def _sample_tiled(self, index: int, ti: int, uv: torch.Tensor, mip: int) -> torch.Tensor:
+        bits = self.grid_bits[index]
+        z = self.latents[index]
+        mid = float((1 << bits) - 1) / 2.0
+        qmax = (1 << bits) - 1
+        scale = fp16_round(torch.exp(self.tile_log_scales[ti]).clamp(1e-4, 5.0))
+        offset = fp16_round(self.tile_offsets[ti].clamp(-2.0, 2.0))
+        q = torch.round(z).clamp(0, qmax)
+        if not self.qat_latents:
+            q_ste = z
+        elif self.training and self.quant_proxy == "noise":
+            q_ste = z + (torch.rand_like(z) - 0.5)
+        else:
+            q_ste = z + (q - z).detach()
+        _c, h, w = q_ste.shape
+        ys = torch.arange(h, device=z.device)
+        xs = torch.arange(w, device=z.device)
+        sy = torch.clamp(torch.div(ys, self.tile_size, rounding_mode="floor"), max=scale.shape[1] - 1)
+        sx = torch.clamp(torch.div(xs, self.tile_size, rounding_mode="floor"), max=scale.shape[2] - 1)
+        value = (q_ste - mid) * scale[:, sy[:, None], sx[None, :]] + offset[:, sy[:, None], sx[None, :]]
+        if mip <= 0:
+            return bilinear_codes_torch(value, uv)
+        chain = mip_chain_from_codes(q.detach(), mip + 1)
+        k = min(mip, len(chain) - 1)
+        fwd = bilinear_tiled_torch(chain[k].float(), uv, scale, offset, self.tile_size, mid, k)
+        soft = value
+        for _ in range(k):
+            nxt = _soft_box(soft)
+            if nxt is None:
+                break
+            soft = nxt
+        soft_s = bilinear_codes_torch(soft, uv)
+        return fwd.detach() + soft_s - soft_s.detach()
+
     def features(self, uv: torch.Tensor, mip: int, max_mip: int) -> torch.Tensor:
         parts = []
         for i in range(len(self.latents)):
+            ti = self._tile_param_of[i]
+            if ti >= 0:
+                parts.append(self._sample_tiled(i, ti, uv, mip))
+                continue
             deq, code, scale = self.quant_grid(i)
             bits = self.grid_bits[i]
             mid = float((1 << bits) - 1) / 2.0
@@ -269,7 +376,7 @@ class NtcNet(nn.Module):
         h = x
         last = len(self.linears) - 1
         for i, lin in enumerate(self.linears):
-            w, b = self._weight(lin)
+            w, b = self._weight(lin, i)
             y = F.linear(h, w, b)
             if i != last:
                 y = _activate(y, self.activation, self.activation_requant)

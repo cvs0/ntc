@@ -23,6 +23,9 @@ constexpr int kMaxMips = 8;
 
 constexpr uint32_t kFlagDerivedMips = 1u << 0;
 constexpr uint32_t kFlagActivationRequant = 1u << 1;
+// Raw deflate (window -15) of the latent region. data_offset is then
+// relative to the inflated bytes. Header u32 at offset 84 is that length.
+constexpr uint32_t kFlagLatentDeflate = 1u << 2;
 
 constexpr int kActIdentity = 0;
 constexpr int kActRelu = 1;
@@ -65,6 +68,7 @@ struct Layer {
     std::vector<float> weight;  // [out, in] integer codes as float
     std::vector<float> bias;    // [out]
     std::vector<float> scale;   // [out, groups] row-major
+    uint32_t weight_bits = 0;   // 0 means the header value
 };
 
 struct TextureSet {
@@ -81,6 +85,10 @@ struct TextureSet {
     std::vector<Grid> grids;
     std::vector<Layer> layers;
     std::vector<uint8_t> raw;
+    uint32_t tile_size = 0;
+    uint32_t latent_stored_bytes = 0;
+    uint32_t latent_plain_bytes = 0;
+    uint32_t scale_stored_bytes = 0;
 
     int num_channels() const { return static_cast<int>(channels.size()); }
     bool activation_requant() const { return (flags & kFlagActivationRequant) != 0; }

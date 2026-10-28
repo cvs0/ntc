@@ -86,3 +86,43 @@ def test_apply_layer_group_scale():
     # group1: (3*1 + 4*1) * 0.2 = 1.4
     # + bias 0.5
     np.testing.assert_allclose(y, [[2.0]], atol=1e-6)
+
+
+def test_tiled_forward_matches_reference():
+    import math
+
+    import torch
+
+    from ntc.encode import export_network
+    from ntc.model import NtcNet
+
+    torch.manual_seed(1)
+    net = NtcNet(
+        image_channels=2,
+        grids=[(8, 8, 2, 4)],
+        hidden=(4,),
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        weight_bits=8,
+        group_size=0,
+        quant_proxy="ste",
+        activation_requant=False,
+        qat_latents=True,
+        qat_weights=True,
+        tile_size=4,
+    )
+    net.latents[0].data.uniform_(0, 15)
+    net.tile_log_scales[0].data.fill_(math.log(0.08))
+    net.tile_offsets[0].data.uniform_(-0.2, 0.2)
+    net.eval()
+    blob = export_network(net, [0, 1], 8, 8, 2)
+    ts = parse_texture_set(blob)
+    ref = decode_mip(ts, 0)
+    ys = torch.arange(8)
+    xs = torch.arange(8)
+    yg, xg = torch.meshgrid(ys, xs, indexing="ij")
+    uv = torch.stack(((xg.reshape(-1) + 0.5) / 8, (yg.reshape(-1) + 0.5) / 8), 1)
+    with torch.no_grad():
+        pred = net(uv, 0, 1).reshape(8, 8, 2).numpy()
+    np.testing.assert_allclose(pred, ref, atol=2e-4)

@@ -25,7 +25,7 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 32 | u16 | pe_octaves |
 | 34 | u16 | weight_bits |
 | 36 | u16 | group_size |
-| 38 | u16 | reserved |
+| 38 | u16 | tile_size. 0 is one fp16 scale per latent channel. Nonzero is a Python-only per-tile endpoint map. The C++ reader throws if it is not 0. |
 | 40 | u32 | channel_off |
 | 44 | u32 | grid_off |
 | 48 | u32 | layer_off |
@@ -37,10 +37,10 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 72 | u32 | scale_bytes |
 | 76 | u32 | crc32 |
 | 80 | u32 | file_bytes |
-| 84 | u32 | reserved |
+| 84 | u32 | inflated latent bytes when flag bit 2 is set, otherwise 0 |
 | 88 | u64 | reserved |
 
-Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files.
+Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the deflate stream. The inflated size is the inference working set.
 
 Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserved`.
 
@@ -57,7 +57,7 @@ Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserve
 
 Grid record, 24 bytes: `u16 width, u16 height, u8 channels, u8 bits, u16 row_stride, u32 data_off, u32 data_bytes, u32 scale_off, u32 plane_bytes`.
 
-Layer record, 32 bytes: `u16 in, u16 out, u32 weight_off, u32 weight_bytes, u32 bias_off, u32 scale_off, u16 group_size, u16 num_groups, u32 reserved, u32 reserved`.
+Layer record, 32 bytes: `u16 in, u16 out, u32 weight_off, u32 weight_bytes, u32 bias_off, u32 scale_off, u16 group_size, u16 num_groups, u32 weight_bits, u32 reserved`. `weight_bits == 0` means the header value. A mixed int8/int4 file stores 8 or 4 per matrix. Old files have 0 there and still decode.
 
 Limits: 8 grids, 4 layers, 16 channels, hidden width 64, 160 input features, 8 mips.
 
@@ -229,9 +229,9 @@ Filtered sampling:
 ntc_eval_filtered(uv, dudx, dudy, lod, frame, /*filt*/ 1u, /*maxAniso*/ 8u);
 ```
 
-`examples/vulkan/main.cpp`: `ntc_vk file.ntc spv_dir`. Prefers a discrete GPU, then integrated, then CPU. Runs the fp32 compute shader and compares to `ntc::decode_mip` with tolerance `1e-3`. If `shaderFloat16` is set, it also runs `ntc_decompress_fp16.comp`. Cooperative matrix is queried and ignored.
+`examples/vulkan/main.cpp`: `ntc_vk file.ntc spv_dir [--device index|name] [--bench outdir] [--warmup N] [--iters N] [--bc7 file] [--bc1 file] [--bc5 file]`. Prints `device_count`, one `device_list` line per physical device (index, name, vendor, device id, type), then the selected device's name, vendor id, device id, raw driver version, API version, and subgroup size. Selection is the integer index or a case-insensitive name substring when `--device` is set, otherwise discrete, then integrated, then CPU. The fp32 compute shader is compared to `ntc::decode_mip` with tolerance `1e-3`. If `shaderFloat16` is set, it also runs `ntc_decompress_fp16.comp`. Cooperative matrix is queried and ignored. `--bench` times inference-on-load (every mip) and inference-on-sample at the texture size, 1920x1080, and 3840x2160 with `vkCmdWriteTimestamp`, after warmup submits. Median and p95 are printed with texels/s and GB/s of the written output. A CPU device skips resolutions above 512 and tags every row `not_a_performance_claim`. Optional `--bc7`, `--bc1`, and `--bc5` are NTCB files (`bench/bc_pack.py`): sampled at the same resolutions. The host writes `vk_ntc_fp32.f32` and, when the file has at least six channels, `vk_lit_fp32.f32`.
 
-`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir`. Surfaceless EGL. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. Context 4.6, then 4.5. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`.
+`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir` with the same `--bench`, `--warmup`, `--iters`, and block-file flags. Linux uses a surfaceless EGL context. Windows creates a hidden window and a core-profile WGL context (`wglCreateContextAttribsARB`, 4.6 then 4.5) and loads GL entry points with `wglGetProcAddress`. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`. `--bench` uses `GL_TIME_ELAPSED`. There is no fp16 GL decode path. A renderer string containing llvmpipe, softpipe, or swiftshader is tagged `not_a_performance_claim` and skips resolutions above 512. Readbacks are `gl_ntc_fp32.f32` and `gl_lit_fp32.f32`.
 
 CPU reference: `ntc_decode file.ntc out.f32 [--mip N]`.
 
@@ -249,7 +249,9 @@ Required path: Vulkan 1.3 or OpenGL 4.5, storage buffers, fp32. No `GL_NV_*`, no
 
 Subgroup size is whatever the device reports. This tree does not branch on 32 vs 64. A wave64 device runs the same fp32 dot.
 
-Encoder device: `torch.cuda.is_available()` covers CUDA and ROCm. A ROCm build sets `torch.version.hip` and still uses the `cuda` device API. `device_report` labels that backend `rocm`. There is no CUDA-only op. CPU is the fallback. ROCm is a PyTorch ROCm wheel from pytorch.org. This VM has the CPU wheel `2.14.1+cpu`.
+Encoder device order for `auto`: CUDA, then ROCm, then DirectML, then CPU. CUDA and ROCm both report `torch.cuda`. A ROCm build sets `torch.version.hip` and still uses the `cuda` device API, including AMD's Windows ROCm wheels. `device_report` labels that backend `rocm` or `cuda`. DirectML is the `torch_directml` package (`privateuseone`); pass `--device directml` to force it. There is no CUDA-only op. This VM has the CPU wheel `2.14.1+cpu`.
+
+RX 9070 is gfx1201. The Windows wheel that lists it is ROCm 7.2.1, torch 2.9.1, Python 3.12. AMD's install page names Adrenalin 26.2.2 as the driver for those wheels. A WDDM driver version such as `32.0.32015.7029` is a different numbering scheme; this tree does not claim they match. If `torch.cuda.is_available()` is false after the install, use the DirectML fallback. The commands are in `bench/train_sweep.ps1`. Do not install a separate torch into the DirectML venv first: current `torch-directml` 0.2.5.dev240914 pins `torch==2.4.1`.
 
 ## Encoder
 
@@ -259,7 +261,7 @@ Initialization is coarse-to-fine PCA of the residual into each grid, then a leas
 
 Loss is mean squared error. Channel weights and a normal-cosine term exist and are off by default.
 
-Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`.
+Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_deflate = true`, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them.
 
 ## Measurements
 
@@ -285,7 +287,7 @@ Block codecs on metal_plate resized to 256 with a box filter. BC7 is `bc7enc -l 
 
 Chart: `results/rd_metal_plate_256.png`.
 
-At 16.084 bpp the shipped network is grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, 480 MACs, 1122 flops. Per-channel 8-bit PSNR: albedo 37.018, normal 39.459, roughness 37.525, metalness 31.595, ao 32.293. Normal angle 1.769 degrees. Against the 16 bpp block bundle that is +2.550 dB PSNR and +0.0216 SSIM. It does not beat ASTC 6x6 (38.275 dB at 17.778 bpp) or per-texture BC7 (44.867 dB at 40 bpp). At 10 bpp it does not beat ASTC 8x8 (32.174 vs 34.072).
+At 16.084 bpp the network from the table above is grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, 480 MACs, 1122 flops, plain latents, mip 0 loss. Per-channel 8-bit PSNR: albedo 37.018, normal 39.459, roughness 37.525, metalness 31.595, ao 32.293. Normal angle 1.769 degrees. Against the 16 bpp block bundle that is +2.550 dB PSNR and +0.0216 SSIM. It does not beat ASTC 6x6 (38.275 dB at 17.778 bpp) or per-texture BC7 (44.867 dB at 40 bpp). The dedicated 10 bpp grids do not beat ASTC 8x8 (32.174 vs 34.072). Deflate of that same 16 bpp file is a different rate point and is in the next section.
 
 The linear network on the same grids keeps the PCA initialization (40 Adam steps scored 34.348 dB and were discarded). 54 MACs, 174 flops, 90 weight bytes. It is +1.192 dB PSNR over the 16 bpp bundle and -0.0077 SSIM.
 
@@ -347,6 +349,44 @@ Seed 0 to the four-seed pool on those grids is +0.509 dB and +0.0143 SSIM. The o
 
 Same-grid hidden 32 vs linear at seed 0 is +0.849 dB and +0.0150 SSIM for 480 MACs instead of 54. The shipped seed is a further +0.509 dB on the hidden network. The linear result does not depend on the hidden-layer seed.
 
+### Deflate and footprint mips
+
+Same machine, torch 2.14.1+cpu. `results/round2_vm.json` is a locked-grid ablation: metal_plate 256, grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, weighting off, one seed. `results/rd_round2.json` is the automatic selector with deflate and footprint loss on, pool 8, four trained seeds, 40 steps. Chart: `results/rd_metal_plate_256.png` plots both NTC series. Block-codec rows were not recomputed.
+
+Raw deflate (`level 9`, `wbits -15`) does not change the decoded image. On the locked 40-step network, plain bpp 16.084 becomes 9.756 at the same 35.749 dB. PavingStones070 on the same grids goes from 16.084 bpp to 9.094 bpp at the same 31.688 dB. The inflated latent is 131104 bytes in both files. That is what the GPU upload expands.
+
+Footprint loss on four mips, same locked metal network, 40 steps: mip 0 35.892 dB (+0.143 vs the mip-0-only 35.749), mip 1 35.254 vs 34.843, mip 2 34.382 vs 33.920. Deflate of that file is 9.760 bpp at the same 35.892 dB. The automatic selector picks the same grids and seed 3: `results/rd_round2.json` metal target 16 is 35.892 dB, SSIM 0.9499, 9.760 bpp. Paving target 16 is 31.693 dB, SSIM 0.9096, 9.113 bpp, seed 0.
+
+Those two operating points beat ASTC 8x8 (metal 34.072 dB at 10.000 bpp, paving 30.981 dB at 10.000 bpp) on rate and on PSNR. They do not beat ASTC 6x6 (metal 38.275 dB at 17.778 bpp, paving 33.727 dB at 17.778 bpp).
+
+More Adam steps on the locked metal grids, mip 0 loss, cosine decay already in the loop:
+
+| steps | PSNR | deflate bpp | delta vs 40 steps | train seconds |
+| --- | --- | --- | --- | --- |
+| 40 | 35.749 | 9.756 | 0 | 0.74 |
+| 80 | 36.137 | 9.820 | +0.388 | 1.10 |
+| 160 | 36.140 | 9.904 | +0.391 | 2.31 |
+| 320 | 36.446 | 10.123 | +0.697 | 4.58 |
+| 800 | 37.049 | 10.517 | +1.299 | 10.71 |
+
+The 320 to 800 step is still +0.603 dB. 37.049 is 1.226 dB under ASTC 6x6. 2000 and 4000 steps are in `bench/train_sweep.py` and have not been measured. Paving at 160 steps is 31.858 dB (+0.170) at deflate 9.455 bpp, still under ASTC 6x6.
+
+Automatic selector, deflate and footprint, 40 steps (`results/rd_round2.json`):
+
+| material | target | bpp | PSNR | SSIM | checkpoint |
+| --- | --- | --- | --- | --- | --- |
+| metal_plate | 4 | 3.603 | 28.389 | 0.7736 | trained |
+| metal_plate | 8 | 5.594 | 31.621 | 0.8523 | trained |
+| metal_plate | 10 | 7.340 | 32.168 | 0.8606 | init |
+| metal_plate | 12 | 8.416 | 32.183 | 0.8660 | trained |
+| metal_plate | 16 | 9.760 | 35.892 | 0.9499 | trained |
+| metal_plate linear, target 16 | 16 | 9.703 | 34.627 | 0.9175 | trained |
+| PavingStones070 | 8 | 4.672 | 28.120 | 0.8272 | trained |
+| PavingStones070 | 10 | 6.463 | 29.366 | 0.8484 | trained |
+| PavingStones070 | 16 | 9.113 | 31.693 | 0.9096 | trained |
+
+The dedicated 10 bpp grids, deflated, are 32.168 dB at 7.340 bpp on metal and 29.366 dB at 6.463 bpp on paving. Both are under ASTC 8x8. The deflated 16 bpp network is the better point near 10 bpp.
+
 ## Negative results
 
 Kept off, with the delta above:
@@ -366,6 +406,18 @@ Kept off, with the delta above:
 - Fusing latent scales into the int8 matrix. Not exact. Not implemented.
 - A subgroup or quad GEMV split of one texel. The MLP is 480 MACs. The shader stays one thread per texel. The 8x8 unique-byte count is analytical only.
 
+Same locked 256 grids, seed 3, measured in `results/round2_vm.json`. Deltas are against the 40-step int8 ReLU mip-0 network at 35.749 dB unless a same-step comparison is named. None of these are the default.
+
+- int4, one scale per row, QAT already on: 29.773 dB (-5.976). Group 16: 32.177 dB (-3.572). The same row quantizer at 160 steps is 31.971 dB against the 160-step int8 network at 36.140 dB (-4.169). The earlier -0.576 dB was the 128 locked grid. It does not carry to these grids. int4 stays off. The rate saving is about 0.03 bpp.
+- Hidden 64-32. At 40 steps the export keeps the initialization, 34.801 dB (-0.948) at 16.389 bpp. At 160 steps, 34.820 dB against 36.140 dB for hidden 32. Mixed int8/int4/int8 on the three matrices of 64-32 stays on the initialization at 34.467 dB at 40 and at 160 steps.
+- Fourier, 1 octave: 31.984 dB at 40 steps, 34.172 dB at 160 steps (against 36.140). Triangle, 3 octaves: 28.531 dB and 29.433 dB.
+- Hard GELU: 35.561 dB at 40 steps (-0.188). At 160 steps, 36.036 dB against 36.140 for ReLU. Activation requant stays on the initialization at 33.978 dB at 40 and at 160 steps (-1.771).
+- Third grid `256x256x4@4`, `64x64x2@4`, `8x8x2@2`: 35.316 dB at 40 steps (-0.434), 35.233 dB at 160 steps.
+- Mip curriculum (footprint, mip 0 only for the first half of 40 steps): mip 0 35.683 dB (-0.066). Not adopted. `geom` weights on four mips are +0.060 dB at mip 0, less than footprint.
+- Per-tile endpoints. Tile 32 at 40 steps is +0.184 dB at plain 16.208 bpp (deflate 9.896). Tile 16 at 40 steps is +0.263 dB at deflate 10.257 bpp. Tile 16 at 160 steps is 36.435 dB at deflate 10.450 bpp, under the 320-step untiled network (36.446 dB at deflate 10.123 bpp). The C++ reader rejects `tile_size != 0`, so these files are not on the GPU path.
+- Paving tile 16 at 40 steps is 31.747 dB against 31.688 dB, at a higher bpp. Not adopted.
+- Dedicated 10 bpp grids at 40 steps stay at 32.174 dB (deflate 7.393 bpp) on metal and 29.218 dB (deflate 6.505 bpp) on paving. 160 steps on metal reaches 32.251 dB. Still under ASTC 8x8.
+
 ## Correctness on this VM
 
 CPU reference vs the Python decoder on `tests/fixtures/tiny.ntc`: max abs 1.490e-8 at mip 0 and 3.725e-9 at mip 1.
@@ -378,13 +430,39 @@ OpenGL 4.5 llvmpipe, compute and fragment vs the CPU reference: max abs 0. `GL_K
 
 ## What is pending hardware
 
-- GPU milliseconds on AMD and NVIDIA, for inference-on-sample and inference-on-load. Lavapipe numbers stay correctness-only.
-- Official RTXNTC `ntc-cli` PSNR and encode time at matched bpp. Compression needs an NVIDIA Turing-or-newer GPU and CUDA. Decompression of an existing file can pass `--no-coopVec` on other vendors. `bench/gpu_bench.py` records the skip reason and does not fail the run. `bench/compare_runs.py` prints two result files side by side.
-- CUDA and ROCm encode times. The encoder will use those devices when `torch.cuda.is_available()` is true. This VM is CPU only.
+No GPU timing from this VM is a performance number. Lavapipe and llvmpipe rows are tagged `not_a_performance_claim` and the hosts skip 1920x1080 and 3840x2160 on a CPU device. Correctness on this VM is in the section above.
+
+Training sweep, from the repository root. On Windows, install the torch build first (`bench/train_sweep.ps1` has the RX 9070 ROCm 7.2.1 commands and the DirectML fallback), then:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\train_sweep.ps1
+```
+
+Linux, including a machine that already has a CUDA or ROCm torch:
+
+```sh
+sh bench/train_sweep.sh
+```
+
+Writes `results/train_sweep/` (`device.json`, `manifest.json`, one `.json` and one `.ntc` per job). Copy that directory back. Jobs: locked 16 bpp grids at 800 steps with mip 0 loss (the CPU cross-check; this VM measured 37.049 dB and 10.71 s of train), the same grids at 2000 and 4000 steps with footprint loss for metal and paving, locked 10 bpp grids at 2000 steps for both materials, and one metal run with pool 8 and eight seeds at 80 steps. A finished `.json` is skipped on a second run. CPU scaling from the measured 40-step and 800-step times puts the sweep near 15 minutes of train on this 4-thread CPU. The GPU wall time is whatever `device.json` and the per-job `wall_s` fields say after the run.
+
+Decode benchmark and screenshots:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
+```
+
+```sh
+sh bench/run_all.sh
+```
+
+`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (Ninja, or the VS 2022 generator if Ninja configure fails), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. ASTC panels are skipped unless `astcenc` is on `PATH`; the skip reason is in the report. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
+
+The 2000-step and 4000-step rows, and every millisecond in `results/hw/`, stay out of this file until those directories are measured.
 
 ## Limitations
 
-The 10 bpp point loses to ASTC 8x8 on metal_plate. The 16 bpp point loses to ASTC 6x6 and to per-texture BC7. A single fp16 scale per latent channel has no spatial endpoints. Derived mips are a box filter, not a second trained pyramid. Inference-on-load writes fp32. Transcode to BC7 or BC5 is host-side through bc7enc. There is no portable GPU BC7 encoder in this tree. The seed pool trains four copies of the chosen grid.
+The deflated 16 bpp network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The dedicated 10 bpp grids also lose to ASTC 8x8. 800 Adam steps reach 37.049 dB, 1.226 dB under ASTC 6x6, and the curve was still rising. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight.
 
 ## Prior work
 
@@ -400,8 +478,9 @@ RTXNTC: https://github.com/NVIDIA-RTX/RTXNTC . License is the NVIDIA RTX SDKs li
 | `cpp` | C++20 reader and reference decoder |
 | `shaders` | GLSL library and entry points |
 | `examples` | Vulkan 1.3 and OpenGL hosts |
-| `bench` | block codecs, ablations, GPU script |
+| `bench` | block codecs, ablations, `train_sweep`, `run_all`, GPU report |
 | `third_party/expcode` | vendored bf16 exponent codec, not on the decode path |
+| `third_party/puff` | puff 2.3, inflate of raw deflate latents. The header in `puff.h` is the copyright. |
 
 Pieces that can be split later without changing the format: the NTC1 container and loader, the GLSL decode library, the group quantizer (it could move into weight-quantizer), and the CPU reference decoder.
 

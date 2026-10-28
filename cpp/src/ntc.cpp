@@ -6,6 +6,10 @@
 #include <fstream>
 #include <stdexcept>
 
+extern "C" {
+#include "puff.h"
+}
+
 namespace ntc {
 namespace {
 
@@ -379,7 +383,30 @@ TextureSet parse(const uint8_t* data, size_t size) {
     ts.pe_octaves = rd_u16(data + 32);
     ts.weight_bits = rd_u16(data + 34);
     ts.group_size = rd_u16(data + 36);
+    ts.tile_size = rd_u16(data + 38);
+    if (ts.tile_size != 0) {
+        throw std::runtime_error("per-tile latent endpoints are not in this reader");
+    }
     const uint32_t channel_off = rd_u32(data + 40);
+    const uint32_t latent_off = rd_u32(data + 52);
+    const uint32_t latent_bytes = rd_u32(data + 56);
+    ts.latent_stored_bytes = latent_bytes;
+    ts.scale_stored_bytes = rd_u32(data + 72);
+    const uint32_t plain_len = rd_u32(data + 84);
+    ts.latent_plain_bytes = (ts.flags & kFlagLatentDeflate) ? plain_len : latent_bytes;
+    std::vector<uint8_t> inflated;
+    const uint8_t* code_base = data;
+    if (ts.flags & kFlagLatentDeflate) {
+        if (plain_len == 0 || static_cast<size_t>(latent_off) + latent_bytes > size) {
+            throw std::runtime_error("bad deflate span");
+        }
+        inflated.assign(plain_len, 0);
+        unsigned long dlen = plain_len;
+        unsigned long slen = latent_bytes;
+        const int rc = puff(inflated.data(), &dlen, data + latent_off, &slen);
+        if (rc != 0 || dlen != plain_len) throw std::runtime_error("latent deflate");
+        code_base = inflated.data();
+    }
     const uint32_t grid_off = rd_u32(data + 44);
     const uint32_t layer_off = rd_u32(data + 48);
     ts.raw.assign(data, data + size);
@@ -403,7 +430,8 @@ TextureSet parse(const uint8_t* data, size_t size) {
         g.data_bytes = rd_u32(p + 12);
         g.scale_offset = rd_u32(p + 16);
         g.plane_bytes = rd_u32(p + 20);
-        unpack_codes(data, g.data_offset, g.channels, g.height, g.width, g.bits, g.row_stride, g.codes);
+        unpack_codes(code_base, g.data_offset, g.channels, g.height, g.width, g.bits, g.row_stride,
+                     g.codes);
         g.scale.resize(g.channels);
         for (int c = 0; c < g.channels; ++c) {
             g.scale[c] = read_f16(data, g.scale_offset + static_cast<uint32_t>(c) * 2);
@@ -423,13 +451,15 @@ TextureSet parse(const uint8_t* data, size_t size) {
         layer.scale_offset = rd_u32(p + 16);
         layer.group_size = rd_u16(p + 20);
         layer.num_groups = rd_u16(p + 22);
+        const uint32_t lbits = rd_u32(p + 24);
+        layer.weight_bits = lbits ? lbits : ts.weight_bits;
         const int out = layer.out_features;
         const int inn = layer.in_features;
         layer.weight.assign(static_cast<size_t>(out) * inn, 0.f);
-        if (ts.weight_bits == 8) {
+        if (layer.weight_bits == 8) {
             const int8_t* w = reinterpret_cast<const int8_t*>(data + layer.weight_offset);
             for (int k = 0; k < out * inn; ++k) layer.weight[k] = static_cast<float>(w[k]);
-        } else if (ts.weight_bits == 4) {
+        } else if (layer.weight_bits == 4) {
             const int row_bytes = (inn + 1) / 2;
             const uint8_t* raw = data + layer.weight_offset;
             for (int o = 0; o < out; ++o) {
@@ -486,10 +516,11 @@ std::vector<float> decode_mip(const TextureSet& ts, int mip) {
 
 uint32_t payload_bytes(const TextureSet& ts) {
     uint32_t n = 0;
-    for (const auto& g : ts.grids) {
-        n += g.data_bytes;
-        n += static_cast<uint32_t>(g.channels) * 2u;
+    if (ts.flags & kFlagLatentDeflate) n += ts.latent_stored_bytes;
+    else {
+        for (const auto& g : ts.grids) n += g.data_bytes;
     }
+    n += ts.scale_stored_bytes;
     for (const auto& layer : ts.layers) {
         n += layer.weight_bytes;
         n += static_cast<uint32_t>(layer.out_features) * 2u;
@@ -527,7 +558,7 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
         for (size_t k = 0; k < grid.mips.size() && k < 8; ++k) {
             uint32_t data_off = grid.data_offset;
             int stride = grid.row_stride;
-            if (k > 0) {
+            if (k > 0 || (ts.flags & kFlagLatentDeflate)) {
                 int ps = 0;
                 auto packed = pack_codes(grid.mips[k], grid.channels, grid.mip_h[k], grid.mip_w[k],
                                          grid.bits, ps);
@@ -545,8 +576,9 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
         const Layer& layer = ts.layers[l];
         set4(12 + static_cast<int>(l), static_cast<uint32_t>(layer.in_features),
              static_cast<uint32_t>(layer.out_features), layer.weight_offset, layer.bias_offset);
+        const uint32_t lbits = layer.weight_bits ? layer.weight_bits : ts.weight_bits;
         set4(16 + static_cast<int>(l), layer.scale_offset, static_cast<uint32_t>(layer.group_size),
-             static_cast<uint32_t>(layer.num_groups), ts.weight_bits);
+             static_cast<uint32_t>(layer.num_groups), lbits);
     }
     while (up.blob.size() % 4) up.blob.push_back(0);
     return up;

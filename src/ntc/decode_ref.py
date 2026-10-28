@@ -133,6 +133,58 @@ def dequant_lerped(lerped: np.ndarray, scale: np.ndarray, bits: int) -> np.ndarr
     return (lerped - mid) * scale.astype(np.float32)[None, :]
 
 
+def bilinear_tile_dequant(
+    codes: np.ndarray,
+    uv: np.ndarray,
+    tile_scale: np.ndarray,
+    tile_offset: np.ndarray,
+    tile: int,
+    bits: int,
+    mip: int,
+) -> np.ndarray:
+    """Dequantize each bilinear tap with its tile endpoint, then lerp.
+
+    ``tile_scale`` and ``tile_offset`` are ``[C, nty, ntx]`` in mip-0 pixels.
+    A mip-k code at integer (x, y) reads the tile of mip-0 pixel (x<<k, y<<k).
+    """
+    c, h, w = codes.shape
+    nty, ntx = tile_scale.shape[1], tile_scale.shape[2]
+    x = uv[:, 0].astype(np.float32) * np.float32(w) - np.float32(0.5)
+    y = uv[:, 1].astype(np.float32) * np.float32(h) - np.float32(0.5)
+    x0 = np.floor(x).astype(np.int64)
+    y0 = np.floor(y).astype(np.int64)
+    tx = (x - x0.astype(np.float32)).astype(np.float32)[:, None]
+    ty = (y - y0.astype(np.float32)).astype(np.float32)[:, None]
+    x0w = _wrap(x0, w)
+    x1w = _wrap(x0 + 1, w)
+    y0w = _wrap(y0, h)
+    y1w = _wrap(y0 + 1, h)
+    plane = codes.reshape(c, h * w)
+    scale = tile_scale.astype(np.float32)
+    offset = tile_offset.astype(np.float32)
+    mid = latent_mid(bits)
+    shift = int(mip)
+
+    def deq(yy, xx):
+        idx = yy * w + xx
+        code = plane[:, idx].T.astype(np.float32)
+        ox = xx.astype(np.int64) << shift
+        oy = yy.astype(np.int64) << shift
+        sx = np.minimum(ox // tile, ntx - 1)
+        sy = np.minimum(oy // tile, nty - 1)
+        s = scale[:, sy, sx].T
+        o = offset[:, sy, sx].T
+        return (code - mid) * s + o
+
+    c00 = deq(y0w, x0w)
+    c10 = deq(y1w, x0w)
+    c01 = deq(y0w, x1w)
+    c11 = deq(y1w, x1w)
+    a = c00 + (c01 - c00) * tx
+    b = c10 + (c11 - c10) * tx
+    return (a + (b - a) * ty).astype(np.float32)
+
+
 def positional(uv: np.ndarray, pe_mode: int, octaves: int, mip: int, max_mip: int) -> np.ndarray:
     n = uv.shape[0]
     if pe_mode == 0 or octaves <= 0:
@@ -228,8 +280,15 @@ def sample_features(ts: TextureSet, uv: np.ndarray, mip: int, chains=None) -> np
     for grid, chain in zip(ts.grids, chains):
         k = min(mip, len(chain) - 1)
         codes = chain[k]
-        lerped = bilinear_codes(codes, uv)
-        cols.append(dequant_lerped(lerped, grid.scale, grid.bits))
+        if grid.tile_scale is not None:
+            cols.append(
+                bilinear_tile_dequant(
+                    codes, uv, grid.tile_scale, grid.tile_offset, ts.tile_size, grid.bits, k
+                )
+            )
+        else:
+            lerped = bilinear_codes(codes, uv)
+            cols.append(dequant_lerped(lerped, grid.scale, grid.bits))
     feat = np.concatenate(cols, axis=1) if cols else np.zeros((uv.shape[0], 0), np.float32)
     pe = positional(uv, ts.pe_mode, ts.pe_octaves, mip, max(ts.num_mips - 1, 1))
     if pe.shape[1]:

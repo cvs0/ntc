@@ -1,0 +1,2839 @@
+{
+  "device": {
+    "device": "cpu",
+    "torch": "2.14.1+cpu",
+    "hip": null,
+    "cuda": null,
+    "backend": "cpu",
+    "name": "cpu"
+  },
+  "platform": "Linux-6.12.94+-x86_64-with-glibc2.39",
+  "cpu": "x86_64",
+  "protocol": "locked grids, seed_pool 1, channel weighting off, cosine LR to 0.05",
+  "runs": [
+    {
+      "name": "m16_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.749193955843445,
+      "ssim": 0.9474357631471422,
+      "psnr_u8_albedo": 37.018055525610194,
+      "psnr_u8_normal": 39.459492229051754,
+      "psnr_u8_roughness": 37.52491971303802,
+      "psnr_u8_metalness": 31.595266182262513,
+      "psnr_u8_ao": 32.29261411130351,
+      "normal_angle_deg": 1.769091566110173,
+      "channel_psnr_u8": [
+        36.92452240350035,
+        36.963003003072615,
+        37.17065592653591,
+        37.49880930783107,
+        39.20416330442955,
+        43.79115943073582,
+        37.52491971303802,
+        31.595266182262513,
+        32.29261411130351
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.7564697265625,
+      "deflate_psnr_u8": 35.749193955843445,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79269,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.749193955843445,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.84309540861804
+        },
+        "m2": {
+          "psnr_u8": 33.91982100517977
+        }
+      },
+      "seconds_train": 0.7422925920000125,
+      "wall_s": 2.2465898420005033
+    },
+    {
+      "name": "m16_s80",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.13681071219827,
+      "ssim": 0.9510831170611911,
+      "psnr_u8_albedo": 37.479279838841535,
+      "psnr_u8_normal": 39.7718077222605,
+      "psnr_u8_roughness": 37.47775729060234,
+      "psnr_u8_metalness": 31.505745596457267,
+      "psnr_u8_ao": 33.44265040100162,
+      "normal_angle_deg": 1.7086179345785992,
+      "channel_psnr_u8": [
+        37.50702493692853,
+        37.63296563569011,
+        37.30420174599147,
+        37.75966908000867,
+        39.55240779438797,
+        44.22262664380404,
+        37.47775729060234,
+        31.505745596457267,
+        33.44265040100162
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.81982421875,
+      "deflate_psnr_u8": 36.13681071219827,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79788,
+      "steps": 80,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.13681071219827,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.06849787886785
+        },
+        "m2": {
+          "psnr_u8": 33.935396524454795
+        }
+      },
+      "seconds_train": 1.0952359590000924,
+      "wall_s": 1.9045854910000344
+    },
+    {
+      "name": "m16_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.14002285003884,
+      "ssim": 0.9528799321916368,
+      "psnr_u8_albedo": 37.472632551142524,
+      "psnr_u8_normal": 39.98058645540284,
+      "psnr_u8_roughness": 37.39492627083249,
+      "psnr_u8_metalness": 31.10396968279508,
+      "psnr_u8_ao": 34.05550976810858,
+      "normal_angle_deg": 1.6551873401412047,
+      "channel_psnr_u8": [
+        37.48853485996476,
+        37.77359730717607,
+        37.176327957268626,
+        38.025326267302745,
+        39.513520226514544,
+        44.95893720002863,
+        37.39492627083249,
+        31.10396968279508,
+        34.05550976810858
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.9041748046875,
+      "deflate_psnr_u8": 36.14002285003884,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80479,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.14002285003884,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.35453877668219
+        },
+        "m2": {
+          "psnr_u8": 34.16534587323842
+        }
+      },
+      "seconds_train": 2.309963455999423,
+      "wall_s": 3.2596938149999914
+    },
+    {
+      "name": "m16_s320",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.446049211263926,
+      "ssim": 0.9560986889733208,
+      "psnr_u8_albedo": 38.11433803279668,
+      "psnr_u8_normal": 39.60579808996479,
+      "psnr_u8_roughness": 36.51334504696809,
+      "psnr_u8_metalness": 31.518125036672252,
+      "psnr_u8_ao": 34.945323806095075,
+      "normal_angle_deg": 1.7525857122206618,
+      "channel_psnr_u8": [
+        38.29137329803336,
+        38.68786570020327,
+        37.456093914085244,
+        37.46893093615537,
+        39.20642009824769,
+        45.32375942840221,
+        36.51334504696809,
+        31.518125036672252,
+        34.945323806095075
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 10.1229248046875,
+      "deflate_psnr_u8": 36.446049211263926,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 82271,
+      "steps": 320,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.446049211263926,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 36.00989880587588
+        },
+        "m2": {
+          "psnr_u8": 35.20443561807528
+        }
+      },
+      "seconds_train": 4.579179402999216,
+      "wall_s": 5.46761390499978
+    },
+    {
+      "name": "m16_s800",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 37.04863091839967,
+      "ssim": 0.9604798158009847,
+      "psnr_u8_albedo": 38.37815574058668,
+      "psnr_u8_normal": 40.25516788683625,
+      "psnr_u8_roughness": 36.87059118023201,
+      "psnr_u8_metalness": 32.233789337775576,
+      "psnr_u8_ao": 35.958688553884286,
+      "normal_angle_deg": 1.6155822714788095,
+      "channel_psnr_u8": [
+        38.60112715182824,
+        38.80609018390124,
+        37.794343859402524,
+        38.74149227086909,
+        39.071052387177815,
+        45.948557013065866,
+        36.87059118023201,
+        32.233789337775576,
+        35.958688553884286
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 10.5166015625,
+      "deflate_psnr_u8": 37.04863091839967,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 85496,
+      "steps": 800,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 37.04863091839967,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 36.54450650611117
+        },
+        "m2": {
+          "psnr_u8": 35.51974348995585
+        }
+      },
+      "seconds_train": 10.709743487000196,
+      "wall_s": 11.484395485999812
+    },
+    {
+      "name": "m16_int4_row",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 29.773049070155423,
+      "ssim": 0.9187780949804518,
+      "psnr_u8_albedo": 34.07034599431588,
+      "psnr_u8_normal": 35.3155718247011,
+      "psnr_u8_roughness": 24.382067891586658,
+      "psnr_u8_metalness": 27.24494955856563,
+      "psnr_u8_ao": 27.22653928258498,
+      "normal_angle_deg": 2.535351506630925,
+      "channel_psnr_u8": [
+        34.93237344189678,
+        33.23617590665753,
+        34.21038019600752,
+        33.23902677369112,
+        37.382048196319225,
+        36.475823579815206,
+        24.382067891586658,
+        27.24494955856563,
+        27.22653928258498
+      ],
+      "total_bpp": 16.0546875,
+      "deflate_bpp": 9.7071533203125,
+      "deflate_psnr_u8": 29.773049070155423,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79105,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 4,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 25.267679236661067,
+      "psnr_u8_trained": 29.773049070155423,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 29.16978874514964
+        },
+        "m2": {
+          "psnr_u8": 28.939991132982726
+        }
+      },
+      "seconds_train": 0.5361980810002933,
+      "wall_s": 1.35099545400044
+    },
+    {
+      "name": "m16_int4_g16",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 32.17703546911193,
+      "ssim": 0.9313811461130778,
+      "psnr_u8_albedo": 33.474318287660374,
+      "psnr_u8_normal": 31.5565583998519,
+      "psnr_u8_roughness": 33.831121783028195,
+      "psnr_u8_metalness": 31.379107889065246,
+      "psnr_u8_ao": 30.626779419258202,
+      "normal_angle_deg": 4.840142192628051,
+      "channel_psnr_u8": [
+        35.82541320633241,
+        30.673309139623154,
+        36.38043141242405,
+        36.576719594746365,
+        27.599550800797235,
+        38.587848919728835,
+        33.831121783028195,
+        31.379107889065246,
+        30.626779419258202
+      ],
+      "total_bpp": 16.056884765625,
+      "deflate_bpp": 9.7066650390625,
+      "deflate_psnr_u8": 32.17703546911193,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79083,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 4,
+      "group_size": 16,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 23.301642300687632,
+      "psnr_u8_trained": 32.17703546911193,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 31.464388114644173
+        },
+        "m2": {
+          "psnr_u8": 30.993379567880666
+        }
+      },
+      "seconds_train": 0.5640956769993863,
+      "wall_s": 1.3456991900002322
+    },
+    {
+      "name": "m16_int4_row_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 31.9709753810156,
+      "ssim": 0.9300630225075616,
+      "psnr_u8_albedo": 31.346937982768985,
+      "psnr_u8_normal": 37.05324463166634,
+      "psnr_u8_roughness": 28.25661232756055,
+      "psnr_u8_metalness": 31.328896320507273,
+      "psnr_u8_ao": 31.57995376762368,
+      "normal_angle_deg": 2.2321357528727863,
+      "channel_psnr_u8": [
+        36.148192345247,
+        27.590581633534793,
+        36.6617292232358,
+        36.503940534893715,
+        36.380608842528034,
+        38.61684961320493,
+        28.25661232756055,
+        31.328896320507273,
+        31.57995376762368
+      ],
+      "total_bpp": 16.0546875,
+      "deflate_bpp": 9.8043212890625,
+      "deflate_psnr_u8": 31.9709753810156,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79901,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 4,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 25.267679236661067,
+      "psnr_u8_trained": 31.9709753810156,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 31.817517486478803
+        },
+        "m2": {
+          "psnr_u8": 31.56750786470404
+        }
+      },
+      "seconds_train": 2.2107660029996623,
+      "wall_s": 2.9816306479997365
+    },
+    {
+      "name": "m16_h64_32_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 34.800939059103534,
+      "ssim": 0.9371687372525533,
+      "psnr_u8_albedo": 37.28896945900914,
+      "psnr_u8_normal": 37.913220959150664,
+      "psnr_u8_roughness": 36.5878627737015,
+      "psnr_u8_metalness": 30.12092333297412,
+      "psnr_u8_ao": 31.293058875910717,
+      "normal_angle_deg": 2.032185527058891,
+      "channel_psnr_u8": [
+        37.1435935306276,
+        38.33919347999814,
+        36.56733745004178,
+        35.33807120043663,
+        38.904402241227885,
+        41.9501219644695,
+        36.5878627737015,
+        30.12092333297412,
+        31.293058875910717
+      ],
+      "total_bpp": 16.388671875,
+      "deflate_bpp": 10.013671875,
+      "deflate_psnr_u8": 34.800939059103534,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 78880,
+      "steps": 40,
+      "hidden": [
+        64,
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "init",
+      "psnr_u8_init": 34.800939059103534,
+      "psnr_u8_trained": 31.528537318040858,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 33.88196313761428
+        },
+        "m2": {
+          "psnr_u8": 33.204765574695884
+        }
+      },
+      "seconds_train": 1.0963456330000554,
+      "wall_s": 1.9464922790002674
+    },
+    {
+      "name": "m16_h64_32_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 34.81960521661119,
+      "ssim": 0.9433524277475145,
+      "psnr_u8_albedo": 37.25166071409275,
+      "psnr_u8_normal": 38.454428772435364,
+      "psnr_u8_roughness": 36.52270700065107,
+      "psnr_u8_metalness": 31.04065603869243,
+      "psnr_u8_ao": 30.15915953627838,
+      "normal_angle_deg": 1.8679590031260007,
+      "channel_psnr_u8": [
+        36.84513310040758,
+        38.61905062006575,
+        36.56247178195507,
+        36.851739780854345,
+        38.62041120879637,
+        40.737358293673566,
+        36.52270700065107,
+        31.04065603869243,
+        30.15915953627838
+      ],
+      "total_bpp": 16.388671875,
+      "deflate_bpp": 10.069091796875,
+      "deflate_psnr_u8": 34.81960521661119,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79334,
+      "steps": 160,
+      "hidden": [
+        64,
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.800939059103534,
+      "psnr_u8_trained": 34.81960521661119,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.319838267993774
+        },
+        "m2": {
+          "psnr_u8": 33.855156864917916
+        }
+      },
+      "seconds_train": 4.07142608400045,
+      "wall_s": 4.997858829999132
+    },
+    {
+      "name": "m16_h64_32_mix_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 34.467306838447584,
+      "ssim": 0.9338356587621901,
+      "psnr_u8_albedo": 37.53138389708539,
+      "psnr_u8_normal": 37.83536691939457,
+      "psnr_u8_roughness": 36.01785529656893,
+      "psnr_u8_metalness": 29.29909408647932,
+      "psnr_u8_ao": 31.14260730319204,
+      "normal_angle_deg": 2.0576502448665313,
+      "channel_psnr_u8": [
+        37.13774795519469,
+        38.97982776949169,
+        36.78056144191805,
+        35.302240648481735,
+        38.934128515746266,
+        41.484188152906434,
+        36.01785529656893,
+        29.29909408647932,
+        31.14260730319204
+      ],
+      "total_bpp": 16.263671875,
+      "deflate_bpp": 9.888671875,
+      "deflate_psnr_u8": 34.467306838447584,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 78880,
+      "steps": 40,
+      "hidden": [
+        64,
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [
+        8,
+        4,
+        8
+      ],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "init",
+      "psnr_u8_init": 34.467306838447584,
+      "psnr_u8_trained": 31.724772222570394,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 33.70607162955985
+        },
+        "m2": {
+          "psnr_u8": 32.92628981735235
+        }
+      },
+      "seconds_train": 1.1389657429999716,
+      "wall_s": 1.979365575999509
+    },
+    {
+      "name": "m16_h64_32_mix_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 34.467306838447584,
+      "ssim": 0.9338356587621901,
+      "psnr_u8_albedo": 37.53138389708539,
+      "psnr_u8_normal": 37.83536691939457,
+      "psnr_u8_roughness": 36.01785529656893,
+      "psnr_u8_metalness": 29.29909408647932,
+      "psnr_u8_ao": 31.14260730319204,
+      "normal_angle_deg": 2.0576502448665313,
+      "channel_psnr_u8": [
+        37.13774795519469,
+        38.97982776949169,
+        36.78056144191805,
+        35.302240648481735,
+        38.934128515746266,
+        41.484188152906434,
+        36.01785529656893,
+        29.29909408647932,
+        31.14260730319204
+      ],
+      "total_bpp": 16.263671875,
+      "deflate_bpp": 9.888671875,
+      "deflate_psnr_u8": 34.467306838447584,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 78880,
+      "steps": 160,
+      "hidden": [
+        64,
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [
+        8,
+        4,
+        8
+      ],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "init",
+      "psnr_u8_init": 34.467306838447584,
+      "psnr_u8_trained": 33.40634654682473,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 33.70607162955985
+        },
+        "m2": {
+          "psnr_u8": 32.92628981735235
+        }
+      },
+      "seconds_train": 4.020868563000477,
+      "wall_s": 4.974120339000365
+    },
+    {
+      "name": "m16_pe_f_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 31.983641931988753,
+      "ssim": 0.8939055336846246,
+      "psnr_u8_albedo": 36.21984573717179,
+      "psnr_u8_normal": 33.203560118635636,
+      "psnr_u8_roughness": 30.353930995893876,
+      "psnr_u8_metalness": 28.333699794841948,
+      "psnr_u8_ao": 29.357102444802354,
+      "normal_angle_deg": 3.430565760877096,
+      "channel_psnr_u8": [
+        36.97895437476111,
+        36.060460586170755,
+        35.71610168664892,
+        31.329561743879818,
+        32.724731004803466,
+        37.839662501035235,
+        30.353930995893876,
+        28.333699794841948,
+        29.357102444802354
+      ],
+      "total_bpp": 16.099609375,
+      "deflate_bpp": 9.781494140625,
+      "deflate_psnr_u8": 31.983641931988753,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79346,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "fourier",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 28.518156206207507,
+      "psnr_u8_trained": 31.983641931988753,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 32.3842619548005
+        },
+        "m2": {
+          "psnr_u8": 32.55111045569201
+        }
+      },
+      "seconds_train": 0.5962959889993726,
+      "wall_s": 1.3934328400000595
+    },
+    {
+      "name": "m16_pe_f_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 34.17220155051535,
+      "ssim": 0.9155724048614502,
+      "psnr_u8_albedo": 37.18315252202487,
+      "psnr_u8_normal": 36.8683341743983,
+      "psnr_u8_roughness": 35.14587842256479,
+      "psnr_u8_metalness": 30.452568822927507,
+      "psnr_u8_ao": 29.80471427174427,
+      "normal_angle_deg": 2.2159707323209243,
+      "channel_psnr_u8": [
+        37.682427096029805,
+        36.8776765939143,
+        37.03069130268453,
+        36.21567833054738,
+        36.209925961476046,
+        38.5808236836595,
+        35.14587842256479,
+        30.452568822927507,
+        29.80471427174427
+      ],
+      "total_bpp": 16.099609375,
+      "deflate_bpp": 9.9256591796875,
+      "deflate_psnr_u8": 34.17220155051535,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80527,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "fourier",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 28.518156206207507,
+      "psnr_u8_trained": 34.17220155051535,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.680852318242586
+        },
+        "m2": {
+          "psnr_u8": 34.95615612872416
+        }
+      },
+      "seconds_train": 2.309750892000011,
+      "wall_s": 3.0750465410001198
+    },
+    {
+      "name": "m16_pe_t_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 28.531433220530058,
+      "ssim": 0.7683831850687662,
+      "psnr_u8_albedo": 33.200977946483846,
+      "psnr_u8_normal": 28.85374401641352,
+      "psnr_u8_roughness": 24.889715088954443,
+      "psnr_u8_metalness": 26.549959993257616,
+      "psnr_u8_ao": 27.39276453492455,
+      "normal_angle_deg": 4.940225682692871,
+      "channel_psnr_u8": [
+        34.26721393452907,
+        32.762452148997916,
+        32.742093253177615,
+        27.690953791518854,
+        27.49237035349356,
+        33.73720730466945,
+        24.889715088954443,
+        26.549959993257616,
+        27.39276453492455
+      ],
+      "total_bpp": 16.138671875,
+      "deflate_bpp": 9.78759765625,
+      "deflate_psnr_u8": 28.531433220530058,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79076,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "triangle",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 24.15074244423365,
+      "psnr_u8_trained": 28.531433220530058,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 27.998186188204258
+        },
+        "m2": {
+          "psnr_u8": 25.854022507360686
+        }
+      },
+      "seconds_train": 0.5946650420000879,
+      "wall_s": 1.4732302120000895
+    },
+    {
+      "name": "m16_pe_t_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 29.433325825841692,
+      "ssim": 0.8789930409855313,
+      "psnr_u8_albedo": 34.87325385421157,
+      "psnr_u8_normal": 28.257128129901172,
+      "psnr_u8_roughness": 29.641817399531543,
+      "psnr_u8_metalness": 29.372311274669922,
+      "psnr_u8_ao": 25.92643021766001,
+      "normal_angle_deg": 4.33661522912965,
+      "channel_psnr_u8": [
+        35.17079251016811,
+        34.36894694988686,
+        35.12774585722929,
+        31.12888621466135,
+        27.705722773154356,
+        26.958894048945105,
+        29.641817399531543,
+        29.372311274669922,
+        25.92643021766001
+      ],
+      "total_bpp": 16.138671875,
+      "deflate_bpp": 9.955810546875,
+      "deflate_psnr_u8": 29.433325825841692,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80454,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "triangle",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 24.15074244423365,
+      "psnr_u8_trained": 29.433325825841692,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 30.168570906865604
+        },
+        "m2": {
+          "psnr_u8": 26.424119697152687
+        }
+      },
+      "seconds_train": 2.342027455999414,
+      "wall_s": 3.0591149269994276
+    },
+    {
+      "name": "m16_hgelu_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.56128138779387,
+      "ssim": 0.9414015412330627,
+      "psnr_u8_albedo": 37.25974176747761,
+      "psnr_u8_normal": 39.33311361442818,
+      "psnr_u8_roughness": 37.421483544916484,
+      "psnr_u8_metalness": 31.493208665635652,
+      "psnr_u8_ao": 31.56606824536615,
+      "normal_angle_deg": 1.7265549688456094,
+      "channel_psnr_u8": [
+        37.05162537098681,
+        38.35008794395745,
+        36.566990686020276,
+        37.89579344120834,
+        39.17836947168536,
+        41.76349060825325,
+        37.421483544916484,
+        31.493208665635652,
+        31.56606824536615
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.7421875,
+      "deflate_psnr_u8": 35.56128138779387,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79152,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "hgelu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.947652688725064,
+      "psnr_u8_trained": 35.56128138779387,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.400389960627706
+        },
+        "m2": {
+          "psnr_u8": 33.59719509868533
+        }
+      },
+      "seconds_train": 0.7584113630000502,
+      "wall_s": 1.6394058769992625
+    },
+    {
+      "name": "m16_hgelu_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.03561052767177,
+      "ssim": 0.9540662037001716,
+      "psnr_u8_albedo": 37.601186588778155,
+      "psnr_u8_normal": 40.33047472531253,
+      "psnr_u8_roughness": 37.275307054020935,
+      "psnr_u8_metalness": 30.628399147878955,
+      "psnr_u8_ao": 34.08420071218905,
+      "normal_angle_deg": 1.6307762425543166,
+      "channel_psnr_u8": [
+        37.10392646753904,
+        39.02719801973325,
+        36.961929476460654,
+        38.45590585601642,
+        39.57255039703572,
+        46.02402438268098,
+        37.275307054020935,
+        30.628399147878955,
+        34.08420071218905
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.932861328125,
+      "deflate_psnr_u8": 36.03561052767177,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80714,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "hgelu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.947652688725064,
+      "psnr_u8_trained": 36.03561052767177,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.204947698662565
+        },
+        "m2": {
+          "psnr_u8": 33.94455309569737
+        }
+      },
+      "seconds_train": 3.5665340380001,
+      "wall_s": 4.557593397999881
+    },
+    {
+      "name": "m16_requant_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 33.9782450290748,
+      "ssim": 0.9155261185434129,
+      "psnr_u8_albedo": 36.395265643684326,
+      "psnr_u8_normal": 36.48302987710479,
+      "psnr_u8_roughness": 35.60614130208966,
+      "psnr_u8_metalness": 30.37563055065203,
+      "psnr_u8_ao": 29.80250218618594,
+      "normal_angle_deg": 2.579146730579531,
+      "channel_psnr_u8": [
+        36.64159528399218,
+        36.166032863297254,
+        36.391183957499244,
+        36.61062464140904,
+        34.43702597867129,
+        40.176905254031716,
+        35.60614130208966,
+        30.37563055065203,
+        29.80250218618594
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.708984375,
+      "deflate_psnr_u8": 33.9782450290748,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 78880,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "hgelu",
+      "activation_requant": true,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "init",
+      "psnr_u8_init": 33.9782450290748,
+      "psnr_u8_trained": 13.32359573827783,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 33.556219532220524
+        },
+        "m2": {
+          "psnr_u8": 33.64567888173767
+        }
+      },
+      "seconds_train": 1.1592605290006759,
+      "wall_s": 2.1825164969995967
+    },
+    {
+      "name": "m16_requant_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 33.9782450290748,
+      "ssim": 0.9155261185434129,
+      "psnr_u8_albedo": 36.395265643684326,
+      "psnr_u8_normal": 36.48302987710479,
+      "psnr_u8_roughness": 35.60614130208966,
+      "psnr_u8_metalness": 30.37563055065203,
+      "psnr_u8_ao": 29.80250218618594,
+      "normal_angle_deg": 2.579146730579531,
+      "channel_psnr_u8": [
+        36.64159528399218,
+        36.166032863297254,
+        36.391183957499244,
+        36.61062464140904,
+        34.43702597867129,
+        40.176905254031716,
+        35.60614130208966,
+        30.37563055065203,
+        29.80250218618594
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.708984375,
+      "deflate_psnr_u8": 33.9782450290748,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 78880,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "hgelu",
+      "activation_requant": true,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "init",
+      "psnr_u8_init": 33.9782450290748,
+      "psnr_u8_trained": 31.382367649086405,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 33.556219532220524
+        },
+        "m2": {
+          "psnr_u8": 33.64567888173767
+        }
+      },
+      "seconds_train": 4.242582912000216,
+      "wall_s": 4.971352126999591
+    },
+    {
+      "name": "m16_mip4_geom",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.80889864104633,
+      "ssim": 0.949688368373447,
+      "psnr_u8_albedo": 37.02049418448134,
+      "psnr_u8_normal": 39.59988315091702,
+      "psnr_u8_roughness": 37.41701695469882,
+      "psnr_u8_metalness": 31.235218589675924,
+      "psnr_u8_ao": 32.97592388148104,
+      "normal_angle_deg": 1.7323432879399132,
+      "channel_psnr_u8": [
+        37.17280217587473,
+        37.74086549669044,
+        36.2748624518358,
+        37.688183117420934,
+        39.18536777574545,
+        44.19838953842503,
+        37.41701695469882,
+        31.235218589675924,
+        32.97592388148104
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.7489013671875,
+      "deflate_psnr_u8": 35.80889864104633,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79207,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 4,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.80889864104633,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.25369282618054
+        },
+        "m2": {
+          "psnr_u8": 34.49943606819504
+        }
+      },
+      "seconds_train": 1.3989291879997836,
+      "wall_s": 2.2284748659994875
+    },
+    {
+      "name": "m16_mip4_foot",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.89208601461818,
+      "ssim": 0.9499257736735873,
+      "psnr_u8_albedo": 37.33024111790746,
+      "psnr_u8_normal": 39.55972318171047,
+      "psnr_u8_roughness": 37.36659600369284,
+      "psnr_u8_metalness": 31.470973268939822,
+      "psnr_u8_ao": 32.718499397316336,
+      "normal_angle_deg": 1.7374897042091253,
+      "channel_psnr_u8": [
+        37.17830675269867,
+        37.87034657909344,
+        36.9906255932981,
+        37.81535280463481,
+        39.058579438206095,
+        43.72333093225745,
+        37.36659600369284,
+        31.470973268939822,
+        32.718499397316336
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.759765625,
+      "deflate_psnr_u8": 35.89208601461818,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79296,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 4,
+      "mip_loss": "footprint",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.89208601461818,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.254212214410295
+        },
+        "m2": {
+          "psnr_u8": 34.382364416431436
+        }
+      },
+      "seconds_train": 1.4133753529995374,
+      "wall_s": 2.130397396999797
+    },
+    {
+      "name": "m16_mip4_foot_cur",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.68316531232374,
+      "ssim": 0.9472680356767442,
+      "psnr_u8_albedo": 37.02748940638659,
+      "psnr_u8_normal": 39.191534110015354,
+      "psnr_u8_roughness": 37.51589125844188,
+      "psnr_u8_metalness": 31.524614659634143,
+      "psnr_u8_ao": 32.258617199067224,
+      "normal_angle_deg": 1.818819611151397,
+      "channel_psnr_u8": [
+        37.57058393107051,
+        36.94669098972899,
+        36.61841973313218,
+        37.51855159144523,
+        38.67889807193599,
+        43.119377902529195,
+        37.51589125844188,
+        31.524614659634143,
+        32.258617199067224
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.75537109375,
+      "deflate_psnr_u8": 35.68316531232374,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79260,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 4,
+      "mip_loss": "footprint",
+      "mip_curriculum": true,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.68316531232374,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.87090403286636
+        },
+        "m2": {
+          "psnr_u8": 34.05814012565767
+        }
+      },
+      "seconds_train": 0.9624272050004947,
+      "wall_s": 1.7269627250007034
+    },
+    {
+      "name": "m16_mip4_foot_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.32923655175348,
+      "ssim": 0.9540621638298035,
+      "psnr_u8_albedo": 37.591762398317925,
+      "psnr_u8_normal": 40.05589793749955,
+      "psnr_u8_roughness": 37.49326492512835,
+      "psnr_u8_metalness": 31.36351866612689,
+      "psnr_u8_ao": 34.33555311157763,
+      "normal_angle_deg": 1.6390398134543633,
+      "channel_psnr_u8": [
+        37.659923021399,
+        37.901501075205594,
+        37.239834701470194,
+        38.051593430738215,
+        39.654426990717965,
+        45.04961575117352,
+        37.49326492512835,
+        31.36351866612689,
+        34.33555311157763
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.92626953125,
+      "deflate_psnr_u8": 36.32923655175348,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80660,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 4,
+      "mip_loss": "footprint",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.32923655175348,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.98299390439723
+        },
+        "m2": {
+          "psnr_u8": 35.29434876217535
+        }
+      },
+      "seconds_train": 5.618804962000468,
+      "wall_s": 6.368805040000552
+    },
+    {
+      "name": "m16_tile8_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.25712971905256,
+      "ssim": 0.9486250877380371,
+      "psnr_u8_albedo": 37.25929537151541,
+      "psnr_u8_normal": 39.7057031964959,
+      "psnr_u8_roughness": 37.79086185533287,
+      "psnr_u8_metalness": 32.556191579972605,
+      "psnr_u8_ao": 32.80341891635516,
+      "normal_angle_deg": 1.7138788380485699,
+      "channel_psnr_u8": [
+        37.14414805633436,
+        37.6554784437672,
+        37.00492994681214,
+        38.08295995998225,
+        38.99918080076104,
+        44.02007839883683,
+        37.79086185533287,
+        32.556191579972605,
+        32.80341891635516
+      ],
+      "total_bpp": 18.0830078125,
+      "deflate_bpp": 11.770263671875,
+      "deflate_psnr_u8": 36.25712971905256,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79390,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 8,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.25712971905256,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.809202985358866
+        },
+        "m2": {
+          "psnr_u8": 34.317253652033195
+        }
+      },
+      "seconds_train": 0.6932327049999003,
+      "wall_s": 1.5869897990005484
+    },
+    {
+      "name": "m16_tile16_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.01206954850823,
+      "ssim": 0.9473075734244453,
+      "psnr_u8_albedo": 37.15917848336363,
+      "psnr_u8_normal": 39.542142805254755,
+      "psnr_u8_roughness": 37.78524005043354,
+      "psnr_u8_metalness": 32.301153644594734,
+      "psnr_u8_ao": 32.30016583519153,
+      "normal_angle_deg": 1.7303151577761389,
+      "channel_psnr_u8": [
+        37.07565424056452,
+        37.440514751851126,
+        36.97505257760131,
+        37.874388762467326,
+        39.11886871094959,
+        43.21288403317602,
+        37.78524005043354,
+        32.301153644594734,
+        32.30016583519153
+      ],
+      "total_bpp": 16.5830078125,
+      "deflate_bpp": 10.2569580078125,
+      "deflate_psnr_u8": 36.01206954850823,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79281,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.01206954850823,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.69240067796956
+        },
+        "m2": {
+          "psnr_u8": 34.30034211058755
+        }
+      },
+      "seconds_train": 0.6597446069999933,
+      "wall_s": 1.5610933130001285
+    },
+    {
+      "name": "m16_tile32_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.93286035619609,
+      "ssim": 0.9468722939491272,
+      "psnr_u8_albedo": 37.06113637549153,
+      "psnr_u8_normal": 39.46935686831441,
+      "psnr_u8_roughness": 37.83051809105878,
+      "psnr_u8_metalness": 32.204109503456046,
+      "psnr_u8_ao": 32.218980682954296,
+      "normal_angle_deg": 1.7653426199432456,
+      "channel_psnr_u8": [
+        36.97520460859473,
+        37.330841997929625,
+        36.88984505615746,
+        37.603657303110076,
+        39.20270388759846,
+        43.448274005103194,
+        37.83051809105878,
+        32.204109503456046,
+        32.218980682954296
+      ],
+      "total_bpp": 16.2080078125,
+      "deflate_bpp": 9.8955078125,
+      "deflate_psnr_u8": 35.93286035619609,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 79392,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 32,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 35.93286035619609,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 34.63669654562295
+        },
+        "m2": {
+          "psnr_u8": 34.22559360449997
+        }
+      },
+      "seconds_train": 0.6825226749997455,
+      "wall_s": 1.4731281690001197
+    },
+    {
+      "name": "m16_tile16_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.43482827272484,
+      "ssim": 0.9535610410902235,
+      "psnr_u8_albedo": 37.71421034897172,
+      "psnr_u8_normal": 40.17872344959895,
+      "psnr_u8_roughness": 37.81348348162187,
+      "psnr_u8_metalness": 31.555050878276557,
+      "psnr_u8_ao": 34.14396982632035,
+      "normal_angle_deg": 1.6152375346993981,
+      "channel_psnr_u8": [
+        37.84668819388124,
+        37.9538571742077,
+        37.36500147374689,
+        38.432962452084276,
+        39.48030949609966,
+        44.98365274434809,
+        37.81348348162187,
+        31.555050878276557,
+        34.14396982632035
+      ],
+      "total_bpp": 16.5830078125,
+      "deflate_bpp": 10.44970703125,
+      "deflate_psnr_u8": 36.43482827272484,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80860,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.43482827272484,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.62284002117997
+        },
+        "m2": {
+          "psnr_u8": 34.49472103308912
+        }
+      },
+      "seconds_train": 2.5807872510004017,
+      "wall_s": 3.391755531999479
+    },
+    {
+      "name": "m16_tile8_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 36.523581940400916,
+      "ssim": 0.9548837674988641,
+      "psnr_u8_albedo": 37.60056499581077,
+      "psnr_u8_normal": 40.27483633140996,
+      "psnr_u8_roughness": 37.94577181644857,
+      "psnr_u8_metalness": 31.74190013710429,
+      "psnr_u8_ao": 34.306375383961566,
+      "normal_angle_deg": 1.5739552642910968,
+      "channel_psnr_u8": [
+        37.66916698476935,
+        37.80298145449802,
+        37.34254871161899,
+        38.54443347842411,
+        39.77723762365427,
+        44.37419588922828,
+        37.94577181644857,
+        31.74190013710429,
+        34.306375383961566
+      ],
+      "total_bpp": 18.0830078125,
+      "deflate_bpp": 11.9498291015625,
+      "deflate_psnr_u8": 36.523581940400916,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 80861,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 8,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 35.53756673601862,
+      "psnr_u8_trained": 36.523581940400916,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 35.632742441681835
+        },
+        "m2": {
+          "psnr_u8": 34.50520922235916
+        }
+      },
+      "seconds_train": 2.7577439039996534,
+      "wall_s": 3.5637919420005346
+    },
+    {
+      "name": "m16_grid3_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.31568773989282,
+      "ssim": 0.9415450029902988,
+      "psnr_u8_albedo": 36.98624280431055,
+      "psnr_u8_normal": 38.243873375983156,
+      "psnr_u8_roughness": 36.92222926636112,
+      "psnr_u8_metalness": 30.79083172451291,
+      "psnr_u8_ao": 32.5190810609113,
+      "normal_angle_deg": 2.007463291920897,
+      "channel_psnr_u8": [
+        37.43417063190731,
+        37.005436204105436,
+        36.56281813720555,
+        35.93508687362815,
+        38.785265356130566,
+        42.05795265276481,
+        36.92222926636112,
+        30.79083172451291,
+        32.5190810609113
+      ],
+      "total_bpp": 16.59228515625,
+      "deflate_bpp": 10.226318359375,
+      "deflate_psnr_u8": 35.31568773989282,
+      "latent_plain_bytes": 135200,
+      "deflate_latent_bytes": 83050,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          64,
+          64,
+          2,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.36559952793211,
+      "psnr_u8_trained": 35.31568773989282,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 28.947858278957447
+        },
+        "m2": {
+          "psnr_u8": 27.670830764992154
+        }
+      },
+      "seconds_train": 0.7034014020000541,
+      "wall_s": 1.5605428740000207
+    },
+    {
+      "name": "m16_grid3_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 35.23338695968003,
+      "ssim": 0.9534244669808282,
+      "psnr_u8_albedo": 37.43299318986477,
+      "psnr_u8_normal": 39.67483005442024,
+      "psnr_u8_roughness": 38.09486934512409,
+      "psnr_u8_metalness": 28.68150832469201,
+      "psnr_u8_ao": 34.91799666854939,
+      "normal_angle_deg": 1.732921888276689,
+      "channel_psnr_u8": [
+        37.836792835409135,
+        37.59305039591545,
+        36.92158222434172,
+        37.84319749441194,
+        39.08379317223738,
+        44.49511925145152,
+        38.09486934512409,
+        28.68150832469201,
+        34.91799666854939
+      ],
+      "total_bpp": 16.59228515625,
+      "deflate_bpp": 10.36279296875,
+      "deflate_psnr_u8": 35.23338695968003,
+      "latent_plain_bytes": 135200,
+      "deflate_latent_bytes": 84168,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          64,
+          64,
+          2,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 34.36559952793211,
+      "psnr_u8_trained": 35.23338695968003,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 29.181503268091134
+        },
+        "m2": {
+          "psnr_u8": 27.816489639353627
+        }
+      },
+      "seconds_train": 2.707324250000056,
+      "wall_s": 3.632049240000015
+    },
+    {
+      "name": "m10_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 32.173511962670474,
+      "ssim": 0.8532408409648471,
+      "psnr_u8_albedo": 36.13989957751551,
+      "psnr_u8_normal": 29.660262182670113,
+      "psnr_u8_roughness": 38.3679817030175,
+      "psnr_u8_metalness": 32.20691224262919,
+      "psnr_u8_ao": 31.335862252811665,
+      "normal_angle_deg": 4.508334610260313,
+      "channel_psnr_u8": [
+        37.23141648730871,
+        36.77483028851547,
+        34.81010656438337,
+        28.48146682460452,
+        27.66609784080291,
+        39.43189557312805,
+        38.3679817030175,
+        32.20691224262919,
+        31.335862252811665
+      ],
+      "total_bpp": 10.080078125,
+      "deflate_bpp": 7.39306640625,
+      "deflate_psnr_u8": 32.173511962670474,
+      "latent_plain_bytes": 81920,
+      "deflate_latent_bytes": 59908,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.02485935826187,
+      "psnr_u8_trained": 32.173511962670474,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 28.520324525660033
+        },
+        "m2": {
+          "psnr_u8": 27.72123848615632
+        }
+      },
+      "seconds_train": 0.541478336000182,
+      "wall_s": 1.3074895689996993
+    },
+    {
+      "name": "m10_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 32.250613236529645,
+      "ssim": 0.8563806215922037,
+      "psnr_u8_albedo": 36.47036497573543,
+      "psnr_u8_normal": 29.713889337135384,
+      "psnr_u8_roughness": 38.04712940007508,
+      "psnr_u8_metalness": 31.898037746137035,
+      "psnr_u8_ao": 31.694312355169924,
+      "normal_angle_deg": 4.49899671439718,
+      "channel_psnr_u8": [
+        37.44476163213096,
+        37.66939375986924,
+        34.88002627015983,
+        28.5496838471678,
+        27.726360547374615,
+        39.21337512974578,
+        38.04712940007508,
+        31.898037746137035,
+        31.694312355169924
+      ],
+      "total_bpp": 10.080078125,
+      "deflate_bpp": 7.531494140625,
+      "deflate_psnr_u8": 32.250613236529645,
+      "latent_plain_bytes": 81920,
+      "deflate_latent_bytes": 61042,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.02485935826187,
+      "psnr_u8_trained": 32.250613236529645,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 28.396578886831566
+        },
+        "m2": {
+          "psnr_u8": 27.512681907604197
+        }
+      },
+      "seconds_train": 2.0451865900004123,
+      "wall_s": 2.7842684310007826
+    },
+    {
+      "name": "m10_tile16_s40",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 32.08472734382741,
+      "ssim": 0.8514000243610806,
+      "psnr_u8_albedo": 35.8352302266258,
+      "psnr_u8_normal": 29.65230003517831,
+      "psnr_u8_roughness": 38.02507771911798,
+      "psnr_u8_metalness": 32.22624485259886,
+      "psnr_u8_ao": 31.08109078747701,
+      "normal_angle_deg": 4.494967029227569,
+      "channel_psnr_u8": [
+        37.009574849581306,
+        36.29963901117947,
+        34.56955573216475,
+        28.442060567332984,
+        27.68456340564603,
+        39.42106297619805,
+        38.02507771911798,
+        32.22624485259886,
+        31.08109078747701
+      ],
+      "total_bpp": 10.35986328125,
+      "deflate_bpp": 7.6737060546875,
+      "deflate_psnr_u8": 32.08472734382741,
+      "latent_plain_bytes": 81920,
+      "deflate_latent_bytes": 59915,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.02485935826187,
+      "psnr_u8_trained": 32.08472734382741,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 28.471298334909353
+        },
+        "m2": {
+          "psnr_u8": 27.667151700289303
+        }
+      },
+      "seconds_train": 0.5541803750002146,
+      "wall_s": 1.391316578000442
+    },
+    {
+      "name": "m10_tile16_s160",
+      "material": "/tmp/mat/metal_plate",
+      "psnr_u8": 32.39533968091806,
+      "ssim": 0.8610072864426507,
+      "psnr_u8_albedo": 36.73801475742976,
+      "psnr_u8_normal": 29.834498112666388,
+      "psnr_u8_roughness": 38.19682857848716,
+      "psnr_u8_metalness": 32.02954372259796,
+      "psnr_u8_ao": 31.843933006597123,
+      "normal_angle_deg": 4.404487648408455,
+      "channel_psnr_u8": [
+        37.649530177904886,
+        37.86111940566914,
+        35.22372338304013,
+        28.66833525362555,
+        27.855809635464446,
+        39.23359072591427,
+        38.19682857848716,
+        32.02954372259796,
+        31.843933006597123
+      ],
+      "total_bpp": 10.35986328125,
+      "deflate_bpp": 7.8116455078125,
+      "deflate_psnr_u8": 32.39533968091806,
+      "latent_plain_bytes": 81920,
+      "deflate_latent_bytes": 61045,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 32.02485935826187,
+      "psnr_u8_trained": 32.39533968091806,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 28.482068362109167
+        },
+        "m2": {
+          "psnr_u8": 27.633687164429862
+        }
+      },
+      "seconds_train": 2.1983907740004724,
+      "wall_s": 2.9832330619992717
+    },
+    {
+      "name": "p16_s40",
+      "material": "/tmp/paving",
+      "psnr_u8": 31.687678902829933,
+      "ssim": 0.9117135405540466,
+      "psnr_u8_albedo": 31.44885880798766,
+      "psnr_u8_normal": 32.29842999932013,
+      "psnr_u8_roughness": 33.38158205362969,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 32.89681768323698,
+      "normal_angle_deg": 3.486126167418674,
+      "channel_psnr_u8": [
+        31.86191645730306,
+        31.252342565911697,
+        31.26003128576285,
+        35.58231707153998,
+        32.85368175311846,
+        30.12216374109578,
+        33.38158205362969,
+        32.89681768323698,
+        29.159239617146593
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.094482421875,
+      "deflate_psnr_u8": 31.687678902829933,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 73846,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.32940680583325,
+      "psnr_u8_trained": 31.687678902829933,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 31.55618000286435
+        },
+        "m2": {
+          "psnr_u8": 31.286434833029713
+        }
+      },
+      "seconds_train": 0.5412765490000311,
+      "wall_s": 1.3148887469997135
+    },
+    {
+      "name": "p16_s160",
+      "material": "/tmp/paving",
+      "psnr_u8": 31.858258049346652,
+      "ssim": 0.9108090466923184,
+      "psnr_u8_albedo": 31.372577522581583,
+      "psnr_u8_normal": 32.67125590393639,
+      "psnr_u8_roughness": 33.32035750696757,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 33.481930778560375,
+      "normal_angle_deg": 3.4904030230987604,
+      "channel_psnr_u8": [
+        31.852390394844498,
+        31.330962146257374,
+        30.97856204931658,
+        35.18775215863914,
+        32.89950926841461,
+        30.93650670545475,
+        33.32035750696757,
+        33.481930778560375,
+        29.415562874751014
+      ],
+      "total_bpp": 16.083984375,
+      "deflate_bpp": 9.4552001953125,
+      "deflate_psnr_u8": 31.858258049346652,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 76801,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.32940680583325,
+      "psnr_u8_trained": 31.858258049346652,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 32.10489990968989
+        },
+        "m2": {
+          "psnr_u8": 31.57650261434494
+        }
+      },
+      "seconds_train": 2.160629480999887,
+      "wall_s": 2.9771892949993344
+    },
+    {
+      "name": "p16_tile16_s40",
+      "material": "/tmp/paving",
+      "psnr_u8": 31.74673631739095,
+      "ssim": 0.9119913710488213,
+      "psnr_u8_albedo": 31.490611830925662,
+      "psnr_u8_normal": 32.37732183442539,
+      "psnr_u8_roughness": 33.291396599547824,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 32.72458114913979,
+      "normal_angle_deg": 3.434171720618216,
+      "channel_psnr_u8": [
+        32.031607572192264,
+        31.14877664050119,
+        31.340236966410163,
+        35.580220708020136,
+        33.07581237655485,
+        30.149493077191167,
+        33.291396599547824,
+        32.72458114913979,
+        29.38109511528806
+      ],
+      "total_bpp": 16.5830078125,
+      "deflate_bpp": 9.5885009765625,
+      "deflate_psnr_u8": 31.74673631739095,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 73805,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.32940680583325,
+      "psnr_u8_trained": 31.74673631739095,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 31.710258777283965
+        },
+        "m2": {
+          "psnr_u8": 31.396579820315683
+        }
+      },
+      "seconds_train": 0.6193201870000848,
+      "wall_s": 1.5178300349998608
+    },
+    {
+      "name": "p16_tile16_s160",
+      "material": "/tmp/paving",
+      "psnr_u8": 32.08966683403371,
+      "ssim": 0.9139700399504768,
+      "psnr_u8_albedo": 31.51038566182883,
+      "psnr_u8_normal": 32.746294146400835,
+      "psnr_u8_roughness": 33.33139571993156,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 33.782835699455575,
+      "normal_angle_deg": 3.427174319433643,
+      "channel_psnr_u8": [
+        31.843780988760745,
+        31.39094772347866,
+        31.315022189046218,
+        35.34443817760038,
+        33.05484605556287,
+        30.93127157161856,
+        33.33139571993156,
+        33.782835699455575,
+        30.14613652405199
+      ],
+      "total_bpp": 16.5830078125,
+      "deflate_bpp": 9.9798583984375,
+      "deflate_psnr_u8": 32.08966683403371,
+      "latent_plain_bytes": 131104,
+      "deflate_latent_bytes": 77011,
+      "steps": 160,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          4,
+          4
+        ],
+        [
+          8,
+          8,
+          2,
+          2
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 16,
+      "seed": 3,
+      "checkpoint": "trained",
+      "psnr_u8_init": 31.32940680583325,
+      "psnr_u8_trained": 32.08966683403371,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 32.348787949553525
+        },
+        "m2": {
+          "psnr_u8": 31.99962108905481
+        }
+      },
+      "seconds_train": 2.4440016649996323,
+      "wall_s": 3.210577426000782
+    },
+    {
+      "name": "p10_s40",
+      "material": "/tmp/paving",
+      "psnr_u8": 29.21824131641408,
+      "ssim": 0.8471000062094795,
+      "psnr_u8_albedo": 29.812813188941703,
+      "psnr_u8_normal": 27.39549589250876,
+      "psnr_u8_roughness": 32.808268141816285,
+      "psnr_u8_metalness": null,
+      "psnr_u8_ao": 28.899069816845273,
+      "normal_angle_deg": 6.910364218466039,
+      "channel_psnr_u8": [
+        31.449720316156665,
+        30.599202933375196,
+        28.111226383294166,
+        24.356450164671216,
+        32.08873341620337,
+        29.28413128261755,
+        32.808268141816285,
+        28.899069816845273,
+        34.36763232070543
+      ],
+      "total_bpp": 10.080078125,
+      "deflate_bpp": 6.50537109375,
+      "deflate_psnr_u8": 29.21824131641408,
+      "latent_plain_bytes": 81920,
+      "deflate_latent_bytes": 52636,
+      "steps": 40,
+      "hidden": [
+        32
+      ],
+      "grids": [
+        [
+          256,
+          256,
+          2,
+          4
+        ],
+        [
+          64,
+          64,
+          4,
+          8
+        ]
+      ],
+      "weight_bits": 8,
+      "group_size": 0,
+      "layer_bits": [],
+      "pe": "none",
+      "activation": "relu",
+      "activation_requant": false,
+      "mip_levels": 1,
+      "mip_loss": "geom",
+      "mip_curriculum": false,
+      "tile_size": 0,
+      "seed": 1,
+      "checkpoint": "trained",
+      "psnr_u8_init": 29.056497581550413,
+      "psnr_u8_trained": 29.21824131641408,
+      "mip_metrics": {
+        "m1": {
+          "psnr_u8": 27.947074670430993
+        },
+        "m2": {
+          "psnr_u8": 26.806120246058093
+        }
+      },
+      "seconds_train": 0.5279353350006204,
+      "wall_s": 1.470227652000176
+    }
+  ]
+}

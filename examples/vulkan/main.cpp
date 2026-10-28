@@ -4,10 +4,13 @@
 // Cooperative matrix is queried and not used: one texel does not fill a tile.
 // Subgroup size is read from the device, never assumed.
 
+#include "bench.hpp"
 #include "ntc/ntc.hpp"
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -96,12 +99,33 @@ static float max_abs(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: ntc_vk file.ntc shader_dir\n";
+        std::cerr << "usage: ntc_vk file.ntc shader_dir [--device index|name] [--bench outdir]\n"
+                     "       [--warmup N] [--iters N] [--bc7 file] [--bc1 file] [--bc5 file]\n";
         return 2;
     }
     try {
         const std::string ntc_path = argv[1];
         const std::string dir = argv[2];
+        std::string device_spec;
+        std::string bench_dir;
+        std::string bc7_path, bc1_path, bc5_path;
+        int warmup = 8;
+        int iters = 20;
+        for (int i = 3; i < argc; ++i) {
+            const std::string a = argv[i];
+            auto need = [&](const char* flag) {
+                if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + flag);
+                return std::string(argv[++i]);
+            };
+            if (a == "--device") device_spec = need("--device");
+            else if (a == "--bench") bench_dir = need("--bench");
+            else if (a == "--warmup") warmup = std::stoi(need("--warmup"));
+            else if (a == "--iters") iters = std::stoi(need("--iters"));
+            else if (a == "--bc7") bc7_path = need("--bc7");
+            else if (a == "--bc1") bc1_path = need("--bc1");
+            else if (a == "--bc5") bc5_path = need("--bc5");
+            else throw std::runtime_error("unknown arg " + a);
+        }
         ntc::TextureSet ts = ntc::load_file(ntc_path);
         auto cpu = ntc::decode_mip(ts, 0);
         auto up = ntc::make_gpu_upload(ts, 0, ntc::kFilterPoint, 4);
@@ -122,21 +146,54 @@ int main(int argc, char** argv) {
         CHECK(vkEnumeratePhysicalDevices(instance, &ndev, nullptr));
         std::vector<VkPhysicalDevice> devs(ndev);
         CHECK(vkEnumeratePhysicalDevices(instance, &ndev, devs.data()));
-        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        std::cout << "device_count " << ndev << "\n";
+        int chosen = -1;
+        bool spec_is_index = !device_spec.empty() &&
+                             std::all_of(device_spec.begin(), device_spec.end(),
+                                         [](unsigned char ch) { return std::isdigit(ch) != 0; });
         int best = -1;
-        for (auto d : devs) {
+        for (uint32_t i = 0; i < ndev; ++i) {
             VkPhysicalDeviceProperties p{};
-            vkGetPhysicalDeviceProperties(d, &p);
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            std::cout << "device_list " << i << " name " << p.deviceName << " vendor 0x" << std::hex << p.vendorID
+                      << " device 0x" << p.deviceID << std::dec << " type " << p.deviceType << "\n";
+            if (spec_is_index && std::stoi(device_spec) == static_cast<int>(i)) chosen = static_cast<int>(i);
+            if (!device_spec.empty() && !spec_is_index) {
+                std::string name = p.deviceName;
+                std::string needle = device_spec;
+                auto lower = [](std::string s) {
+                    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    return s;
+                };
+                if (lower(name).find(lower(needle)) != std::string::npos) chosen = static_cast<int>(i);
+            }
             int score = 0;
             if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 3;
             else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 2;
             else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) score = 1;
-            if (score > best) {
-                best = score;
-                phys = d;
+            if (score > best) best = score;
+        }
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        if (chosen >= 0) {
+            phys = devs[static_cast<uint32_t>(chosen)];
+        } else if (device_spec.empty()) {
+            best = -1;
+            for (uint32_t i = 0; i < ndev; ++i) {
+                VkPhysicalDeviceProperties p{};
+                vkGetPhysicalDeviceProperties(devs[i], &p);
+                int score = 0;
+                if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 3;
+                else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 2;
+                else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) score = 1;
+                if (score > best) {
+                    best = score;
+                    chosen = static_cast<int>(i);
+                    phys = devs[i];
+                }
             }
         }
         if (!phys) throw std::runtime_error("no device");
+        std::cout << "device_index " << chosen << "\n";
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys, &props);
@@ -171,6 +228,14 @@ int main(int argc, char** argv) {
         const bool coop = has_coop && cm.cooperativeMatrix == VK_TRUE;
         const bool cpu_dev = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 
+        std::cout << "device_name " << props.deviceName << "\n";
+        std::cout << "vendor_id 0x" << std::hex << props.vendorID << "\n";
+        std::cout << "device_id 0x" << props.deviceID << std::dec << "\n";
+        std::cout << "driver_raw " << props.driverVersion << "\n";
+        std::cout << "api_version " << VK_VERSION_MAJOR(props.apiVersion) << "."
+                  << VK_VERSION_MINOR(props.apiVersion) << "." << VK_VERSION_PATCH(props.apiVersion) << "\n";
+        std::cout << "subgroup_size " << sg.subgroupSize << "\n";
+        std::cout << "timestamp_period_ns " << props.limits.timestampPeriod << "\n";
         std::cout << "device " << props.deviceName << " vendor 0x" << std::hex << props.vendorID << std::dec
                   << " type " << props.deviceType << " api " << VK_VERSION_MAJOR(props.apiVersion) << "."
                   << VK_VERSION_MINOR(props.apiVersion) << " driver " << props.driverVersion
@@ -377,6 +442,10 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (!bench_dir.empty()) {
+            run_vk_bench(dev, phys, queue, qfam, ts, up, float16, cpu_dev, dir, bench_dir, warmup, iters, bc7_path,
+                         bc1_path, bc5_path);
+        }
         std::cout << "ok\n";
         vkDestroyQueryPool(dev, qpool, nullptr);
         vkDestroyCommandPool(dev, cpool, nullptr);

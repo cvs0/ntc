@@ -9,6 +9,7 @@ byte after the header.
 
 from __future__ import annotations
 
+import math
 import struct
 import zlib
 from dataclasses import dataclass, field
@@ -27,6 +28,11 @@ MAX_MIPS = 8
 
 FLAG_DERIVED_MIPS = 1 << 0
 FLAG_ACTIVATION_REQUANT = 1 << 1
+# Latent region is a raw deflate stream (window -15, no zlib header).
+# Grid data_offset values are then relative to the inflated bytes.
+# Header u32 at offset 84 is the inflated length. bpp counts the
+# compressed length, not the inflated grids.
+FLAG_LATENT_DEFLATE = 1 << 2
 
 ACT_IDENTITY = 0
 ACT_RELU = 1
@@ -100,6 +106,9 @@ class GridRec:
     plane_bytes: int
     scale: np.ndarray = field(repr=False, default=None)
     codes: np.ndarray = field(repr=False, default=None)  # uint8 [C,H,W]
+    # Present when this grid uses per-tile endpoints. Both are [C, nty, ntx].
+    tile_scale: np.ndarray | None = field(repr=False, default=None)
+    tile_offset: np.ndarray | None = field(repr=False, default=None)
 
 
 @dataclass
@@ -115,6 +124,8 @@ class LayerRec:
     weight: np.ndarray = field(repr=False, default=None)  # float codes [out, in]
     bias: np.ndarray = field(repr=False, default=None)
     scale: np.ndarray = field(repr=False, default=None)  # [out, groups]
+    # 0 means the header weight_bits value.
+    weight_bits: int = 0
 
 
 @dataclass
@@ -132,6 +143,10 @@ class TextureSet:
     grids: list[GridRec]
     layers: list[LayerRec]
     raw: bytes
+    tile_size: int = 0
+    latent_stored_bytes: int = 0
+    latent_plain_bytes: int = 0
+    scale_stored_bytes: int = 0
 
     @property
     def activation_requant(self) -> bool:
@@ -198,6 +213,25 @@ def unpack_codes(blob: bytes | memoryview, offset: int, c: int, h: int, w: int, 
     raise ValueError(bits)
 
 
+def tile_counts(width: int, height: int, tile: int) -> tuple[int, int]:
+    """Return ``(nty, ntx)``. ``(0, 0)`` means one scale per channel."""
+    if tile < 2 or (width <= tile and height <= tile):
+        return 0, 0
+    return math.ceil(height / tile), math.ceil(width / tile)
+
+
+def deflate_raw(data: bytes) -> bytes:
+    co = zlib.compressobj(level=9, wbits=-15)
+    return co.compress(data) + co.flush()
+
+
+def inflate_raw(data: bytes, plain_len: int) -> bytes:
+    out = zlib.decompress(data, wbits=-15)
+    if len(out) != plain_len:
+        raise ValueError(f"deflate length {len(out)} != {plain_len}")
+    return out
+
+
 def _f16_bytes(values: np.ndarray) -> bytes:
     return np.ascontiguousarray(values, dtype=np.float32).astype(np.float16).tobytes()
 
@@ -256,12 +290,15 @@ def build_texture_set(
     channels: list[ChannelRec],
     grids: list[dict],
     layers: list[dict],
+    latent_deflate: bool = False,
+    tile_size: int = 0,
 ) -> bytes:
     """Build a file.
 
     ``grids`` items: codes uint8 ``[C,H,W]``, bits, scale float ``[C]``.
-    ``layers`` items: codes signed ``[out,in]``, bias ``[out]``, scale ``[out,groups]``,
-    group_size.
+    A tiled grid also carries ``tile_scale`` and ``tile_offset``, each
+    ``[C, nty, ntx]``. ``layers`` items: codes signed ``[out,in]``, bias
+    ``[out]``, scale ``[out,groups]``, group_size, optional ``weight_bits``.
     """
     if not (1 <= len(channels) <= MAX_CHANNELS):
         raise ValueError("channel count")
@@ -281,20 +318,32 @@ def build_texture_set(
         bits = int(g["bits"])
         scale = np.asarray(g["scale"], dtype=np.float32).reshape(-1)
         packed, stride, plane = pack_codes(codes, bits)
+        gw, gh, gc = int(codes.shape[2]), int(codes.shape[1]), int(codes.shape[0])
+        nty, ntx = tile_counts(gw, gh, tile_size)
+        tscale = g.get("tile_scale")
+        toffset = g.get("tile_offset")
+        if nty:
+            if tscale is None or toffset is None:
+                raise ValueError("tiled grid missing endpoints")
+            tscale = np.asarray(tscale, dtype=np.float32).reshape(gc, nty, ntx)
+            toffset = np.asarray(toffset, dtype=np.float32).reshape(gc, nty, ntx)
+            scale_bytes = _f16_bytes(tscale.reshape(-1)) + _f16_bytes(toffset.reshape(-1))
+        else:
+            if len(scale) != gc:
+                raise ValueError("scale count")
+            scale_bytes = _f16_bytes(scale)
         grid_recs.append(
             {
-                "width": codes.shape[2],
-                "height": codes.shape[1],
-                "channels": codes.shape[0],
+                "width": gw,
+                "height": gh,
+                "channels": gc,
                 "bits": bits,
                 "row_stride": stride,
                 "plane_bytes": plane,
                 "packed": packed,
-                "scale_bytes": _f16_bytes(scale),
+                "scale_bytes": scale_bytes,
             }
         )
-        if len(scale) != codes.shape[0]:
-            raise ValueError("scale count")
 
     weight = bytearray()
     layer_recs = []
@@ -307,7 +356,8 @@ def build_texture_set(
         gs = int(layer["group_size"])
         out_f, in_f = codes.shape
         groups = scale.shape[1]
-        wbytes = pack_weight_matrix(codes, weight_bits)
+        layer_bits = int(layer.get("weight_bits") or weight_bits)
+        wbytes = pack_weight_matrix(codes, layer_bits)
         if len(weight) % 2:
             weight += b"\x00"
         w_off = len(weight)
@@ -328,6 +378,7 @@ def build_texture_set(
                 "w_len": len(wbytes),
                 "b_off": b_off,
                 "s_off": s_off,
+                "bits": layer_bits,
             }
         )
 
@@ -352,18 +403,26 @@ def build_texture_set(
     for rec in grid_recs:
         if len(latent_blob) % 2:
             latent_blob += b"\x00"
-        data_off = latent_off + len(latent_blob)
+        rel = len(latent_blob)
         latent_blob += rec["packed"]
-        abs_grids.append((rec, data_off))
-    latent_bytes = len(latent_blob)
+        abs_grids.append((rec, rel))
+    plain = bytes(latent_blob)
+    plain_len = len(plain)
+    if latent_deflate:
+        stored_latent = deflate_raw(plain)
+        flags = flags | FLAG_LATENT_DEFLATE
+    else:
+        stored_latent = plain
+    latent_bytes = len(stored_latent)
     offset = latent_off + latent_bytes
     if offset % 2:
         offset += 1
     scale_off = offset
     abs_scales = []
-    for rec, data_off in abs_grids:
+    for rec, rel in abs_grids:
         s_off = scale_off + len(scale_blob)
         scale_blob += rec["scale_bytes"]
+        data_off = rel if latent_deflate else latent_off + rel
         abs_scales.append((rec, data_off, s_off))
     scale_bytes = len(scale_blob)
     offset = scale_off + scale_bytes
@@ -401,7 +460,7 @@ def build_texture_set(
             weight_off + rec["s_off"],
             rec["gs"] & 0xFFFF,
             rec["groups"] & 0xFFFF,
-            0,
+            rec["bits"] & 0xFFFFFFFF,
             0,
         )
 
@@ -409,7 +468,7 @@ def build_texture_set(
     body[channel_off : channel_off + len(ch_blob)] = ch_blob
     body[grid_off : grid_off + len(grid_table)] = grid_table
     body[layer_off : layer_off + len(layer_table)] = layer_table
-    body[latent_off : latent_off + latent_bytes] = latent_blob
+    body[latent_off : latent_off + latent_bytes] = stored_latent
     body[scale_off : scale_off + scale_bytes] = scale_blob
     body[weight_off : weight_off + weight_bytes] = weight_blob
 
@@ -430,7 +489,7 @@ def build_texture_set(
         pe_octaves,
         weight_bits,
         group_size & 0xFFFF,
-        0,
+        tile_size & 0xFFFF,
         channel_off,
         grid_off,
         layer_off,
@@ -442,7 +501,7 @@ def build_texture_set(
         scale_bytes,
         crc,
         file_bytes,
-        0,
+        plain_len if latent_deflate else 0,
         0,
     )
     if len(header) != HEADER_BYTES:
@@ -471,7 +530,7 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         pe_octaves,
         weight_bits,
         group_size,
-        _reserved0,
+        tile_size,
         channel_off,
         grid_off,
         layer_off,
@@ -483,7 +542,7 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         scale_bytes,
         crc,
         file_bytes,
-        _r1,
+        latent_plain,
         _r2,
     ) = fields
     if magic != MAGIC:
@@ -500,6 +559,12 @@ def parse_texture_set(blob: bytes) -> TextureSet:
     if _HEADER.size != HEADER_BYTES:
         raise RuntimeError("struct size")
 
+    code_src: bytes | memoryview = blob
+    if flags & FLAG_LATENT_DEFLATE:
+        if latent_plain <= 0:
+            raise ValueError("deflate flag without inflated length")
+        code_src = inflate_raw(blob[latent_off : latent_off + latent_bytes], latent_plain)
+
     channels = []
     for i in range(num_channels):
         sem, cs, _, _ = struct.unpack_from("<BBHI", blob, channel_off + 8 * i)
@@ -510,22 +575,37 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         w, h, ch, bits, stride, data_off, data_len, s_off, plane = struct.unpack_from(
             "<HHBBHIIII", blob, grid_off + 24 * i
         )
-        codes = unpack_codes(blob, data_off, ch, h, w, bits, stride)
-        scale = _read_f16(blob, s_off, ch)
+        codes = unpack_codes(code_src, data_off, ch, h, w, bits, stride)
+        nty, ntx = tile_counts(w, h, tile_size)
+        tile_scale = None
+        tile_offset = None
+        if nty:
+            n = ch * nty * ntx
+            tile_scale = _read_f16(blob, s_off, n).reshape(ch, nty, ntx)
+            tile_offset = _read_f16(blob, s_off + n * 2, n).reshape(ch, nty, ntx)
+            scale = tile_scale.reshape(ch, -1).mean(axis=1)
+        else:
+            scale = _read_f16(blob, s_off, ch)
         grids.append(
-            GridRec(w, h, ch, bits, stride, data_off, data_len, s_off, plane, scale, codes)
+            GridRec(
+                w, h, ch, bits, stride, data_off, data_len, s_off, plane, scale, codes,
+                tile_scale, tile_offset,
+            )
         )
 
     layers = []
     for i in range(num_layers):
-        inn, out, w_off, w_len, b_off, s_off, gs, groups, _, _ = struct.unpack_from(
+        inn, out, w_off, w_len, b_off, s_off, gs, groups, layer_bits, _ = struct.unpack_from(
             "<HHIIIIHHII", blob, layer_off + 32 * i
         )
-        weight = unpack_weight_matrix(blob, w_off, out, inn, weight_bits)
+        use_bits = int(layer_bits) if layer_bits else int(weight_bits)
+        weight = unpack_weight_matrix(blob, w_off, out, inn, use_bits)
         bias = _read_f16(blob, b_off, out)
         scale = _read_f16(blob, s_off, out * groups).reshape(out, groups)
         layers.append(
-            LayerRec(inn, out, gs, groups, w_off, w_len, b_off, s_off, weight, bias, scale)
+            LayerRec(
+                inn, out, gs, groups, w_off, w_len, b_off, s_off, weight, bias, scale, use_bits
+            )
         )
 
     return TextureSet(
@@ -542,13 +622,23 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         grids=grids,
         layers=layers,
         raw=blob,
+        tile_size=int(tile_size),
+        latent_stored_bytes=int(latent_bytes),
+        latent_plain_bytes=int(latent_plain) if flags & FLAG_LATENT_DEFLATE else int(latent_bytes),
+        scale_stored_bytes=int(scale_bytes),
     )
 
 
 def payload_bytes(ts: TextureSet) -> int:
-    """Latent codes + scales + weights + bias. Excludes header and tables."""
-    latent = sum(g.data_bytes for g in ts.grids)
-    scales = sum(g.channels * 2 for g in ts.grids)
+    """Latent codes + scales + weights + bias. Excludes header and tables.
+
+    When the latent region is deflated, the compressed length is the rate.
+    """
+    if ts.flags & FLAG_LATENT_DEFLATE:
+        latent = ts.latent_stored_bytes
+    else:
+        latent = sum(g.data_bytes for g in ts.grids)
+    scales = ts.scale_stored_bytes if ts.scale_stored_bytes else sum(g.channels * 2 for g in ts.grids)
     weights = 0
     for layer in ts.layers:
         weights += layer.weight_bytes

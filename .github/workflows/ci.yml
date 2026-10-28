@@ -38,3 +38,14 @@ jobs:
         run: |
           ./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
           ./build/ntc_gl tests/fixtures/tiny.ntc shaders
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: configure and compile
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
+          ctest --test-dir build -C Release -R test_ntc --output-on-failure

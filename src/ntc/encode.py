@@ -64,7 +64,7 @@ class TrainConfig:
     qat_latents: bool = True
     qat_weights: bool = True
     quant_proxy: str = "ste"
-    mip_levels: int = 1
+    mip_levels: int = 4
     channel_weighting: bool = False
     normal_cosine: float = 0.0
     pca_init: bool = True
@@ -78,6 +78,11 @@ class TrainConfig:
     adaptive_pool: int = 8
     seed_pool: int = 4
     with_ssim: bool = True
+    latent_deflate: bool = True
+    tile_size: int = 0
+    layer_bits: tuple = ()
+    mip_loss: str = "footprint"
+    mip_curriculum: bool = False
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
@@ -121,6 +126,10 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
             mid = ((1 << bits) - 1) / 2.0
             scale = (amax / mid).clamp(1e-4, 5.0)
             net.log_scales[i].copy_(torch.log(scale))
+            ti = net._tile_param_of[i]
+            if ti >= 0:
+                net.tile_log_scales[ti].copy_(torch.log(scale).view(-1, 1, 1))
+                net.tile_offsets[ti].zero_()
             # Store the latent in code units so the optimizer steps in bins.
             lat.copy_(values / scale.view(-1, 1, 1) + mid)
             basis = u[:, :k]
@@ -152,8 +161,8 @@ def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
     feat = net.features(uv, 0, 1).detach()
     h = feat
     with torch.no_grad():
-        for lin in list(net.linears)[:-1]:
-            w, b = net._weight(lin)
+        for i, lin in enumerate(list(net.linears)[:-1]):
+            w, b = net._weight(lin, i)
             h = F.linear(h, w, b)
             h = _activate(h, net.activation, net.activation_requant)
     tgt = target[:, yg.reshape(-1), xg.reshape(-1)].T.detach()
@@ -197,7 +206,24 @@ def _subset_psnr(pred: torch.Tensor, tgt: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mips: int) -> bytes:
+def _mip_weight(cfg: TrainConfig, level: int) -> float:
+    if cfg.mip_loss == "footprint":
+        return float(0.25**level)
+    if cfg.mip_loss == "uniform":
+        return 1.0
+    if cfg.mip_loss != "geom":
+        raise ValueError(cfg.mip_loss)
+    return float(0.5**level)
+
+
+def export_network(
+    net: NtcNet,
+    sems: list[int],
+    width: int,
+    height: int,
+    num_mips: int,
+    latent_deflate: bool = False,
+) -> bytes:
     net.eval()
     grids = []
     for i in range(len(net.latents)):
@@ -205,17 +231,23 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
         bits = net.grid_bits[i]
         z = net.latents[i].detach().float().cpu()
         code = torch.round(z).clamp(0, (1 << bits) - 1)
-        grids.append(
-            {
-                "codes": code.to(torch.uint8).numpy(),
-                "bits": bits,
-                "scale": scale.numpy(),
-            }
-        )
+        item = {
+            "codes": code.to(torch.uint8).numpy(),
+            "bits": bits,
+            "scale": scale.numpy(),
+        }
+        ti = net._tile_param_of[i]
+        if ti >= 0:
+            ts_ = torch.exp(net.tile_log_scales[ti]).clamp(1e-4, 5.0)
+            item["tile_scale"] = ts_.detach().float().cpu().half().float().numpy()
+            off = net.tile_offsets[ti].detach().float().cpu().clamp(-2, 2)
+            item["tile_offset"] = off.half().float().numpy()
+        grids.append(item)
     layers = []
-    for lin in net.linears:
+    for li, lin in enumerate(net.linears):
+        bits_l = net.layer_weight_bits(li)
         _ste, codes, scales = quantize_weight(
-            lin.weight.detach().float().cpu(), net.weight_bits, net.group_size
+            lin.weight.detach().float().cpu(), bits_l, net.group_size
         )
         bias = lin.bias.detach().float().cpu()
         gs = net.group_size
@@ -230,6 +262,7 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
                 "bias": bias.numpy(),
                 "scale": scales.numpy(),
                 "group_size": gs_store,
+                "weight_bits": bits_l,
             }
         )
     flags = FLAG_ACTIVATION_REQUANT if net.activation_requant else 0
@@ -246,6 +279,8 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
         channels=[ChannelRec(int(s), 0) for s in sems],
         grids=grids,
         layers=layers,
+        latent_deflate=latent_deflate,
+        tile_size=net.tile_size,
     )
 
 
@@ -262,6 +297,8 @@ def encode_arrays(
     hidden = list(cfg.hidden)
     if any(v > 64 for v in hidden) or len(hidden) > 3:
         raise ValueError("hidden width must be <= 64 and depth <= 3")
+    if cfg.layer_bits and len(cfg.layer_bits) != len(hidden) + 1:
+        raise ValueError("layer_bits must have one entry per MLP matrix")
     pe_mode = _PE[cfg.pe]
     probe_table = []
     if cfg.grids is None:
@@ -357,6 +394,8 @@ def encode_arrays(
         activation_requant=cfg.activation_requant,
         qat_latents=cfg.qat_latents,
         qat_weights=cfg.qat_weights,
+        tile_size=cfg.tile_size,
+        layer_bits=cfg.layer_bits,
     ).to(device)
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
     if cfg.pca_init:
@@ -372,12 +411,11 @@ def encode_arrays(
     init_state = None
     if cfg.steps > 0:
         init_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    latent_params = list(net.latents.parameters()) + list(net.log_scales.parameters())
+    latent_params += list(net.tile_log_scales.parameters()) + list(net.tile_offsets.parameters())
     opt = torch.optim.Adam(
         [
-            {
-                "params": list(net.latents.parameters()) + list(net.log_scales.parameters()),
-                "lr": cfg.lr * cfg.latent_lr_mult,
-            },
+            {"params": latent_params, "lr": cfg.lr * cfg.latent_lr_mult},
             {"params": net.linears.parameters(), "lr": cfg.lr},
         ]
     )
@@ -394,6 +432,8 @@ def encode_arrays(
         loss = target.new_zeros(())
         monitor_psnr = None
         for m in range(cfg.mip_levels):
+            if cfg.mip_curriculum and m > 0 and step < cfg.steps // 2:
+                continue
             tm = _color_mip(target, m)
             hm, wm = tm.shape[-2], tm.shape[-1]
             n = hm * wm
@@ -413,7 +453,7 @@ def encode_arrays(
             uv = torch.stack(((xs.float() + 0.5) / wm, (ys.float() + 0.5) / hm), dim=1)
             tgt = tm[:, ys, xs].T
             pred = net(uv, mip=m, max_mip=max_mip)
-            loss = loss + (0.5 ** m) * _loss(pred, tgt, semantics, cfg)
+            loss = loss + _mip_weight(cfg, m) * _loss(pred, tgt, semantics, cfg)
             if m == 0 and (step % cfg.log_every == 0 or step == cfg.steps - 1):
                 monitor_psnr = _subset_psnr(pred, tgt)
         loss.backward()
@@ -428,7 +468,7 @@ def encode_arrays(
 
     def _export_current():
         t_export = time.perf_counter()
-        blob_i = export_network(net, semantics, w, h, num_mips)
+        blob_i = export_network(net, semantics, w, h, num_mips, latent_deflate=cfg.latent_deflate)
         export_dt = time.perf_counter() - t_export
         t_dec = time.perf_counter()
         ts_i = parse_texture_set(blob_i)
@@ -505,6 +545,13 @@ def encode_arrays(
             {"psnr_u8": p, "grids": [list(g) for g in grids_i]} for p, grids_i in probe_table
         ],
         "activation_requant": cfg.activation_requant,
+        "latent_deflate": cfg.latent_deflate,
+        "tile_size": cfg.tile_size,
+        "layer_bits": list(cfg.layer_bits),
+        "mip_loss": cfg.mip_loss,
+        "mip_curriculum": cfg.mip_curriculum,
+        "latent_stored_bytes": ts.latent_stored_bytes,
+        "latent_plain_bytes": ts.latent_plain_bytes,
         "curve": curve,
         "metrics": metrics,
         "mip_metrics": mip_metrics,
