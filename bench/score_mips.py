@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 from pathlib import Path
 
@@ -93,6 +94,12 @@ def _index(root: Path) -> dict[tuple[str, int], Path]:
 
 
 def _psnr_from_mse(mse: float) -> float:
+    """Pooled 8-bit PSNR. A non-finite error is not a perfect score.
+
+    ``min(100, nan)`` is 100 in Python, so a NaN mip used to report 100 dB.
+    """
+    if not math.isfinite(mse):
+        return float("-inf")
     if mse <= 1e-20:
         return 100.0
     return float(min(100.0, 10.0 * np.log10(1.0 / mse)))

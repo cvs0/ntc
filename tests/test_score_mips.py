@@ -4,7 +4,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-from bench.score_mips import score_tree
+from bench.score_mips import _psnr_from_mse, score_tree
 from ntc.grids import latent_payload_bits, select_grids
 
 
@@ -27,6 +27,11 @@ def test_score_identical_chain(tmp_path: Path):
     assert report["groups"]["roughness"]["psnr_u8"] == 100.0
     assert report["mips"] == [0, 1]
     assert report["texels"] == (4 * 4 * 3 + 2 * 2 * 3) + 4 * 4 * 3
+
+
+def test_nonfinite_mse_is_not_a_perfect_score():
+    assert _psnr_from_mse(float("nan")) == float("-inf")
+    assert _psnr_from_mse(float("inf")) == float("-inf")
 
 
 def test_score_known_error(tmp_path: Path):

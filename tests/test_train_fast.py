@@ -577,6 +577,77 @@ def test_pca_code_ratio_aims_each_material_at_its_label():
     assert np.isfinite(stats["metrics"]["psnr_u8"])
 
 
+def test_one_inf_gradient_is_skipped_and_the_run_stays_finite(monkeypatch):
+    import ntc.train_fast as tf
+
+    real = tf._clip_no_sync
+    seen = {"n": 0}
+
+    def _poison_once(params, max_norm, skips=None):
+        seen["n"] += 1
+        if seen["n"] == 1:
+            for param in params:
+                if param.grad is not None:
+                    param.grad.fill_(float("inf"))
+                    break
+        real(params, max_norm, skips)
+
+    monkeypatch.setattr(tf, "_clip_no_sync", _poison_once)
+    img = np.linspace(0.0, 1.0, 3 * 16 * 16, dtype=np.float32).reshape(3, 16, 16)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=2,
+            hidden=(8,),
+            grids=[(8, 8, 2, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=2,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+        ),
+    )
+    assert stats["grad_skips"] == 1
+    assert np.isfinite(stats["metrics"]["psnr_u8"])
+    assert np.isfinite(stats["psnr_u8_trained"])
+
+
+def test_finished_checkpoint_starts_fresh(tmp_path: Path):
+    net = _net()
+    path = tmp_path / "done.pt"
+    torch.save({"model": net.state_dict(), "step": 9}, path)
+    img = np.linspace(0.0, 1.0, 3 * 8 * 8, dtype=np.float32).reshape(3, 8, 8)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=2,
+            hidden=(8,),
+            grids=[(8, 8, 2, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=1,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            resume=str(path),
+        ),
+    )
+    assert not path.is_file()
+    assert stats["steps_ran"] == 2
+    assert np.isfinite(stats["psnr_u8_init"])
+
+
 def test_recompile_limit_covers_every_mip_sample_count():
     import torch._dynamo.config as dyn
 

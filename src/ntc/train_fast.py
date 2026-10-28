@@ -576,15 +576,29 @@ def _prep_mips(
     return out
 
 
-def _clip_no_sync(params, max_norm: float) -> None:
+# One non-finite gradient used to make the clip coefficient NaN and poison
+# every parameter in that step. The step is zeroed and counted instead.
+# More than this many skips fails the run.
+GRAD_SKIP_LIMIT = 8
+
+
+def _clip_no_sync(params, max_norm: float, skips: torch.Tensor | None = None) -> None:
     grads = [p.grad for p in params if p.grad is not None]
     if not grads:
         return
     norms = torch.stack([g.detach().float().norm(2) for g in grads])
     total = norms.norm(2)
-    coef = torch.clamp(total.new_tensor(max_norm) / (total + 1e-6), max=1.0)
+    bad = ~torch.isfinite(total)
+    coef = torch.where(
+        bad,
+        total.new_zeros(()),
+        torch.clamp(total.new_tensor(max_norm) / (total + 1e-6), max=1.0),
+    )
+    if skips is not None:
+        skips.add_(bad.to(dtype=skips.dtype))
     for grad in grads:
-        grad.mul_(coef)
+        # ``nan * 0`` is still NaN. Write an explicit zero when the norm is bad.
+        grad.copy_(torch.where(bad, torch.zeros_like(grad), grad * coef))
 
 
 def _lr_slot(value: float, device: torch.device, capturable: bool):
@@ -926,6 +940,7 @@ def _run_loop(
     if cfg.lr_batch_ref and batch:
         lr_scale = scaled_lr(1.0, batch, cfg.lr_batch_ref)
     params = [p for group in opt.param_groups for p in group["params"]]
+    skip_count = torch.zeros((), device=stacked.latents[0].device, dtype=torch.int32)
     graph = None
     graph_error = None
     static_loss = None
@@ -967,7 +982,7 @@ def _run_loop(
             if scaler is not None:
                 scaler.scale(loss).backward()
                 scaler.unscale_(opt)
-                _clip_no_sync(params, 1.0)
+                _clip_no_sync(params, 1.0, skip_count)
                 scaler.step(opt)
                 scaler.update()
                 _clamp_latents(stacked)
@@ -977,7 +992,7 @@ def _run_loop(
             from ntc.train_steps import shampoo_precondition
 
             shampoo_precondition(params)
-        _clip_no_sync(params, 1.0)
+        _clip_no_sync(params, 1.0, skip_count)
         opt.step()
         _clamp_latents(stacked)
         return loss
@@ -1035,7 +1050,7 @@ def _run_loop(
                         from ntc.train_steps import shampoo_precondition
 
                         shampoo_precondition(params)
-                    _clip_no_sync(params, 1.0)
+                    _clip_no_sync(params, 1.0, skip_count)
                     opt.step()
                     _clamp_latents(stacked)
                     return loss
@@ -1117,6 +1132,9 @@ def _run_loop(
         torch.cuda.synchronize()
     _require_finite_params(stacked)
     elapsed = time.perf_counter() - t0
+    grad_skips = int(skip_count.item())
+    if grad_skips > GRAD_SKIP_LIMIT:
+        raise RuntimeError(f"non-finite gradients skipped {grad_skips} steps")
     return {
         "seconds": elapsed,
         "steps": steps,
@@ -1126,6 +1144,7 @@ def _run_loop(
         "compile_mode": compile_mode if compiled else None,
         "cuda_graph_error": graph_error,
         "steps_per_s": (steps / elapsed) if elapsed > 0 else None,
+        "grad_skips": grad_skips,
     }
 
 
@@ -1450,8 +1469,18 @@ def encode_arrays_fast(
         cfg = replace(cfg, resume="")
     if cfg.resume:
         preview = torch.load(cfg.resume, map_location="cpu", weights_only=False)
-        if not _state_matches_grids(preview.get("model", {}), grids):
-            print("resume grid mismatch, training from scratch", cfg.resume, flush=True)
+        finished = int(preview.get("step", -1)) + 1 >= int(cfg.steps)
+        mismatch = not _state_matches_grids(preview.get("model", {}), grids)
+        if finished or mismatch:
+            why = "checkpoint already finished" if finished else "resume grid mismatch"
+            print(f"{why}, training from scratch", cfg.resume, flush=True)
+            if finished:
+                try:
+                    from pathlib import Path as _Path
+
+                    _Path(cfg.resume).unlink()
+                except OSError:
+                    pass
             cfg = replace(cfg, resume="")
     seeds = [cfg.seed + i for i in range(max(1, cfg.seed_pool if cfg.steps > 0 else 1))]
     if cfg.resume:
@@ -1525,6 +1554,7 @@ def encode_arrays_fast(
         "cuda_graph_error": None,
         "compile_mode": None,
         "hit_target": False,
+        "grad_skips": 0,
     }
     stopped_early = False
     best_val = -1e9
@@ -1748,6 +1778,7 @@ def encode_arrays_fast(
         "batch_pixels": int(cfg.batch_pixels or 0),
         "batch_mip": str(cfg.batch_mip),
         "latent_rate_scale": float(cfg.latent_rate_scale),
+        "grad_skips": int(loop_info.get("grad_skips") or 0),
         "device": device_report(device),
         "steps": cfg.steps,
         "grids": [list(g) for g in grids],
@@ -1783,6 +1814,7 @@ def _merge_info(acc: dict, info: dict) -> dict:
     acc["cuda_graph_error"] = info["cuda_graph_error"] or acc["cuda_graph_error"]
     if info.get("compile_mode"):
         acc["compile_mode"] = info["compile_mode"]
+    acc["grad_skips"] = int(acc.get("grad_skips") or 0) + int(info.get("grad_skips") or 0)
     return acc
 
 

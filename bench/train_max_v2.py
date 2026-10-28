@@ -734,6 +734,9 @@ def _run_claimed(
         row["done"] = False
         row["collapsed"] = True
         row["error"] = collapse_reason(float(trained), float(init), effective, pixels)
+        # The json is set aside. The checkpoint must not be resumed later.
+        if ckpt.is_file():
+            ckpt.unlink()
         print("collapsed", job["name"], row["error"], flush=True)
     if row.get("done") and not job.get("_rd_retry"):
         lower = cheaper_better(out, job, float(row["psnr_u8"]))
