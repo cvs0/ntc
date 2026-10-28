@@ -30,6 +30,24 @@ def _get(url: str, dest: Path) -> None:
         dest.write_bytes(resp.read())
 
 
+def _zip_opens(path: Path) -> bool:
+    if not path.is_file():
+        return False
+    try:
+        with zipfile.ZipFile(path) as zf:
+            zf.namelist()
+    except zipfile.BadZipFile:
+        return False
+    return True
+
+
+def _one_map(directory: Path, pattern: str, material: str, role: str) -> Path:
+    found = next(directory.glob(pattern), None)
+    if found is None:
+        raise RuntimeError(f"{material}: missing map {role}")
+    return found
+
+
 def polyhaven(root: Path, name: str, maps: dict[str, str], size: str = "1k") -> None:
     d = root / name if size == "1k" else root / f"{name}_{size}"
     d.mkdir(parents=True, exist_ok=True)
@@ -44,17 +62,31 @@ def polyhaven(root: Path, name: str, maps: dict[str, str], size: str = "1k") -> 
     (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
 
 
-def ambient(root: Path, name: str, size: str = "1K") -> None:
+def ambient(root: Path, name: str, size: str = "1K") -> Path:
     d = root / name if size == "1K" else root / f"{name}_{size}"
+    if (d / "manifest.json").is_file():
+        return d
     d.mkdir(parents=True, exist_ok=True)
     zpath = d / f"{name}.zip"
-    _get(AMBIENT.format(name=name, size=size), zpath)
-    with zipfile.ZipFile(zpath) as zf:
-        zf.extractall(d)
+    url = AMBIENT.format(name=name, size=size)
+    opened = False
+    for _attempt in (1, 2):
+        if not _zip_opens(zpath):
+            zpath.unlink(missing_ok=True)
+            _get(url, zpath)
+        try:
+            with zipfile.ZipFile(zpath) as zf:
+                zf.extractall(d)
+            opened = True
+            break
+        except zipfile.BadZipFile:
+            zpath.unlink(missing_ok=True)
+    if not opened:
+        raise RuntimeError(f"{name}: zip failed to open after retry")
     # ambientCG names vary. Point the manifest at the extracted JPGs.
-    color = next(d.glob("*Color.jpg"))
-    normal = next(d.glob("*NormalGL.jpg"))
-    rough = next(d.glob("*Roughness.jpg"))
+    color = _one_map(d, "*Color.jpg", name, "Color")
+    normal = _one_map(d, "*NormalGL.jpg", name, "NormalGL")
+    rough = _one_map(d, "*Roughness.jpg", name, "Roughness")
     ao = next(d.glob("*AmbientOcclusion.jpg"), None)
     metal = next(d.glob("*Metalness.jpg"), None)
     if metal is None:

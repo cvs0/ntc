@@ -1,6 +1,10 @@
 #!/bin/bash
 # Fresh Runpod PyTorch pod. One process per GPU. Shard is I/N, for example 0/5.
 set -euo pipefail
+if ! curl -m 10 -sI https://github.com >/dev/null; then
+  echo "no outbound internet: curl -m 10 -sI https://github.com failed" >&2
+  exit 1
+fi
 SHARD="${1:?usage: setup_pod.sh I/N}"
 ROOT="${NTC_ROOT:-$HOME/ntc}"
 BRANCH="${NTC_BRANCH:-cursor/ntc-rd-gpu-2cb6}"
@@ -19,7 +23,16 @@ git pull --ff-only origin "$BRANCH"
 export PYTHONPATH="$ROOT/src:$ROOT"
 
 python -m pip install -e ".[dev]"
-python bench/download_materials.py --preset cloud --dest "$ROOT/data/materials"
+MATS="$ROOT/data/materials"
+mkdir -p "$MATS"
+SPLIT="$MATS/cloud_split.json"
+exec 9>"$MATS/.cloud_download.lock"
+flock 9
+if [[ -f "$SPLIT" ]]; then
+  echo "skip download $SPLIT"
+else
+  python bench/download_materials.py --preset cloud --dest "$MATS"
+fi
 
 python - << 'PY'
 import torch

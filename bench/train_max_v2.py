@@ -395,7 +395,7 @@ CLOUD_TRAIN = (
     "Concrete034",
     "Bark001",
 )
-CLOUD_HOLDOUT = ("Leather011", "LeafSet017", "Gravel001")
+CLOUD_HOLDOUT = ("Leather011", "LeafSet017", "Gravel022")
 # 1 and 2 sit under BC1. 4 is BC1. 8 is BC7 and ASTC 4x4. 2.5 stays so the
 # laptop b2.5 points still have a neighbor. 8000 on the first label: the
 # 5070 MetalPlates b2.5 run was still above its init at 4000 and had not

@@ -47,6 +47,8 @@ def test_cloud_queue_shape_and_hours():
     jobs = build_cloud_jobs(Path("data/materials"))
     assert len(CLOUD_TRAIN) == 12
     assert len(CLOUD_HOLDOUT) == 3
+    assert "Gravel022" in CLOUD_HOLDOUT
+    assert "Gravel001" not in CLOUD_HOLDOUT
     assert set(CLOUD_TRAIN).isdisjoint(set(CLOUD_HOLDOUT))
     assert len(jobs) == len(CLOUD_TRAIN) * len(CLOUD_BPP)
     assert len({job["name"] for job in jobs}) == len(jobs)
@@ -169,6 +171,12 @@ def test_cloud_entry_points_run_as_files_without_pythonpath(tmp_path: Path):
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     script = (repo / "bench/cloud/setup_pod.sh").read_text()
     assert 'export PYTHONPATH="$ROOT/src:$ROOT"' in script
+    assert "curl -m 10 -sI https://github.com" in script
+    assert "no outbound internet" in script
+    assert "cloud_split.json" in script
+    assert "skip download" in script
+    syntax = subprocess.run(["bash", "-n", str(repo / "bench/cloud/setup_pod.sh")], check=False)
+    assert syntax.returncode == 0
 
     def run(args: list[str]) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
