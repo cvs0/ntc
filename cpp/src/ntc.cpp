@@ -23,6 +23,10 @@ uint32_t rd_u32(const uint8_t* p) {
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
+void need(size_t size, uint64_t off, uint64_t n, const char* what) {
+    if (n > size || off > size - n) throw std::runtime_error(what);
+}
+
 float f16_to_f32(uint16_t h) {
     const uint32_t sign = static_cast<uint32_t>(h & 0x8000u) << 16;
     const uint32_t exp = (h >> 10) & 0x1Fu;
@@ -50,7 +54,8 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
-float read_f16(const uint8_t* data, uint32_t offset) {
+float read_f16(const uint8_t* data, size_t size, uint32_t offset) {
+    need(size, offset, 2, "fp16 out of range");
     return f16_to_f32(rd_u16(data + offset));
 }
 
@@ -66,9 +71,13 @@ uint32_t crc32(const uint8_t* data, size_t n) {
     return ~c;
 }
 
-void unpack_codes(const uint8_t* data, uint32_t offset, int c, int h, int w, int bits, int stride,
-                  std::vector<uint8_t>& dst) {
-    dst.assign(static_cast<size_t>(c) * h * w, 0);
+void unpack_codes(const uint8_t* data, size_t limit, uint32_t offset, int c, int h, int w, int bits,
+                  int stride, std::vector<uint8_t>& dst) {
+    if (c < 0 || h < 0 || w < 0 || stride < 0) throw std::runtime_error("bad latent shape");
+    if (w > 0 && stride <= 0) throw std::runtime_error("latent stride");
+    const uint64_t nbytes = static_cast<uint64_t>(c) * static_cast<uint64_t>(stride) * static_cast<uint64_t>(h);
+    need(limit, offset, nbytes, "latent codes out of range");
+    dst.assign(static_cast<size_t>(c) * static_cast<size_t>(h) * static_cast<size_t>(w), 0);
     for (int ci = 0; ci < c; ++ci) {
         for (int y = 0; y < h; ++y) {
             const uint8_t* row = data + offset + static_cast<uint32_t>(ci) * stride * h +
@@ -406,6 +415,9 @@ TextureSet parse(const uint8_t* data, size_t size) {
     if (ts.tile_size != 0) {
         throw std::runtime_error("per-tile latent endpoints are not in this reader");
     }
+    if (ts.width == 0 || ts.height == 0 || ts.num_mips == 0) {
+        throw std::runtime_error("empty image");
+    }
     const uint32_t channel_off = rd_u32(data + 40);
     const uint32_t latent_off = rd_u32(data + 52);
     const uint32_t latent_bytes = rd_u32(data + 56);
@@ -422,7 +434,8 @@ TextureSet parse(const uint8_t* data, size_t size) {
     std::vector<uint8_t> inflated;
     const uint8_t* code_base = data;
     if (ts.flags & kFlagLatentCompressed) {
-        if (plain_len == 0 || static_cast<size_t>(latent_off) + latent_bytes > size) {
+        if (plain_len == 0 || plain_len > 64u * 1024u * 1024u ||
+            static_cast<uint64_t>(latent_off) + latent_bytes > size) {
             throw std::runtime_error("bad compressed latent span");
         }
         if (flag_deflate) {
@@ -442,7 +455,11 @@ TextureSet parse(const uint8_t* data, size_t size) {
     }
     const uint32_t grid_off = rd_u32(data + 44);
     const uint32_t layer_off = rd_u32(data + 48);
+    need(size, channel_off, static_cast<uint64_t>(num_channels) * 8u, "channel table");
+    need(size, grid_off, static_cast<uint64_t>(num_grids) * 24u, "grid table");
+    need(size, layer_off, static_cast<uint64_t>(num_layers) * 32u, "layer table");
     ts.raw.assign(data, data + size);
+    const size_t code_limit = (ts.flags & kFlagLatentCompressed) ? inflated.size() : size;
 
     ts.channels.resize(num_channels);
     for (uint32_t i = 0; i < num_channels; ++i) {
@@ -463,11 +480,12 @@ TextureSet parse(const uint8_t* data, size_t size) {
         g.data_bytes = rd_u32(p + 12);
         g.scale_offset = rd_u32(p + 16);
         g.plane_bytes = rd_u32(p + 20);
-        unpack_codes(code_base, g.data_offset, g.channels, g.height, g.width, g.bits, g.row_stride,
-                     g.codes);
+        unpack_codes(code_base, code_limit, g.data_offset, g.channels, g.height, g.width, g.bits,
+                     g.row_stride, g.codes);
         g.scale.resize(g.channels);
+        need(size, g.scale_offset, static_cast<uint64_t>(g.channels) * 2u, "latent scale");
         for (int c = 0; c < g.channels; ++c) {
-            g.scale[c] = read_f16(data, g.scale_offset + static_cast<uint32_t>(c) * 2);
+            g.scale[c] = read_f16(data, size, g.scale_offset + static_cast<uint32_t>(c) * 2);
         }
         build_mips(g);
         ts.grids[i] = std::move(g);
@@ -489,6 +507,12 @@ TextureSet parse(const uint8_t* data, size_t size) {
         const int out = layer.out_features;
         const int inn = layer.in_features;
         layer.weight.assign(static_cast<size_t>(out) * inn, 0.f);
+        const uint64_t wbytes = layer.weight_bits == 8
+                                    ? static_cast<uint64_t>(out) * static_cast<uint64_t>(inn)
+                                    : static_cast<uint64_t>(out) * static_cast<uint64_t>((inn + 1) / 2);
+        if (layer.weight_bits == 8 || layer.weight_bits == 4) {
+            need(size, layer.weight_offset, wbytes, "weights");
+        }
         if (layer.weight_bits == 8) {
             const int8_t* w = reinterpret_cast<const int8_t*>(data + layer.weight_offset);
             for (int k = 0; k < out * inn; ++k) layer.weight[k] = static_cast<float>(w[k]);
@@ -507,12 +531,14 @@ TextureSet parse(const uint8_t* data, size_t size) {
             throw std::runtime_error("bad weight bits");
         }
         layer.bias.resize(out);
+        need(size, layer.bias_offset, static_cast<uint64_t>(out) * 2u, "bias");
         for (int o = 0; o < out; ++o) {
-            layer.bias[o] = read_f16(data, layer.bias_offset + static_cast<uint32_t>(o) * 2);
+            layer.bias[o] = read_f16(data, size, layer.bias_offset + static_cast<uint32_t>(o) * 2);
         }
         layer.scale.resize(static_cast<size_t>(out) * layer.num_groups);
+        need(size, layer.scale_offset, static_cast<uint64_t>(layer.scale.size()) * 2u, "weight scale");
         for (size_t k = 0; k < layer.scale.size(); ++k) {
-            layer.scale[k] = read_f16(data, layer.scale_offset + static_cast<uint32_t>(k) * 2);
+            layer.scale[k] = read_f16(data, size, layer.scale_offset + static_cast<uint32_t>(k) * 2);
         }
         ts.layers[i] = std::move(layer);
     }
@@ -523,7 +549,7 @@ TextureSet parse(const uint8_t* data, size_t size) {
         ts.act_scales.resize(static_cast<size_t>(n));
         for (int i = 0; i < n; ++i) {
             ts.act_scales[static_cast<size_t>(i)] =
-                read_f16(data, size - nbytes + static_cast<uint32_t>(i) * 2u);
+                read_f16(data, size, static_cast<uint32_t>(size - nbytes + static_cast<uint32_t>(i) * 2u));
         }
     }
     return ts;

@@ -208,8 +208,21 @@ def pack_codes(codes: np.ndarray, bits: int) -> tuple[bytes, int, int]:
     return out.tobytes(), stride, plane
 
 
+def _need(blob: bytes | memoryview, offset: int, nbytes: int, what: str) -> None:
+    """Reject a table or payload that would read past ``blob``."""
+    size = len(blob)
+    if offset < 0 or nbytes < 0 or offset > size or nbytes > size - offset:
+        raise ValueError(f"{what} out of range")
+
+
 def unpack_codes(blob: bytes | memoryview, offset: int, c: int, h: int, w: int, bits: int, stride: int):
-    raw = np.frombuffer(blob, dtype=np.uint8, count=c * stride * h, offset=offset)
+    if c < 0 or h < 0 or w < 0 or stride < 0 or bits not in (2, 4, 8):
+        raise ValueError(f"bad latent shape bits={bits}")
+    if w > 0 and stride <= 0:
+        raise ValueError("latent stride")
+    nbytes = c * stride * h
+    _need(blob, offset, nbytes, "latent codes")
+    raw = np.frombuffer(blob, dtype=np.uint8, count=nbytes, offset=offset)
     raw = raw.reshape(c, h, stride)
     if bits == 8:
         return raw[:, :, :w].copy()
@@ -254,8 +267,11 @@ def _f16_bytes(values: np.ndarray) -> bytes:
 
 
 def _read_f16(blob: bytes, offset: int, count: int) -> np.ndarray:
+    if count < 0:
+        raise ValueError("fp16 count")
     if offset % 2:
         raise ValueError("fp16 offset must be 2-aligned")
+    _need(blob, offset, count * 2, "fp16")
     raw = np.frombuffer(blob, dtype=np.float16, count=count, offset=offset)
     return np.array(raw, dtype=np.float32)
 
@@ -277,12 +293,16 @@ def pack_weight_matrix(codes: np.ndarray, bits: int) -> bytes:
 
 
 def unpack_weight_matrix(blob: bytes, offset: int, out: int, inn: int, bits: int) -> np.ndarray:
+    if out < 0 or inn < 0:
+        raise ValueError("bad weight shape")
     if bits == 8:
+        _need(blob, offset, out * inn, "weights")
         raw = np.frombuffer(blob, dtype=np.int8, count=out * inn, offset=offset)
         return np.array(raw, dtype=np.float32).reshape(out, inn)
     if bits != 4:
         raise ValueError(bits)
     row_bytes = (inn + 1) // 2
+    _need(blob, offset, out * row_bytes, "weights")
     raw = np.frombuffer(blob, dtype=np.uint8, count=out * row_bytes, offset=offset)
     raw = raw.reshape(out, row_bytes)
     lo = (raw & 0x0F).astype(np.int16)
@@ -615,19 +635,25 @@ def parse_texture_set(blob: bytes) -> TextureSet:
         raise ValueError("bad header size")
     if file_bytes != len(blob):
         raise ValueError(f"file_bytes {file_bytes} != {len(blob)}")
+    if width <= 0 or height <= 0 or num_mips <= 0:
+        raise ValueError("empty image")
     got = zlib.crc32(blob[HEADER_BYTES:]) & 0xFFFFFFFF
     if got != crc:
         raise ValueError(f"crc mismatch {got:#x} != {crc:#x}")
     if _HEADER.size != HEADER_BYTES:
         raise RuntimeError("struct size")
+    _need(blob, channel_off, num_channels * 8, "channel table")
+    _need(blob, grid_off, num_grids * 24, "grid table")
+    _need(blob, layer_off, num_layers * 32, "layer table")
 
     nflags = bin(flags & (FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE | FLAG_LATENT_CTX)).count("1")
     if nflags > 1:
         raise ValueError("latent coder flags are mutually exclusive")
     code_src: bytes | memoryview = blob
     if flags & FLAG_LATENT_COMPRESSED:
-        if latent_plain <= 0:
+        if latent_plain <= 0 or latent_plain > 64 * 1024 * 1024:
             raise ValueError("compressed latent without inflated length")
+        _need(blob, int(latent_off), int(latent_bytes), "compressed latent")
         packed = blob[latent_off : latent_off + latent_bytes]
         if flags & FLAG_LATENT_DEFLATE:
             code_src = inflate_raw(packed, latent_plain)

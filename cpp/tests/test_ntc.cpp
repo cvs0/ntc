@@ -127,6 +127,40 @@ static void test_fixture(const std::string& dir) {
     expect(gpu.blob.size() >= ts.raw.size(), "blob holds the file");
 }
 
+static uint32_t crc32_ref(const uint8_t* data, size_t n) {
+    uint32_t c = 0xFFFFFFFFu;
+    for (size_t i = 0; i < n; ++i) {
+        c ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            const uint32_t mask = -(c & 1u);
+            c = (c >> 1) ^ (0xEDB88320u & mask);
+        }
+    }
+    return ~c;
+}
+
+static void test_wild_offset(const std::string& dir) {
+    auto bytes = read_bin(dir + "/tiny.ntc");
+    expect(bytes.size() > 96, "tiny present for offset test");
+    if (bytes.size() <= 96) return;
+    bytes[40] = 0xF0;
+    bytes[41] = 0xFF;
+    bytes[42] = 0xFF;
+    bytes[43] = 0xFF;
+    const uint32_t crc = crc32_ref(bytes.data() + 96, bytes.size() - 96);
+    bytes[76] = static_cast<uint8_t>(crc);
+    bytes[77] = static_cast<uint8_t>(crc >> 8);
+    bytes[78] = static_cast<uint8_t>(crc >> 16);
+    bytes[79] = static_cast<uint8_t>(crc >> 24);
+    bool threw = false;
+    try {
+        ntc::parse(bytes.data(), bytes.size());
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    expect(threw, "wild channel offset throws");
+}
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "tests/fixtures";
     test_quant();
@@ -134,6 +168,7 @@ int main(int argc, char** argv) {
     test_range_ctx();
     test_ctx_file(dir);
     test_fixture(dir);
+    test_wild_offset(dir);
     if (g_fails) {
         std::cerr << g_fails << " failures\n";
         return 1;

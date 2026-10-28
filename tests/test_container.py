@@ -258,6 +258,118 @@ def test_tile_endpoints_roundtrip():
     np.testing.assert_array_equal(ts.grids[0].codes, codes)
 
 
+def _recrc(blob: bytearray) -> bytes:
+    import struct
+    import zlib
+
+    crc = zlib.crc32(blob[HEADER_BYTES:]) & 0xFFFFFFFF
+    struct.pack_into("<I", blob, 76, crc)
+    return bytes(blob)
+
+
+def test_truncated_bad_magic_and_version_are_value_errors():
+    blob = _tiny_blob()
+    for n in (0, 8, HEADER_BYTES - 1, HEADER_BYTES):
+        try:
+            parse_texture_set(blob[:n] if n else b"")
+            assert n == HEADER_BYTES
+        except ValueError:
+            pass
+    bad = bytearray(blob)
+    bad[0] ^= 0xFF
+    try:
+        parse_texture_set(_recrc(bad))
+        raised = False
+    except ValueError as exc:
+        raised = "magic" in str(exc)
+    assert raised
+    bad = bytearray(blob)
+    bad[4] = 99
+    try:
+        parse_texture_set(_recrc(bad))
+        raised = False
+    except ValueError as exc:
+        raised = "version" in str(exc)
+    assert raised
+
+
+def test_zero_size_and_wild_offset_are_value_errors():
+    blob = bytearray(_tiny_blob())
+    import struct
+
+    struct.pack_into("<I", blob, 12, 0)
+    try:
+        parse_texture_set(_recrc(blob))
+        raised = False
+    except ValueError as exc:
+        raised = "empty" in str(exc)
+    assert raised
+    blob = bytearray(_tiny_blob())
+    struct.pack_into("<I", blob, 40, 0xFFFFFFF0)
+    try:
+        parse_texture_set(_recrc(blob))
+        raised = False
+    except ValueError as exc:
+        raised = "channel table" in str(exc)
+    assert raised
+
+
+def test_range_coder_roundtrip_and_truncated():
+    from ntc.range_coder import range_decode, range_decode_ctx, range_encode, range_encode_ctx
+
+    rng = np.random.default_rng(1)
+    for n in (0, 1, 2, 7, 15, 64, 200):
+        raw = bytes(int(v) for v in rng.integers(0, 256, size=n))
+        assert range_decode(range_encode(raw), n) == raw
+        assert range_decode_ctx(range_encode_ctx(raw), n) == raw
+    try:
+        range_decode(b"\x00\x01", 4)
+        raised = False
+    except ValueError:
+        raised = True
+    assert raised
+
+
+def test_encode_odd_size_single_channel_is_finite_and_deterministic():
+    from ntc.decode_ref import decode_mip
+    from ntc.encode import TrainConfig, encode_arrays
+
+    img = np.linspace(0.0, 1.0, 3 * 5, dtype=np.float32).reshape(1, 3, 5)
+    cfg = TrainConfig(
+        steps=2,
+        hidden=(4,),
+        grids=[(4, 2, 1, 4)],
+        seed=3,
+        seed_pool=1,
+        adaptive_pool=1,
+        with_ssim=False,
+        mip_levels=2,
+        fast=False,
+        device="cpu",
+        pca_init=True,
+        log_every=10**9,
+    )
+    a, _ = encode_arrays(img, [0], cfg)
+    b, _ = encode_arrays(img, [0], cfg)
+    assert a == b
+    recon = decode_mip(parse_texture_set(a), 0)
+    assert recon.shape == (3, 5, 1)
+    assert np.isfinite(recon).all()
+
+
+def test_mutated_bytes_do_not_escape_value_error():
+    blob = _tiny_blob()
+    rng = np.random.default_rng(0)
+    for _ in range(80):
+        trial = bytearray(blob)
+        index = int(rng.integers(0, len(trial)))
+        trial[index] ^= int(rng.integers(1, 256))
+        try:
+            parse_texture_set(bytes(trial))
+        except ValueError:
+            continue
+
+
 def test_crc_detects_corruption():
     blob = bytearray(_tiny_blob())
     blob[-1] ^= 0xFF
