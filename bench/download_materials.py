@@ -4,9 +4,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 import urllib.request
 import zipfile
 from pathlib import Path
+
+# Running ``python bench/download_materials.py`` puts bench/ on sys.path.
+_ROOT = Path(__file__).resolve().parents[1]
+for _path in (str(_ROOT), str(_ROOT / "src")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 POLY = "https://dl.polyhaven.org/file/ph-assets/Textures/jpg/{size}/{name}/{name}_{map}_{size}.jpg"
 AMBIENT = "https://ambientcg.com/get?file={name}_{size}-JPG.zip"
@@ -116,7 +123,13 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dest", type=Path, default=Path("data/materials"))
     p.add_argument("--preset", choices=("base", "max", "rtxntc", "cloud"), default="base")
+    p.add_argument("--dry-run", action="store_true", help="Resolve the cloud name lists and do not download.")
     args = p.parse_args()
+    if args.preset == "cloud" and args.dry_run:
+        from bench.train_max_v2 import CLOUD_HOLDOUT, CLOUD_TRAIN
+
+        print(f"cloud train {len(CLOUD_TRAIN)} holdout {len(CLOUD_HOLDOUT)}")
+        return
     if args.preset == "cloud":
         cloud_materials(args.dest)
         print(args.dest)

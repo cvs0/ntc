@@ -15,6 +15,9 @@ git fetch origin "$BRANCH"
 git checkout "$BRANCH"
 git pull --ff-only origin "$BRANCH"
 
+# ``python bench/x.py`` puts bench/ on sys.path, not the repo root.
+export PYTHONPATH="$ROOT/src:$ROOT"
+
 python -m pip install -e ".[dev]"
 python bench/download_materials.py --preset cloud --dest "$ROOT/data/materials"
 

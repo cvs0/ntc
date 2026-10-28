@@ -1,6 +1,9 @@
 """Cloud 5090 profile stays off the laptop job list."""
 
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -152,3 +155,48 @@ def test_collect_keeps_a_finished_json_over_a_later_partial(tmp_path: Path):
     assert rows[0]["psnr_u8"] == 30.0
     saved = json.loads((tmp_path / "out" / "cloud_Metal003_2K_b1.json").read_text())
     assert saved["done"] is True
+
+
+def test_cloud_entry_points_run_as_files_without_pythonpath(tmp_path: Path):
+    """``python bench/x.py`` must import ``bench`` with a clean environment.
+
+    That invocation puts ``bench/`` on sys.path. The pod failed in
+    ``download_materials.py --preset cloud`` with ``No module named 'bench'``.
+    """
+    repo = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    script = (repo / "bench/cloud/setup_pod.sh").read_text()
+    assert 'export PYTHONPATH="$ROOT/src:$ROOT"' in script
+
+    def run(args: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [sys.executable, *args],
+            cwd=repo,
+            env=env,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+
+    listed = run(["bench/download_materials.py", "--preset", "cloud", "--dry-run"])
+    assert listed.returncode == 0, listed.stderr
+    assert "cloud train 12 holdout 3" in listed.stdout
+
+    planned = run(
+        [
+            "bench/train_max_v2.py",
+            "--profile",
+            "cloud5090",
+            "--dry-run",
+            "--shard",
+            "0/5",
+            "--out",
+            str(tmp_path / "out"),
+            "--materials",
+            str(tmp_path / "materials"),
+        ]
+    )
+    assert planned.returncode == 0, planned.stderr
+    assert "cloud_" in planned.stdout

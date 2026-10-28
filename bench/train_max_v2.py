@@ -28,11 +28,17 @@ import time
 import traceback
 from pathlib import Path
 
-from bench.train_max import G16
-from ntc.device import device_report, pick_device
-from ntc.encode import TrainConfig
-from ntc.materials import load_material
-from ntc.train_fast import choose_precision, encode_arrays_fast
+# Running ``python bench/train_max_v2.py`` puts bench/ on sys.path.
+_ROOT = Path(__file__).resolve().parents[1]
+for _path in (str(_ROOT), str(_ROOT / "src")):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
+
+from bench.train_max import G16  # noqa: E402
+from ntc.device import device_report, pick_device  # noqa: E402
+from ntc.encode import TrainConfig  # noqa: E402
+from ntc.materials import load_material  # noqa: E402
+from ntc.train_fast import choose_precision, encode_arrays_fast  # noqa: E402
 
 
 def parse_shard(text: str) -> tuple[int, int]:
