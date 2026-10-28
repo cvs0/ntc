@@ -50,6 +50,16 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
 # A run that finishes within this many dB of its init did not train the latent.
 NEAR_INIT_DB = 4.0
 
+# A mean loss over a 2048 frame puts per-texel code gradients near 1e-10
+# to 1e-11. Adam's default eps of 1e-8 then keeps only a few percent of the
+# learning rate (about 1% at 1e-10, about 4% at 4e-10). 1e-15 leaves the
+# latent step next to the learning rate. beta2 0.99 follows that sparse
+# code gradient. MLP weights keep the library defaults.
+LATENT_ADAM_EPS = 1e-15
+LATENT_ADAM_BETAS = (0.9, 0.99)
+MLP_ADAM_EPS = 1e-8
+MLP_ADAM_BETAS = (0.9, 0.999)
+
 
 def wide_latent(grids) -> bool:
     """True when any latent grid has 8 or more channels."""
@@ -510,14 +520,42 @@ def _clip_no_sync(params, max_norm: float) -> None:
         grad.mul_(coef)
 
 
+def _lr_slot(value: float, device: torch.device, capturable: bool):
+    """A CUDA-graph Adam reads ``lr`` as a device tensor and updates it in place."""
+    if capturable and device.type == "cuda":
+        return torch.tensor(float(value), device=device)
+    return float(value)
+
+
+def _assign_lr(group: dict, value: float) -> None:
+    slot = group["lr"]
+    if torch.is_tensor(slot):
+        slot.fill_(float(value))
+    else:
+        group["lr"] = float(value)
+
+
 def _adam_on(stacked: StackedTrain, cfg: TrainConfig, capturable: bool):
+    device = stacked.latents[0].device
     latent = [p for p in list(stacked.latents.parameters()) + list(stacked.log_scales.parameters()) if p.requires_grad]
     mlp = [p for p in list(stacked.weights.parameters()) + list(stacked.biases.parameters()) if p.requires_grad]
     groups = []
     if latent:
-        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult, "name": "latent"})
+        groups.append({
+            "params": latent,
+            "lr": _lr_slot(cfg.lr * cfg.latent_lr_mult, device, capturable),
+            "name": "latent",
+            "eps": LATENT_ADAM_EPS,
+            "betas": LATENT_ADAM_BETAS,
+        })
     if mlp:
-        groups.append({"params": mlp, "lr": cfg.lr, "name": "mlp"})
+        groups.append({
+            "params": mlp,
+            "lr": _lr_slot(cfg.lr, device, capturable),
+            "name": "mlp",
+            "eps": MLP_ADAM_EPS,
+            "betas": MLP_ADAM_BETAS,
+        })
     if not groups:
         raise ValueError("no trainable parameters")
     if cfg.optimizer == "lion":
@@ -800,9 +838,9 @@ def _run_loop(
         lr = _step_lr(cfg, step) * lr_scale
         for group in opt.param_groups:
             if group.get("name") == "latent":
-                group["lr"] = lr * cfg.latent_lr_mult
+                _assign_lr(group, lr * cfg.latent_lr_mult)
             else:
-                group["lr"] = lr
+                _assign_lr(group, lr)
 
     def one_step(step: int, replay: bool) -> torch.Tensor:
         _group_lr(step)
@@ -1015,8 +1053,18 @@ def _single_adam(net: NtcNet, cfg: TrainConfig) -> torch.optim.Adam:
     latent += list(net.tile_log_scales.parameters()) + list(net.tile_offsets.parameters())
     return torch.optim.Adam(
         [
-            {"params": latent, "lr": cfg.lr * cfg.latent_lr_mult},
-            {"params": net.linears.parameters(), "lr": cfg.lr},
+            {
+                "params": latent,
+                "lr": cfg.lr * cfg.latent_lr_mult,
+                "eps": LATENT_ADAM_EPS,
+                "betas": LATENT_ADAM_BETAS,
+            },
+            {
+                "params": net.linears.parameters(),
+                "lr": cfg.lr,
+                "eps": MLP_ADAM_EPS,
+                "betas": MLP_ADAM_BETAS,
+            },
         ]
     )
 

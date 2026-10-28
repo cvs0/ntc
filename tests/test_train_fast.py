@@ -8,8 +8,10 @@ import torch
 from ntc.encode import TrainConfig, encode_arrays
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
+    LATENT_ADAM_EPS,
     NEAR_INIT_DB,
     StackedTrain,
+    _adam_on,
     _mesh_uv,
     bilinear_batched,
     encode_arrays_fast,
@@ -107,6 +109,39 @@ def test_halving_drops_seeds():
     assert alive[0] == [0, 1, 2, 3]
     assert len(alive[-1]) == 1
     assert stats["winner_seed"] in alive[-1]
+
+
+def test_latent_adam_step_matches_lr_at_2k_grad_scale():
+    """A 2048 mean loss yields per-texel grads near 1e-10.
+
+    Default eps 1e-8 keeps about 1% of the learning rate there. The latent
+    group uses 1e-15, so the first step stays next to the learning rate.
+    """
+    torch.manual_seed(0)
+    net = _net()
+    stacked = StackedTrain([net])
+    cfg = TrainConfig(steps=1, lr=1e-2, latent_lr_mult=1.0, fast=True, compile_step="off", cuda_graph="off")
+    opt = _adam_on(stacked, cfg, capturable=False)
+    latent = next(group for group in opt.param_groups if group.get("name") == "latent")
+    mlp = next(group for group in opt.param_groups if group.get("name") == "mlp")
+    assert latent["eps"] == LATENT_ADAM_EPS == 1e-15
+    assert latent["betas"] == (0.9, 0.99)
+    assert mlp["eps"] == 1e-8
+    grad = 1e-10
+    probe = torch.nn.Parameter(torch.zeros(4, 8, 8))
+    step_opt = torch.optim.Adam([{"params": [probe], "lr": 1e-2, "eps": LATENT_ADAM_EPS, "betas": (0.9, 0.99)}])
+    probe.grad = torch.full_like(probe, grad)
+    before = probe.detach().clone()
+    step_opt.step()
+    delta = float((probe.detach() - before).abs().mean())
+    assert delta > 0.5 * 1e-2
+    default = torch.nn.Parameter(torch.zeros(4, 8, 8))
+    slow = torch.optim.Adam([default], lr=1e-2)
+    default.grad = torch.full_like(default, grad)
+    base = default.detach().clone()
+    slow.step()
+    shrunk = float((default.detach() - base).abs().mean())
+    assert shrunk < 0.05 * 1e-2
 
 
 def test_lr_scales_linearly_with_batch():
