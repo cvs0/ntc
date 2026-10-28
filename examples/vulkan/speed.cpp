@@ -307,7 +307,7 @@ void run_vk_speed(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
 
     // Packed int8 sample. Exact when the file carries act scales, otherwise max-abs/127.
     std::cout << "note i8_path i8vec4_dot4 " << (ts.act_int8() ? "exact_qat" : "approx_maxabs") << "\n";
-    std::cout << "note i8_dot glslang_15_has_no_GL_EXT_shader_integer_dot_product\n";
+    std::cout << "note i8_dot glslang_15_has_no_GL_EXT_integer_dot_product\n";
     if (!int8) {
         std::cout << "bench sample_i8 skipped shaderInt8\n";
     } else {
