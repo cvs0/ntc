@@ -12,6 +12,7 @@ from ntc.train_fast import (
     NEAR_INIT_DB,
     StackedTrain,
     _adam_on,
+    _assign_lr,
     _mesh_uv,
     bilinear_batched,
     encode_arrays_fast,
@@ -143,6 +144,17 @@ def test_halving_drops_seeds():
     assert alive[0] == [0, 1, 2, 3]
     assert len(alive[-1]) == 1
     assert stats["winner_seed"] in alive[-1]
+
+
+def test_assign_lr_fills_a_capturable_tensor():
+    slot = torch.tensor(0.1)
+    group = {"lr": slot}
+    _assign_lr(group, 0.25)
+    assert group["lr"] is slot
+    assert float(slot) == 0.25
+    plain = {"lr": 0.1}
+    _assign_lr(plain, 0.3)
+    assert plain["lr"] == 0.3
 
 
 def test_latent_adam_step_matches_lr_at_2k_grad_scale():

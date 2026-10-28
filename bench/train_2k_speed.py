@@ -310,7 +310,12 @@ def _child_env() -> dict:
 
 
 def _run_isolated(args: argparse.Namespace) -> dict:
-    """One subprocess per mode so a failed CUDA graph does not poison the next."""
+    """One subprocess per mode.
+
+    A failed CUDA graph capture leaves the context unusable for the next
+    call in the same process (pytorch 171263). The Triton gather then
+    failed while loading a state dict. Each mode is a fresh process.
+    """
     out = Path(args.out)
     _forbid_v2(out)
     modes = [name.strip() for name in args.modes.split(",") if name.strip()]

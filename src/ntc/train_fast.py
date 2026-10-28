@@ -972,9 +972,23 @@ def _run_loop(
                 graph_idx = static_sample_indices(
                     mips, batch, str(cfg.batch_mip), stacked.latents[0].device
                 )
-            for warm in range(3):
-                refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
-                one_step(start_step + warm, replay=True)
+
+            def _warm_graph() -> None:
+                for warm in range(3):
+                    refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+                    one_step(start_step + warm, replay=True)
+
+            # Warm up on a side stream so the capture stream does not replay
+            # a generator or allocator state from those steps. A failed
+            # capture on the capturing stream poisons later CUDA work
+            # (pytorch 171263). The learning rate is a device tensor when
+            # Adam was built capturable, and sample indices are filled
+            # outside the capture.
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                _warm_graph()
+            torch.cuda.current_stream().wait_stream(side)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
