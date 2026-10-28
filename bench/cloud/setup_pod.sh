@@ -11,13 +11,24 @@ BRANCH="${NTC_BRANCH:-cursor/ntc-rd-gpu-2cb6}"
 REPO="${NTC_REPO:-https://github.com/cvs0/ntc.git}"
 OUT="${NTC_OUT:-$ROOT/results/cloud5090}"
 
+# One lock for clone, pull, and the material download. Two shards pulling
+# the same checkout at once fail with "Cannot fast-forward to multiple
+# branches." The lock file lives beside the repo so it exists before clone.
+mkdir -p "$(dirname "$ROOT")"
+exec 9>"$(dirname "$ROOT")/.ntc_cloud_setup.lock"
+flock 9
+
 if [[ ! -d "$ROOT/.git" ]]; then
   git clone --branch "$BRANCH" "$REPO" "$ROOT"
 fi
 cd "$ROOT"
 git fetch origin "$BRANCH"
 git checkout "$BRANCH"
-git pull --ff-only origin "$BRANCH"
+if [[ "$(git rev-parse HEAD)" == "$(git rev-parse "origin/$BRANCH")" ]]; then
+  echo "HEAD matches origin/$BRANCH"
+else
+  git pull --ff-only origin "$BRANCH"
+fi
 
 # ``python bench/x.py`` puts bench/ on sys.path, not the repo root.
 export PYTHONPATH="$ROOT/src:$ROOT"
@@ -26,13 +37,15 @@ python -m pip install -e ".[dev]"
 MATS="$ROOT/data/materials"
 mkdir -p "$MATS"
 SPLIT="$MATS/cloud_split.json"
-exec 9>"$MATS/.cloud_download.lock"
-flock 9
 if [[ -f "$SPLIT" ]]; then
   echo "skip download $SPLIT"
 else
   python bench/download_materials.py --preset cloud --dest "$MATS"
 fi
+
+# The nohup trainer inherits open fds. Leaving fd 9 open holds this flock
+# until that process exits, and the next shard on the pod blocks forever.
+exec 9>&-
 
 python - << 'PY'
 import torch
@@ -54,6 +67,6 @@ nohup python bench/train_max_v2.py \
   --shard "$SHARD" \
   --out "$OUT" \
   --materials "$ROOT/data/materials" \
-  > "$LOG" 2>&1 &
+  9>&- > "$LOG" 2>&1 &
 echo $! | tee "$PID"
 echo "log $LOG"

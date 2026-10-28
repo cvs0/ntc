@@ -1091,6 +1091,23 @@ def _read_precision(path: Path, identity: dict) -> str | None:
     return str(report["equal_wall_choice"])
 
 
+def _precision_material(materials: Path) -> Path | None:
+    """Manifest folder for the bf16 versus fp32 probe.
+
+    Laptop trees ship ``metal_plate``. The cloud download does not, and the
+    probe was printing ``missing .../metal_plate`` and staying on fp32.
+    The first cloud train folder that has a manifest is the stand-in.
+    """
+    preferred = materials / "metal_plate"
+    if (preferred / "manifest.json").is_file():
+        return preferred
+    for name in CLOUD_TRAIN:
+        folder = materials / f"{name}_2K"
+        if (folder / "manifest.json").is_file():
+            return folder
+    return None
+
+
 def _ensure_precision(args: argparse.Namespace) -> str:
     path = args.out / "precision.json"
     identity = precision_identity()
@@ -1107,9 +1124,9 @@ def _ensure_precision(args: argparse.Namespace) -> str:
             path,
             flush=True,
         )
-    metal = args.materials / "metal_plate"
-    if not (metal / "manifest.json").is_file():
-        print("missing", metal)
+    metal = _precision_material(args.materials)
+    if metal is None:
+        print("missing", args.materials / "metal_plate")
         return "fp32"
     images, _sems, _info = load_material(metal, 256)
     probe_cfg = TrainConfig(

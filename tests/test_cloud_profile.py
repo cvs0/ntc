@@ -19,6 +19,7 @@ from bench.train_max_v2 import (
     CLOUD_SEED_FACTOR,
     CLOUD_STEPS_PER_S,
     CLOUD_TRAIN,
+    _precision_material,
     assign_shards,
     build_cloud_jobs,
     build_jobs,
@@ -29,6 +30,21 @@ from bench.train_max_v2 import (
 from ntc.encode import TrainConfig
 from ntc.materials import load_material
 from ntc.train_fast import StackedTrain, _build_nets, _sync_quant_schedule, encode_arrays_fast
+
+
+def test_precision_probe_uses_a_cloud_material_when_metal_plate_is_absent(tmp_path: Path):
+    """The cloud tree has no ``metal_plate``. The probe must not require it."""
+    cloud = tmp_path / "MetalPlates013_2K"
+    cloud.mkdir()
+    (cloud / "manifest.json").write_text("{}")
+    assert _precision_material(tmp_path) == cloud
+    laptop = tmp_path / "metal_plate"
+    laptop.mkdir()
+    (laptop / "manifest.json").write_text("{}")
+    assert _precision_material(tmp_path) == laptop
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert _precision_material(empty) is None
 
 
 def test_laptop_sdk_job_is_unchanged():
@@ -175,6 +191,20 @@ def test_cloud_entry_points_run_as_files_without_pythonpath(tmp_path: Path):
     assert "no outbound internet" in script
     assert "cloud_split.json" in script
     assert "skip download" in script
+    lines = script.splitlines()
+
+    def at(text: str) -> int:
+        for i, line in enumerate(lines):
+            if text in line:
+                return i
+        raise AssertionError(text)
+
+    # Pull stays inside the setup lock. The trainer must not inherit fd 9.
+    assert at("flock 9") < at("git pull --ff-only")
+    assert "HEAD matches origin/$BRANCH" in script
+    assert at("exec 9>&-") < at("nohup python")
+    launch = "\n".join(lines[at("nohup python") : at("nohup python") + 8])
+    assert "9>&-" in launch
     syntax = subprocess.run(["bash", "-n", str(repo / "bench/cloud/setup_pod.sh")], check=False)
     assert syntax.returncode == 0
 
