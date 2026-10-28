@@ -54,15 +54,31 @@ set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
 set(SPV_DIR ${CMAKE_BINARY_DIR}/shaders)
 file(MAKE_DIRECTORY ${SPV_DIR})
 
+if(GLSLANG)
+    set(NTC_DOT_PROBE ${SPV_DIR}/ntc_dot_probe.comp)
+    file(WRITE ${NTC_DOT_PROBE}
+        "#version 450\n#extension GL_EXT_integer_dot_product : require\nlayout(local_size_x=1) in;\nvoid main(){ dotPacked4x8EXT(1u, 1u); }\n")
+    execute_process(
+        COMMAND ${GLSLANG} -V --target-env vulkan1.3 ${NTC_DOT_PROBE} -o ${SPV_DIR}/ntc_dot_probe.spv
+        RESULT_VARIABLE NTC_DOT_RC
+        ERROR_VARIABLE NTC_DOT_ERR
+        OUTPUT_VARIABLE NTC_DOT_OUT)
+    if(NTC_DOT_RC EQUAL 0 AND NOT NTC_DOT_ERR MATCHES "WARNING" AND NOT NTC_DOT_OUT MATCHES "WARNING")
+        file(WRITE ${SPV_DIR}/ntc_dot_config.glsl "#define NTC_HAVE_DOT4 1\n")
+    else()
+        file(WRITE ${SPV_DIR}/ntc_dot_config.glsl "/* GL_EXT_integer_dot_product is not in this glslang */\n")
+    endif()
+endif()
+
 function(ntc_spirv src env out_name)
     if(NOT GLSLANG)
         return()
     endif()
     add_custom_command(
         OUTPUT ${SPV_DIR}/${out_name}
-        COMMAND ${GLSLANG} -V --target-env ${env} "-I${SHADER_DIR}"
+        COMMAND ${GLSLANG} -V --target-env ${env} "-I${SPV_DIR}" "-I${SHADER_DIR}"
                 ${SHADER_DIR}/${src} -o ${SPV_DIR}/${out_name}
-        DEPENDS ${SHADER_DIR}/${src} ${SHADER_DIR}/ntc_decode.glsl
+        DEPENDS ${SHADER_DIR}/${src} ${SHADER_DIR}/ntc_decode.glsl ${SPV_DIR}/ntc_dot_config.glsl
         VERBATIM)
     set(NTC_SPV_OUTPUTS ${NTC_SPV_OUTPUTS} ${SPV_DIR}/${out_name} PARENT_SCOPE)
 endfunction()

@@ -1,7 +1,10 @@
 #version 450
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-#extension GL_EXT_integer_dot_product : enable
+#include "ntc_dot_config.glsl"
+#ifdef NTC_HAVE_DOT4
+#extension GL_EXT_integer_dot_product : require
+#endif
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "ntc_decode.glsl"
 
@@ -13,7 +16,7 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 // when FLAG_ACT_INT8 is set, otherwise 0 and each vector uses max-abs/127.
 
 int ntc_dot4(int w0, int w1, int w2, int w3, int x0, int x1, int x2, int x3) {
-#ifdef GL_EXT_integer_dot_product
+#ifdef NTC_HAVE_DOT4
     uint wp = (uint(w0) & 255u) | ((uint(w1) & 255u) << 8) | ((uint(w2) & 255u) << 16) | ((uint(w3) & 255u) << 24);
     uint xp = (uint(x0) & 255u) | ((uint(x1) & 255u) << 8) | ((uint(x2) & 255u) << 16) | ((uint(x3) & 255u) << 24);
     return int(dotPacked4x8EXT(wp, xp));
