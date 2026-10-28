@@ -283,11 +283,17 @@ class StackedTrain(nn.Module):
             return int(self.layer_bits[index])
         return int(self.weight_bits)
 
-    def features(self, uv: torch.Tensor, mip: int) -> torch.Tensor:
-        """Latent samples in fp32, ``[S, N, features]``."""
-        feats = []
+    def prepare_mip_chains(self, max_mip: int) -> None:
+        """Build each latent's integer and soft pyramids once.
+
+        ``features`` used to box the code again for every mip, which is
+        quadratic in the mip count. The loss asks for every mip in one step,
+        so the pyramids are stored on the module until that step ends.
+        """
+        limit = max(int(max_mip), 0)
+        ready = []
         for i, lat in enumerate(self.latents):
-            bits = self.grid_bits[i]
+            bits = int(self.grid_bits[i])
             mid = float((1 << bits) - 1) / 2.0
             qmax = (1 << bits) - 1
             scale = fp16_round(torch.exp(self.log_scales[i]).clamp(1e-4, 5.0))
@@ -295,38 +301,58 @@ class StackedTrain(nn.Module):
                 q = torch.round(lat).clamp(0, qmax)
                 q_ste = lat + (q - lat).detach()
                 deq = (q_ste - mid) * scale[:, :, None, None]
-            else:
-                q = None
-                deq = (lat - mid) * scale[:, :, None, None]
-            if mip <= 0 or q is None:
-                sampled = bilinear_batched(deq, uv)
-            else:
                 code = q.detach().to(torch.int64)
-                chain = [code]
+            else:
+                deq = (lat - mid) * scale[:, :, None, None]
+                code = None
+            ints: list[torch.Tensor] = []
+            if code is not None:
+                ints = [code]
                 cur = code
-                while len(chain) <= mip:
+                while len(ints) <= limit:
                     nxt = _leading_box(cur, integer_box)
                     if nxt is None:
                         break
                     if nxt.shape[-2] == cur.shape[-2] and nxt.shape[-1] == cur.shape[-1]:
                         break
-                    chain.append(nxt)
+                    ints.append(nxt)
                     cur = nxt
-                k = min(mip, len(chain) - 1)
-                sampled_codes = bilinear_batched(chain[k].float(), uv)
-                fwd = (sampled_codes - mid) * scale[:, None, :]
-                soft = deq
-                for _ in range(k):
-                    nxt = _leading_box(soft, _soft_box)
-                    if nxt is None:
-                        break
-                    soft = nxt
-                soft_s = bilinear_batched(soft, uv)
-                sampled = fwd.detach() + soft_s - soft_s.detach()
-            feats.append(sampled)
-        if not feats:
-            return uv.new_zeros((self.n_seeds, uv.shape[0], 0))
-        return torch.cat(feats, dim=-1)
+            softs = [deq]
+            soft = deq
+            while len(softs) <= limit:
+                nxt = _leading_box(soft, _soft_box)
+                if nxt is None:
+                    break
+                softs.append(nxt)
+                soft = nxt
+            ready.append((deq, ints, softs, scale, mid))
+        self._mip_ready = ready
+
+    def features(self, uv: torch.Tensor, mip: int) -> torch.Tensor:
+        """Latent samples in fp32, ``[S, N, features]``."""
+        own = getattr(self, "_mip_ready", None) is None
+        if own:
+            self.prepare_mip_chains(max(int(mip), 0))
+        try:
+            feats = []
+            ready = self._mip_ready
+            for deq, ints, softs, scale, mid in ready:
+                if mip <= 0 or not ints:
+                    sampled = bilinear_batched(deq, uv)
+                else:
+                    k = min(int(mip), len(ints) - 1)
+                    sampled_codes = bilinear_batched(ints[k].float(), uv)
+                    fwd = (sampled_codes - mid) * scale[:, None, :]
+                    soft = softs[min(k, len(softs) - 1)]
+                    soft_s = bilinear_batched(soft, uv)
+                    sampled = fwd.detach() + soft_s - soft_s.detach()
+                feats.append(sampled)
+            if not feats:
+                return uv.new_zeros((self.n_seeds, uv.shape[0], 0))
+            return torch.cat(feats, dim=-1)
+        finally:
+            if own:
+                self._mip_ready = None
 
     def mlp(self, hidden: torch.Tensor, amp_dtype: torch.dtype | None, device_type: str) -> torch.Tensor:
         """fp32 master weights. ``amp_dtype`` autocasts the GEMM only."""
@@ -679,61 +705,66 @@ def _loss_from_mips(
     chosen = list(enumerate(mips))
     if cfg.coarse_to_fine and step < int(cfg.steps * 0.4) and len(chosen) > 1:
         chosen = chosen[-1:]
-    for mip, slot in chosen:
-        uv = slot["uv"]
-        tgt = slot["tgt"]
-        count = uv.shape[0]
-        budget = mip_sample_count(batch_pixels, mip, count, cfg.batch_mip)
-        if budget:
-            provided = None if indices is None else indices[mip]
-            if provided is not None:
-                idx = provided
-            elif cfg.importance and mip == 0:
-                from ntc.train_steps import importance_index
+    need = max((mip for mip, _slot in chosen), default=0)
+    stacked.prepare_mip_chains(need)
+    try:
+        for mip, slot in chosen:
+            uv = slot["uv"]
+            tgt = slot["tgt"]
+            count = uv.shape[0]
+            budget = mip_sample_count(batch_pixels, mip, count, cfg.batch_mip)
+            if budget:
+                provided = None if indices is None else indices[mip]
+                if provided is not None:
+                    idx = provided
+                elif cfg.importance and mip == 0:
+                    from ntc.train_steps import importance_index
 
-                cache = getattr(stacked, "_importance", None)
-                if cache is None:
-                    cache = {}
-                    stacked._importance = cache
-                idx = importance_index(stacked, uv, tgt, budget, step, cache)
+                    cache = getattr(stacked, "_importance", None)
+                    if cache is None:
+                        cache = {}
+                        stacked._importance = cache
+                    idx = importance_index(stacked, uv, tgt, budget, step, cache)
+                else:
+                    idx = torch.randint(0, count, (budget,), device=uv.device)
+                uv = uv.index_select(0, idx)
+                tgt = tgt.index_select(1, idx)
+            pred = stacked.predict(
+                uv,
+                mip,
+                max(cfg.mip_levels - 1, 1),
+                amp_dtype,
+                stacked.latents[0].device.type,
+            )
+            # per-seed mse, then the historical channel weights via _loss on a
+            # flattened batch would mix seeds. Apply _loss per seed only when
+            # channel weights are on. The default path is a plain mean.
+            if cfg.channel_weighting or cfg.normal_cosine:
+                seed_losses = []
+                for s in range(pred.shape[0]):
+                    seed_losses.append(_loss(pred[s].float(), tgt[s], semantics, cfg))
+                per = torch.stack(seed_losses)
             else:
-                idx = torch.randint(0, count, (budget,), device=uv.device)
-            uv = uv.index_select(0, idx)
-            tgt = tgt.index_select(1, idx)
-        pred = stacked.predict(
-            uv,
-            mip,
-            max(cfg.mip_levels - 1, 1),
-            amp_dtype,
-            stacked.latents[0].device.type,
-        )
-        # per-seed mse, then the historical channel weights via _loss on a
-        # flattened batch would mix seeds. Apply _loss per seed only when
-        # channel weights are on. The default path is a plain mean.
-        if cfg.channel_weighting or cfg.normal_cosine:
-            seed_losses = []
-            for s in range(pred.shape[0]):
-                seed_losses.append(_loss(pred[s].float(), tgt[s], semantics, cfg))
-            per = torch.stack(seed_losses)
-        else:
-            per = (pred.float() - tgt).square().mean(dim=(1, 2))
-        term = per * float(slot["weight"])
-        mip_terms.append(term)
-    if not mip_terms:
-        return stacked.latents[0].new_zeros((stacked.n_seeds,))
-    # A wide latent's ReLU does not commute with the mip box. On the 4+12
-    # checker the mip-1 term was 0.047 against a mip-0 term of 0.00094, and
-    # the step left the PCA fit (11 dB under the init at step 200). The 4+4
-    # grid's coarse terms were already smaller than mip 0 and are unchanged.
-    # Keep the sum of the coarser terms from exceeding the finest term.
-    fine = mip_terms[0]
-    if len(mip_terms) == 1:
-        return fine
-    coarse = mip_terms[1]
-    for term in mip_terms[2:]:
-        coarse = coarse + term
-    scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
-    return fine + coarse * scale
+                per = (pred.float() - tgt).square().mean(dim=(1, 2))
+            term = per * float(slot["weight"])
+            mip_terms.append(term)
+        if not mip_terms:
+            return stacked.latents[0].new_zeros((stacked.n_seeds,))
+        # A wide latent's ReLU does not commute with the mip box. On the 4+12
+        # checker the mip-1 term was 0.047 against a mip-0 term of 0.00094, and
+        # the step left the PCA fit (11 dB under the init at step 200). The 4+4
+        # grid's coarse terms were already smaller than mip 0 and are unchanged.
+        # Keep the sum of the coarser terms from exceeding the finest term.
+        fine = mip_terms[0]
+        if len(mip_terms) == 1:
+            return fine
+        coarse = mip_terms[1]
+        for term in mip_terms[2:]:
+            coarse = coarse + term
+        scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
+        return fine + coarse * scale
+    finally:
+        stacked._mip_ready = None
 
 
 def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:

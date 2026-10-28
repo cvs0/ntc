@@ -54,6 +54,40 @@ def test_bilinear_batch_matches_reference():
     assert torch.allclose(ref, got)
 
 
+def test_one_step_builds_each_mip_chain_once(monkeypatch):
+    import ntc.train_fast as tf
+
+    calls = {"n": 0}
+    real = tf.integer_box
+
+    def wrapped(codes):
+        calls["n"] += 1
+        return real(codes)
+
+    monkeypatch.setattr(tf, "integer_box", wrapped)
+    img = np.zeros((3, 16, 16), dtype=np.float32)
+    cfg = TrainConfig(
+        steps=1,
+        hidden=(8,),
+        grids=[(16, 16, 2, 4)],
+        seed=0,
+        seed_pool=1,
+        adaptive_pool=1,
+        with_ssim=False,
+        mip_levels=4,
+        fast=True,
+        device="cpu",
+        pca_init=False,
+        compile_step="off",
+        cuda_graph="off",
+        log_every=10**9,
+        latent_deflate=False,
+    )
+    encode_arrays_fast(img, [0, 1, 2], cfg)
+    # Four mips used to rebuild the pyramid (0+1+2+3 boxes). One prepare is three.
+    assert calls["n"] <= 4
+
+
 def test_stacked_matches_net_including_mip1():
     net = _net()
     stacked = StackedTrain([net])
