@@ -11,6 +11,8 @@ from ntc.encode import (
     _code_scale,
     _fit_readout,
     _ridge_lstsq,
+    checkpoint_is_finite,
+    discard_nonfinite_checkpoint,
     encode_arrays,
     export_network,
 )
@@ -427,6 +429,80 @@ def test_non_finite_readout_does_not_write_the_layer(monkeypatch):
     with pytest.raises(RuntimeError, match="non-finite readout"):
         _fit_readout(net, torch.rand(3, 8, 8))
     assert torch.equal(net.linears[-1].weight, before)
+
+
+def test_wide_fp32_step_keeps_init_and_trained_finite():
+    """The 4+12 grid is the b15 shape that exported NaN at 989362d in fp32.
+
+    One Adam step is enough. Init is the PCA readout, taken before the step.
+    """
+    rng = np.random.default_rng(1)
+    img = rng.random((3, 32, 32), dtype=np.float32)
+    img[0] += np.linspace(0.0, 0.2, 32, dtype=np.float32)[None, :]
+    img = np.clip(img, 0.0, 1.0)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=2,
+            hidden=(32,),
+            grids=[(32, 32, 4, 4), (16, 16, 12, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=3,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            batch_pixels=64,
+            batch_mip="flat",
+        ),
+    )
+    assert np.isfinite(stats["psnr_u8_init"])
+    assert np.isfinite(stats["psnr_u8_trained"])
+    assert np.isfinite(stats["metrics"]["psnr_u8"])
+    assert np.isfinite(stats["best_val_psnr"])
+    assert stats["steps_ran"] == 2
+
+
+def test_nonfinite_checkpoint_is_not_resumed(tmp_path: Path):
+    net = _net()
+    with torch.no_grad():
+        net.linears[-1].weight.fill_(float("nan"))
+    path = tmp_path / "bad.pt"
+    torch.save({"model": net.state_dict(), "opt": {"state": {"exp_avg": torch.tensor([float("nan")])}}, "step": 40}, path)
+    assert checkpoint_is_finite(torch.load(path, weights_only=False)) is False
+    img = np.linspace(0.0, 1.0, 3 * 16 * 16, dtype=np.float32).reshape(3, 16, 16)
+    _blob, stats = encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=1,
+            hidden=(8,),
+            grids=[(8, 8, 2, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=2,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            resume=str(path),
+            ckpt=str(tmp_path / "next.pt"),
+        ),
+    )
+    assert not path.is_file()
+    assert discard_nonfinite_checkpoint("") is False
+    assert stats["steps_ran"] == 1
+    assert np.isfinite(stats["psnr_u8_init"])
+    assert np.isfinite(stats["psnr_u8_trained"])
+    assert np.isfinite(stats["metrics"]["psnr_u8"])
 
 
 def test_code_scale_uses_a_percentile_not_one_spike():

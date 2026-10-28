@@ -33,6 +33,7 @@ from ntc.encode import (
     _loss,
     _mip_weight,
     _pca_init,
+    discard_nonfinite_checkpoint,
     export_network,
 )
 from ntc.metrics import group_metrics, psnr_u8
@@ -1346,6 +1347,8 @@ def encode_arrays_fast(
         )
         cfg = replace(cfg, batch_pixels=int(batch_pixels), batch_mip=str(batch_mip))
 
+    if cfg.resume and discard_nonfinite_checkpoint(cfg.resume):
+        cfg = replace(cfg, resume="")
     if cfg.resume:
         preview = torch.load(cfg.resume, map_location="cpu", weights_only=False)
         if not _state_matches_grids(preview.get("model", {}), grids):

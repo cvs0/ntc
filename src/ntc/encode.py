@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -165,6 +166,59 @@ PCA_CLIP_QUANTILE = 0.995
 # The last-layer fit is unregularized lstsq on a random hidden layer. A weak
 # column becomes a huge weight. This ridge is in feature units.
 READOUT_RIDGE = 1e-2
+
+
+def checkpoint_is_finite(ckpt: object) -> bool:
+    """True when every tensor in a resume file is finite.
+
+    The model and the Adam moments are both checked. A missing model is
+    not a checkpoint this trainer can resume.
+    """
+    if not isinstance(ckpt, dict):
+        return False
+    model = ckpt.get("model")
+    if not isinstance(model, dict) or not model:
+        return False
+
+    def walk(obj: object) -> bool:
+        if torch.is_tensor(obj):
+            return bool(torch.isfinite(obj).all())
+        if isinstance(obj, dict):
+            return all(walk(value) for value in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return all(walk(value) for value in obj)
+        return True
+
+    if not walk(model):
+        return False
+    opt = ckpt.get("opt")
+    if opt is not None and not walk(opt):
+        return False
+    return True
+
+
+def discard_nonfinite_checkpoint(path: str) -> bool:
+    """Delete a resume file that contains NaN or inf. Return True if it did.
+
+    ``sdk_MetalPlates013_2K_b15`` and ``sdk_PavingStones070_2K_b2.5`` finished
+    in seconds because the queue loaded a ``trained`` checkpoint left by the
+    earlier NaN run and exported it again. The file is removed so the next
+    process cannot load it.
+    """
+    if not path:
+        return False
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if checkpoint_is_finite(ckpt):
+        return False
+    print("non-finite checkpoint, not resuming", path, flush=True)
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+    return True
 
 
 def _code_scale(values: torch.Tensor, bits: int) -> torch.Tensor:
@@ -639,6 +693,8 @@ def encode_arrays(
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
     start_step = 0
     resume_ckpt = None
+    if cfg.resume and discard_nonfinite_checkpoint(cfg.resume):
+        cfg = replace(cfg, resume="")
     if cfg.resume:
         resume_ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
         net.load_state_dict(resume_ckpt["model"])
@@ -727,6 +783,8 @@ def encode_arrays(
                 count += int(q.numel())
         net.train()
         mse = sse / max(count, 1)
+        if not math.isfinite(mse):
+            raise RuntimeError("non-finite PSNR")
         if mse <= 0.0:
             return 100.0
         return 10.0 * math.log10(1.0 / mse)
@@ -784,7 +842,7 @@ def encode_arrays(
         if cfg.eval_every and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
             vp = _val_psnr()
             curve.append({"step": step, "psnr_val": vp})
-            if vp > best_val + 0.01:
+            if math.isfinite(vp) and vp > best_val + 0.01:
                 best_val = vp
                 best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
                 stall = 0
@@ -830,7 +888,13 @@ def encode_arrays(
         psnr_init = psnr_u8(recon_i, ref)
         export_s += export_i
         decode_s += decode_i
-        if psnr_init > psnr_trained:
+        if (
+            psnr_init is not None
+            and psnr_trained is not None
+            and math.isfinite(psnr_init)
+            and math.isfinite(psnr_trained)
+            and psnr_init > psnr_trained
+        ):
             blob, ts, recon = blob_i, ts_i, recon_i
             kept = "init"
         else:
@@ -893,7 +957,7 @@ def encode_arrays(
         "warmup_steps": cfg.warmup_steps,
         "schedule": cfg.schedule,
         "stopped_early": stopped_early,
-        "best_val_psnr": None if best_val < -1e8 else best_val,
+        "best_val_psnr": best_val if math.isfinite(best_val) and best_val > -1e8 else None,
         "tile_size": cfg.tile_size,
         "layer_bits": list(cfg.layer_bits),
         "mip_loss": cfg.mip_loss,
@@ -905,6 +969,12 @@ def encode_arrays(
         "mip_metrics": mip_metrics,
         "code_entropy": _entropies(ts),
     }
+    for key in ("psnr_u8_init", "psnr_u8_trained", "best_val_psnr"):
+        value = stats.get(key)
+        if value is not None and not math.isfinite(float(value)):
+            raise RuntimeError(f"non-finite {key}")
+    if not math.isfinite(float(stats["metrics"]["psnr_u8"])):
+        raise RuntimeError("non-finite PSNR")
     return blob, stats
 
 
