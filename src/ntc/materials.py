@@ -30,6 +30,7 @@ _CANON = [
     ("metalness", "metalness"),
     ("ao", "ao"),
     ("height", "height"),
+    ("opacity", "opacity"),
 ]
 
 _EXTS = (".png", ".jpg", ".jpeg", ".tif", ".tiff")
@@ -75,6 +76,7 @@ def load_material(directory: str | Path, size: int | None = None) -> tuple[np.nd
         SEM_NORMAL_X,
         SEM_NORMAL_Y,
         SEM_NORMAL_Z,
+        SEM_OPACITY,
         SEM_ROUGHNESS,
     )
 
@@ -83,7 +85,7 @@ def load_material(directory: str | Path, size: int | None = None) -> tuple[np.nd
     roles: dict[str, Path] = {}
     if manifest_path.is_file():
         spec = json.loads(manifest_path.read_text())
-        for key in ("albedo", "normal", "roughness", "metalness", "ao", "height"):
+        for key in ("albedo", "normal", "roughness", "metalness", "ao", "height", "opacity"):
             if key in spec and spec[key]:
                 roles[key] = directory / spec[key]
     else:
@@ -98,7 +100,7 @@ def load_material(directory: str | Path, size: int | None = None) -> tuple[np.nd
     sems: list[int] = []
     role_slices = {}
     ref_hw = None
-    order = ["albedo", "normal", "roughness", "metalness", "ao", "height"]
+    order = ["albedo", "normal", "roughness", "metalness", "ao", "height", "opacity"]
     role_sem = {
         "albedo": (SEM_ALBEDO_R, SEM_ALBEDO_G, SEM_ALBEDO_B),
         "normal": (SEM_NORMAL_X, SEM_NORMAL_Y, SEM_NORMAL_Z),
@@ -106,6 +108,7 @@ def load_material(directory: str | Path, size: int | None = None) -> tuple[np.nd
         "metalness": (SEM_METALNESS,),
         "ao": (SEM_AO,),
         "height": (SEM_HEIGHT,),
+        "opacity": (SEM_OPACITY,),
     }
     role_ch = {k: len(v) for k, v in role_sem.items()}
     for key in order:

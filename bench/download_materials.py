@@ -48,30 +48,54 @@ def ambient(root: Path, name: str, size: str = "1K") -> None:
     color = next(d.glob("*Color.jpg"))
     normal = next(d.glob("*NormalGL.jpg"))
     rough = next(d.glob("*Roughness.jpg"))
-    ao = next(d.glob("*AmbientOcclusion.jpg"))
+    ao = next(d.glob("*AmbientOcclusion.jpg"), None)
     metal = next(d.glob("*Metalness.jpg"), None)
     if metal is None:
         metal = next(d.glob("*Metallic.jpg"), None)
     height = next(d.glob("*Displacement.jpg"), None)
+    opacity = next(d.glob("*Opacity.jpg"), None)
     manifest = {
         "albedo": color.name,
         "normal": normal.name,
         "roughness": rough.name,
-        "ao": ao.name,
         "source": f"https://ambientcg.com/view?id={name}",
         "license": "CC0",
         "normal_convention": "opengl",
     }
+    if ao:
+        manifest["ao"] = ao.name
     if metal:
         manifest["metalness"] = metal.name
     if height:
         manifest["height"] = height.name
+    if opacity:
+        manifest["opacity"] = opacity.name
     (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
     return d
 
 
 _MAPS_METAL = {"albedo": "diff", "normal": "nor_gl", "roughness": "rough", "metalness": "metal", "ao": "ao"}
 _MAPS = {"albedo": "diff", "normal": "nor_gl", "roughness": "rough", "ao": "ao"}
+
+
+def cloud_materials(root: Path) -> None:
+    """Train and held-out ambientCG 2K sets for the 5090 queue.
+
+    Writes ``cloud_split.json``. Held-out directories are downloaded and
+    are not training jobs.
+    """
+    from bench.train_max_v2 import CLOUD_HOLDOUT, CLOUD_TRAIN
+    from ntc.materials import export_reference_mips
+
+    names = list(CLOUD_TRAIN) + list(CLOUD_HOLDOUT)
+    for name in names:
+        src = ambient(root, name, size="2K")
+        export_reference_mips(src, src / "reference")
+    split = {
+        "train": [f"{name}_2K" for name in CLOUD_TRAIN],
+        "heldout": [f"{name}_2K" for name in CLOUD_HOLDOUT],
+    }
+    (root / "cloud_split.json").write_text(json.dumps(split, indent=2))
 
 
 def sdk_materials(root: Path) -> None:
@@ -91,8 +115,12 @@ def sdk_materials(root: Path) -> None:
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--dest", type=Path, default=Path("data/materials"))
-    p.add_argument("--preset", choices=("base", "max", "rtxntc"), default="base")
+    p.add_argument("--preset", choices=("base", "max", "rtxntc", "cloud"), default="base")
     args = p.parse_args()
+    if args.preset == "cloud":
+        cloud_materials(args.dest)
+        print(args.dest)
+        return
     if args.preset == "rtxntc":
         sdk_materials(args.dest)
         print(args.dest)

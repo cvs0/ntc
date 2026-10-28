@@ -1027,10 +1027,11 @@ def _sync_quant_schedule(stacked: StackedTrain, cfg: TrainConfig, step: int) -> 
     if not cfg.quant_schedule or int(cfg.steps) <= 0:
         return
     frac = float(step + 1) / float(cfg.steps)
+    freeze_at = float(getattr(cfg, "quant_freeze_at", 0.95) or 0.95)
     if frac <= 0.70:
         stacked.latent_proxy = "noise"
         stacked.freeze_latents = False
-    elif frac <= 0.95:
+    elif frac <= freeze_at:
         stacked.latent_proxy = "ste"
         stacked.freeze_latents = False
     else:

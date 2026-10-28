@@ -222,6 +222,7 @@ def test_workers_spawn_a_queue(monkeypatch, tmp_path: Path):
         batch_pixels=None,
         dry_run=False,
         pack=True,
+        profile="laptop",
     )
     assert v2._spawn_workers(args) == 0
     assert len(calls) == 3

@@ -156,6 +156,9 @@ class TrainConfig:
     # rounding until 95 percent, then the latents are frozen and the MLP
     # trains on the rounded codes. encode_arrays does not read it.
     quant_schedule: bool = False
+    # Fraction of steps after which latents freeze. 0.95 is the historical
+    # 5 percent MLP tail. The cloud profile uses 0.90.
+    quant_freeze_at: float = 0.95
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

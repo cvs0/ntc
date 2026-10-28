@@ -355,6 +355,49 @@ def assign_shards(jobs: list[dict], n: int) -> list[int]:
 
 _SDK_DIRS = ("MetalPlates013_2K", "PavingStones070_2K", "Tiles135D_2K")
 
+# ambientCG 2K names. Train and held-out are disjoint. Held-out is downloaded
+# and never given a job, so a config search cannot fit those three.
+CLOUD_TRAIN = (
+    "MetalPlates013",
+    "Metal003",
+    "PavingStones070",
+    "Rock023",
+    "Ground054",
+    "Tiles135D",
+    "Tiles074",
+    "Fabric048",
+    "Carpet001",
+    "WoodFloor051",
+    "Concrete034",
+    "Bark001",
+)
+CLOUD_HOLDOUT = ("Leather011", "LeafSet017", "Gravel001")
+# 1 and 2 sit under BC1. 4 is BC1. 8 is BC7 and ASTC 4x4. 2.5 stays so the
+# laptop b2.5 points still have a neighbor. 8000 on the first label: the
+# 5070 MetalPlates b2.5 run was still above its init at 4000 and had not
+# flattened. Tiles flattened at 3000 under a raw-rate penalty that the
+# file-unit fix removes, so the extra steps are there for that climb.
+CLOUD_BPP = (1.0, 2.0, 2.5, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0)
+CLOUD_FULL_STEPS = 8000
+# 2,097,152 flat samples. A 1,048,576 dense step was about 6.5 GB. Twice
+# that fits a 32 GB card and leaves room for Adam and the compile workspace.
+# A 4,194,304 frame would sit near 26 GB and is not the default.
+CLOUD_BATCH = 2 * 1024 * 1024
+# Budget, not a measured 5090 number. A 5070 laptop did about 20 steps/s
+# at 1,048,576. This uses that rate for a 2,097,152 batch, so the hour
+# figure is high if the 5090 is faster and low if the larger batch is slower.
+# The seed pool is three wide for 500 steps and one wide after two halvings.
+CLOUD_STEPS_PER_S = 20.0
+CLOUD_SEED_FACTOR = 1.25
+
+
+def cloud_queue_gpu_hours(jobs: list[dict] | None = None) -> float:
+    """GPU-hours for the cloud queue on the 30 steps/s budget."""
+    if jobs is None:
+        jobs = build_cloud_jobs(Path("."))
+    steps = sum(int(job["steps"]) for job in jobs)
+    return steps * CLOUD_SEED_FACTOR / CLOUD_STEPS_PER_S / 3600.0
+
 
 def _sdk_missing(root: Path) -> list[Path]:
     return [root / name for name in _SDK_DIRS if not (root / name / "manifest.json").is_file()]
@@ -707,6 +750,7 @@ def _run_claimed(
         eval_every=int(job.get("eval_every", 500)),
         early_stop=int(job.get("early_stop", 8)),
         batch_pixels=int(job.get("batch_pixels", 0)),
+        quant_freeze_at=float(job.get("quant_freeze_at", 0.95)),
         lr_batch_ref=int(job.get("lr_batch_ref", 0)),
         min_latent_bits=int(job.get("min_latent_bits", 0)),
         batch_mip=str(job.get("batch_mip", "flat")),
@@ -861,8 +905,59 @@ def _run_claimed(
     return row
 
 
-def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
-    """Same names and order as the original sweep. ``batch_pixels`` overrides 256 jobs only."""
+def build_cloud_jobs(root: Path) -> list[dict]:
+    """2K latent ladder for 32 GB Blackwell. Does not include the 256 sweep.
+
+    Held-out names are not jobs. Laptop ``build_jobs`` is a different list.
+    """
+    held = {f"{name}_2K" for name in CLOUD_HOLDOUT}
+    budgets = ladder_step_budget(len(CLOUD_BPP), CLOUD_FULL_STEPS)
+    jobs = []
+    for name in CLOUD_TRAIN:
+        folder = f"{name}_2K"
+        if folder in held:
+            raise RuntimeError(f"train name is held out: {name}")
+        for steps, bpp in zip(budgets, CLOUD_BPP, strict=True):
+            label = int(bpp) if float(bpp).is_integer() else bpp
+            jobs.append({
+                "name": f"cloud_{folder}_b{label}",
+                "material": str(root / folder),
+                "size": 2048,
+                "steps": int(steps),
+                "bpp": float(bpp),
+                "seed": 0,
+                "warmup": 800 if int(steps) >= CLOUD_FULL_STEPS else 400,
+                "schedule": "cosine",
+                "eval_every": 500,
+                "early_stop": 16,
+                "batch_pixels": CLOUD_BATCH,
+                "mip_levels": 12,
+                "adaptive_pool": 1,
+                "grids": None,
+                "rate": "latent",
+                "seed_pool": 3,
+                "halve_steps": 500,
+                "lr_batch_ref": 0,
+                "min_latent_bits": 4,
+                "batch_mip": "flat",
+                "latent_rate_scale": 0.0,
+                "entropy_rate": True,
+                "quant_schedule": True,
+                "quant_freeze_at": 0.90,
+                "profile": "cloud5090",
+            })
+    return jobs
+
+
+def build_jobs(root: Path, batch_pixels: int | None, profile: str = "laptop") -> list[dict]:
+    """Laptop sweep when ``profile`` is ``laptop``. ``cloud5090`` is separate.
+
+    ``batch_pixels`` overrides 256 jobs only. It does not change the cloud list.
+    """
+    if profile == "cloud5090":
+        return build_cloud_jobs(root)
+    if profile != "laptop":
+        raise SystemExit(f"unknown profile {profile}")
     metal = root / "metal_plate"
     paving = root / "PavingStones070"
 
@@ -1037,6 +1132,7 @@ def _spawn_workers(args: argparse.Namespace) -> int:
             "--probe-steps", str(args.probe_steps),
             "--stale-lock-s", str(args.stale_lock_s),
             "--queue",
+            "--profile", args.profile,
         ]
         if args.batch_pixels is not None:
             cmd.extend(["--batch-pixels", str(args.batch_pixels)])
@@ -1342,6 +1438,7 @@ def _run_packed(jobs: list[dict], out: Path, precision: str, shard_label: str, s
 
 def main() -> None:
     p = argparse.ArgumentParser()
+    p.add_argument("--profile", choices=("laptop", "cloud5090"), default="laptop")
     p.add_argument("--out", type=Path, default=Path("results/train_max_v2"))
     p.add_argument("--materials", type=Path, default=Path("data/materials"))
     p.add_argument("--probe-steps", type=int, default=400)
@@ -1353,6 +1450,8 @@ def main() -> None:
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
     p.add_argument("--stale-lock-s", type=float, default=86400.0)
     args = p.parse_args()
+    if args.profile == "cloud5090" and int(args.probe_steps) == 400:
+        args.probe_steps = 800
     args.out.mkdir(parents=True, exist_ok=True)
     if args.workers and args.shard:
         raise SystemExit("pass --workers or --shard, not both")
@@ -1363,7 +1462,7 @@ def main() -> None:
     if args.workers:
         if args.workers < 1:
             raise SystemExit("--workers must be >= 1")
-        jobs = build_jobs(args.materials, args.batch_pixels)
+        jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
         planned = planned_workers(int(args.workers), jobs, args.out)
         if planned != int(args.workers):
             print(
@@ -1373,7 +1472,7 @@ def main() -> None:
             )
             args.workers = planned
         if args.dry_run:
-            jobs = build_jobs(args.materials, args.batch_pixels)
+            jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
             for job in sorted(jobs, key=job_cost, reverse=True):
                 print(
                     f"plan queue cost {job_cost(job):.0f} {job['name']} batch {job['batch_pixels']} lr_ref {job['lr_batch_ref']}",
@@ -1382,7 +1481,12 @@ def main() -> None:
             print(f"would spawn {args.workers} queue workers", flush=True)
             return
         # Download before the probe so a missing 2K set stops the parent.
-        ensure_sdk_materials(args.materials)
+        if args.profile == "cloud5090":
+            from bench.download_materials import cloud_materials
+
+            cloud_materials(args.materials)
+        else:
+            ensure_sdk_materials(args.materials)
         device = pick_device("auto")
         (args.out / "device.json").write_text(json.dumps(device_report(device), indent=2))
         _ensure_precision(args)
@@ -1393,12 +1497,17 @@ def main() -> None:
         shard_i, shard_n = parse_shard(args.shard)
         shard_label = args.shard
     if not args.dry_run:
-        ensure_sdk_materials(args.materials)
+        if args.profile == "cloud5090":
+            from bench.download_materials import cloud_materials
+
+            cloud_materials(args.materials)
+        else:
+            ensure_sdk_materials(args.materials)
     device = pick_device("auto")
     info = device_report(device)
     (args.out / "device.json").write_text(json.dumps(info, indent=2))
     print(json.dumps({"shard": shard_label or "0/1", "pid": os.getpid(), **info}), flush=True)
-    jobs = build_jobs(args.materials, args.batch_pixels)
+    jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
     if args.dry_run:
         if args.queue:
             for job in sorted(jobs, key=job_cost, reverse=True):
