@@ -159,6 +159,32 @@ def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
     return t
 
 
+# One hot texel used to set the whole channel's scale, so the rest of a
+# 2048 grid sat near the bin center and init PSNR stayed around 11 to 14 dB.
+PCA_CLIP_QUANTILE = 0.995
+# The last-layer fit is unregularized lstsq on a random hidden layer. A weak
+# column becomes a huge weight. This ridge is in feature units.
+READOUT_RIDGE = 1e-2
+
+
+def _code_scale(values: torch.Tensor, bits: int) -> torch.Tensor:
+    """Per-channel scale from a high percentile of ``|values|``."""
+    mid = ((1 << int(bits)) - 1) / 2.0
+    flat = values.detach().abs().reshape(values.shape[0], -1).float()
+    level = torch.quantile(flat, PCA_CLIP_QUANTILE, dim=1).clamp(min=1e-3)
+    return (level / mid).clamp(1e-4, 5.0).to(dtype=values.dtype)
+
+
+def _ridge_lstsq(features: torch.Tensor, target: torch.Tensor, ridge: float) -> torch.Tensor:
+    """Solve ``features @ A ≈ target`` with ``ridge`` on the columns of ``A``."""
+    width = int(features.shape[1])
+    eye = torch.eye(width, device=features.device, dtype=features.dtype)
+    aug_h = torch.cat([features, (float(ridge) ** 0.5) * eye], dim=0)
+    zeros = torch.zeros(width, int(target.shape[1]), device=target.device, dtype=target.dtype)
+    aug_t = torch.cat([target, zeros], dim=0)
+    return torch.linalg.lstsq(aug_h, aug_t).solution
+
+
 def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
     """Coarse-to-fine PCA of the residual into each latent grid."""
     recon = torch.zeros_like(target)
@@ -185,19 +211,24 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
             if k < ch:
                 coeff = torch.cat([coeff, torch.zeros(ch - k, coeff.shape[1], device=coeff.device)], 0)
             values = coeff.reshape(ch, gh, gw)
-            amax = values.abs().amax(dim=(1, 2)).clamp(min=1e-3)
             bits = net.grid_bits[i]
             mid = ((1 << bits) - 1) / 2.0
-            scale = (amax / mid).clamp(1e-4, 5.0)
+            scale = _code_scale(values, bits)
             net.log_scales[i].copy_(torch.log(scale))
             ti = net._tile_param_of[i]
             if ti >= 0:
                 net.tile_log_scales[ti].copy_(torch.log(scale).view(-1, 1, 1))
                 net.tile_offsets[ti].zero_()
             # Store the latent in code units so the optimizer steps in bins.
-            lat.copy_(values / scale.view(-1, 1, 1) + mid)
+            # Codes outside the bins are the percentile spikes. The residual
+            # below uses those clipped codes, not the raw coefficient.
+            qmax = float((1 << bits) - 1)
+            stored = (values / scale.view(-1, 1, 1) + mid).clamp(0, qmax)
+            lat.copy_(stored)
+            clipped = (stored - mid) * scale.view(-1, 1, 1)
             basis = u[:, :k]
-            rec_ds = (basis @ coeff[:k]).reshape(channels, gh, gw)
+            coeff_c = clipped.reshape(ch, -1)
+            rec_ds = (basis @ coeff_c[:k]).reshape(channels, gh, gw)
             rec = F.interpolate(
                 rec_ds.unsqueeze(0), size=target.shape[-2:], mode="bilinear", align_corners=False
             )[0]
@@ -209,9 +240,9 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
 def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
     """Least-squares fit of the last layer to the current features.
 
-    Hidden layers stay at their initializer. The fit is unregularized and
-    runs with quantization on, so the exported integer weights start near
-    a solution of the linear readout.
+    Hidden layers stay at their initializer. The fit is ridged and runs
+    with quantization on, so the exported integer weights start near a
+    solution of the linear readout without a huge column on a weak feature.
     """
     was = net.training
     net.eval()
@@ -232,7 +263,7 @@ def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
     tgt = target[:, yg.reshape(-1), xg.reshape(-1)].T.detach()
     # Solve h @ A ≈ tgt. A is [hidden, C], and the last weight is A.T.
     try:
-        sol = torch.linalg.lstsq(h, tgt).solution
+        sol = _ridge_lstsq(h, tgt, READOUT_RIDGE)
     except RuntimeError:
         if was:
             net.train()

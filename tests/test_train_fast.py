@@ -5,7 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from ntc.encode import TrainConfig, encode_arrays
+from ntc.encode import TrainConfig, _code_scale, _ridge_lstsq, encode_arrays
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
     LATENT_ADAM_EPS,
@@ -358,6 +358,28 @@ def test_wide_checker_stays_above_init():
         ),
     )
     assert narrow["fast"] is True
+
+
+def test_code_scale_uses_a_percentile_not_one_spike():
+    values = torch.ones(2, 32, 32)
+    values[0, 0, 0] = 50.0
+    scale = _code_scale(values, 4)
+    # amax/mid would be 50/7.5, clamped to 5. The bulk is 1.
+    assert float(scale[0]) < 1.0
+    assert float(scale[1]) < 1.0
+    assert float(scale[0]) > 0.05
+
+
+def test_readout_ridge_bounds_a_weak_column():
+    cols = 4
+    rows = 32
+    feat = torch.randn(rows, cols)
+    feat[:, -1] *= 1e-4
+    target = torch.randn(rows, 3)
+    ridged = _ridge_lstsq(feat, target, 1e-2)
+    plain = torch.linalg.lstsq(feat, target).solution
+    assert torch.isfinite(ridged).all()
+    assert float(ridged[:, -1].abs().max()) < float(plain[:, -1].abs().max())
 
 
 def test_transplant_matches_the_smaller_grid(tmp_path: Path):
