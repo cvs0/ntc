@@ -44,6 +44,9 @@ FLAG_LATENT_COMPRESSED = FLAG_LATENT_DEFLATE | FLAG_LATENT_RANGE | FLAG_LATENT_C
 # stored as a tail of float16 values (one per layer, input side). Default
 # files do not set this bit. train_max does not set it.
 FLAG_ACT_INT8 = 1 << 4
+# Integer MLP reference (int8 activations, int32 dots, multiplier-shift).
+# The fp32 decoder ignores this bit. Old files leave it clear.
+FLAG_INT_DECODE = 1 << 6
 
 ACT_IDENTITY = 0
 ACT_RELU = 1
