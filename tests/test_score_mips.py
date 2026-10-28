@@ -60,6 +60,21 @@ def test_latent_min_bits_avoids_a_two_bit_tie():
     assert max(g[0] for g in held) == 1024
 
 
+def test_low_rate_tie_prefers_half_resolution_over_a_wide_quarter_grid():
+    """PavingStones b2.5 at scale 0.643 ties raw 3.75 and raw 4.00.
+
+    The 12-channel 512 grid won that tie and plateaued near 25 dB. The
+    4-channel 1024 grid is the one that reached 27.4 dB at the higher file
+    rate. A process already training on 5a71784 keeps the 512 grid. The
+    next start of an unstarted job uses this order.
+    """
+    picked = select_grids(
+        2048, 2048, 2.5 / 0.643, [32], 9, 0, 0, 8, 0, rate="latent", min_bits=4
+    )[0]
+    assert max(g[0] for g in picked) == 1024
+    assert max(g[2] for g in picked) <= 8
+
+
 def test_quality_prefers_halfres_features_and_four_bit():
     # Raw 10 is the b5 search (label 5 divided by the 0.5 coder scale).
     # A 2-channel full-resolution grid is an exact raw match and lost to a

@@ -165,6 +165,9 @@ def _grid_quality(grids: list[tuple[int, int, int, int]], width: int) -> float:
     29.33 dB at 2.69 bpp and lost to a 4-channel half-resolution grid at
     31.80 dB and 1.42 bpp, so a finest grid under 4 channels is discounted
     and a full-resolution channel counts less than a half-resolution one.
+    A quarter-resolution grid counts less than its channel count can
+    recover: PavingStones at raw 3.89 tied a 12-channel 512 grid with a
+    4-channel 1024 grid, and the 512 grid plateaued near 25 dB.
     """
     ordered = sorted(grids, key=lambda g: (g[0] * g[1], g[2]), reverse=True)
     score = 0.0
@@ -183,7 +186,7 @@ def _grid_quality(grids: list[tuple[int, int, int, int]], width: int) -> float:
         elif side * 2 >= width:
             res = 1.0
         else:
-            res = 0.6
+            res = 0.25
         level = 1.0 if i == 0 else 0.15
         score += ch * quant * res * level
     return score
