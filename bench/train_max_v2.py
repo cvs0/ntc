@@ -643,6 +643,7 @@ def _run_claimed(
         min_latent_bits=int(job.get("min_latent_bits", 0)),
         batch_mip=str(job.get("batch_mip", "flat")),
         latent_rate_scale=float(job.get("latent_rate_scale", 1.0)),
+        entropy_rate=bool(job.get("entropy_rate", False)),
         resume=str(ckpt) if ckpt.is_file() else "",
         ckpt=str(ckpt),
         log_every=100,
@@ -871,6 +872,7 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
             # already built this list with 0.5 keeps that list until it exits.
             row["min_latent_bits"] = 4
             row["latent_rate_scale"] = 0.0
+            row["entropy_rate"] = True
     return jobs
 
 

@@ -149,6 +149,9 @@ class TrainConfig:
     onecycle_peak: float = 5.0
     # Printed on the fast-path progress line. encode_arrays does not read it.
     job_name: str = ""
+    # Fast path only. When set, a Laplace rate above ``target_bpp`` is added
+    # to the loss. encode_arrays does not read it.
+    entropy_rate: bool = False
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

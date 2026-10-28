@@ -880,12 +880,26 @@ def _loss_from_mips(
         # Keep the sum of the coarser terms from exceeding the finest term.
         fine = mip_terms[0]
         if len(mip_terms) == 1:
-            return fine
-        coarse = mip_terms[1]
-        for term in mip_terms[2:]:
-            coarse = coarse + term
-        scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
-        return fine + coarse * scale
+            distortion = fine
+        else:
+            coarse = mip_terms[1]
+            for term in mip_terms[2:]:
+                coarse = coarse + term
+            scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
+            distortion = fine + coarse * scale
+        if cfg.entropy_rate and float(cfg.target_bpp) > 0 and mips:
+            from ntc.entropy import latent_rate_bits
+
+            height = int(mips[0]["height"])
+            width = int(mips[0]["width"])
+            pixels = max(1, height * width * stacked.n_seeds)
+            rate_bpp = latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels)
+            # Only rate above the label is penalized, so a low-rate fit is
+            # not pulled off its distortion minimum.
+            excess = (rate_bpp - float(cfg.target_bpp)).clamp(min=0.0)
+            weight = 0.002 / max(float(cfg.target_bpp), 0.5)
+            distortion = distortion + excess * weight
+        return distortion
     finally:
         stacked._mip_ready = None
 
