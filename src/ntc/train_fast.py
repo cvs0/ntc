@@ -61,16 +61,17 @@ def fullres_batch_floor(
     """Keep a dense mip0 sample when a latent is as large as the image.
 
     ``262144`` area samples on a 2048 grid touch 1/16 of the texels each step.
-    That schedule left MetalPlates013 b5 at 11.87 dB (init 10.02) and b10 at
-    12.45 dB (init 9.43). The same b5 shape at a flat ``1048576`` batch had
-    reached 28.84 dB. A 1024 grid still trains at ``262144``. ``rd_lambda``
-    is 0 on this path, so the loss has no rate term.
+    That schedule left a full-resolution grid near its init. The same budget
+    on a 12-channel 8-bit 1024 grid (``b15``) scored 8.16 dB against an init
+    of 10.67. 4-bit grids at that resolution did not. An 8-bit grid or a
+    grid as large as the image uses a flat quarter-frame batch.
     """
     if not grids:
         return int(batch_pixels), str(batch_mip)
     finest = max(int(g[0]) * int(g[1]) for g in grids)
     image = int(height) * int(width)
-    if finest < max(image // 2, 1):
+    wide_or_deep = any(int(g[3]) >= 8 for g in grids) or finest >= max(image // 2, 1)
+    if not wide_or_deep:
         return int(batch_pixels), str(batch_mip)
     if int(batch_pixels) <= 0:
         return int(batch_pixels), str(batch_mip)

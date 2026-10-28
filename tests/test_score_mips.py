@@ -52,6 +52,21 @@ def test_latent_min_bits_avoids_a_two_bit_tie():
     assert max(g[3] for g in held) == 4
     bpp = latent_payload_bits(held) / (2048 * 2048)
     assert abs(bpp - 5.0) < 0.05
+    assert max(g[0] for g in held) == 1024
+
+
+def test_quality_prefers_halfres_features_and_four_bit():
+    # Raw 10 is the b5 search (label 5 divided by the 0.5 coder scale).
+    # A 2-channel full-resolution grid is an exact raw match and lost to a
+    # half-resolution grid that has more 4-bit features.
+    b5 = select_grids(2048, 2048, 10.0, [32], 9, 0, 0, 8, 0, rate="latent", min_bits=4)[0]
+    assert max(g[3] for g in b5) == 4
+    assert max(g[0] for g in b5) == 1024
+    assert sum(g[2] for g in b5) >= 8
+    # Raw 30 is the b15 search. The exact match is 12 channels at 8 bits.
+    b15 = select_grids(2048, 2048, 30.0, [32], 9, 0, 0, 8, 0, rate="latent", min_bits=4)[0]
+    assert max(g[3] for g in b15) == 4
+    assert min(g[3] for g in b15) == 4
 
 
 def test_rd_svg_labels_table3(tmp_path: Path):

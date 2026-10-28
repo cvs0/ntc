@@ -111,6 +111,51 @@ def _family(width: int, height: int) -> list[list[tuple[int, int, int, int]]]:
     return out
 
 
+def _bit_band(grids: list[tuple[int, int, int, int]]) -> int:
+    """0 for an all-4-bit grid, 1 for any other grid that avoids 2-bit, 2 otherwise.
+
+    4-bit codes are the ones that trained on the 2048 materials. 2-bit has
+    four levels. 8-bit on a 12-channel 1024 grid fell under its PCA init.
+    """
+    bits = [g[3] for g in grids]
+    if bits and all(b == 4 for b in bits):
+        return 0
+    if bits and min(bits) >= 4:
+        return 1
+    return 2
+
+
+def _grid_quality(grids: list[tuple[int, int, int, int]], width: int) -> float:
+    """Higher means more usable features at a matched raw rate.
+
+    The finest grid dominates. A 2-channel full-resolution grid scored
+    29.33 dB at 2.69 bpp and lost to a 4-channel half-resolution grid at
+    31.80 dB and 1.42 bpp, so a finest grid under 4 channels is discounted
+    and a full-resolution channel counts less than a half-resolution one.
+    """
+    ordered = sorted(grids, key=lambda g: (g[0] * g[1], g[2]), reverse=True)
+    score = 0.0
+    for i, (gw, gh, ch, bits) in enumerate(ordered):
+        if bits <= 2:
+            quant = 0.2
+        elif bits >= 8:
+            quant = 0.35
+        else:
+            quant = 1.0
+        if i == 0 and ch < 4:
+            quant *= 0.25
+        side = max(gw, gh)
+        if side >= width:
+            res = 0.5
+        elif side * 2 >= width:
+            res = 1.0
+        else:
+            res = 0.6
+        level = 1.0 if i == 0 else 0.15
+        score += ch * quant * res * level
+    return score
+
+
 def select_grids(
     width: int,
     height: int,
@@ -132,9 +177,10 @@ def select_grids(
     The bpp here is the packed latent (and, for ``payload``, the MLP), not
     the deflate or range-coded size written into the file.
 
-    ``min_bits`` of 0 keeps the historical order. Above 0, a grid that uses
-    fewer bits per code sorts after one that meets the floor, and a higher
-    minimum bit depth wins a raw-bpp tie. A 2-bit code has four levels.
+    ``min_bits`` of 0 keeps the historical order. Above 0, 2-bit grids sort
+    last, then every 4-bit grid sorts ahead of 8-bit, then raw-bpp error,
+    then ``_grid_quality``. That puts 4-bit half-resolution features ahead of
+    a 2-channel full-resolution grid at the same packed size.
     """
     if rate not in ("payload", "latent"):
         raise ValueError(rate)
@@ -165,21 +211,16 @@ def select_grids(
         over = max(0.0, bpp - target_bpp)
         if min_bits > 0:
             depth = min(g[3] for g in grids)
-            peak = max(g[3] for g in grids)
-            # Grids under the floor sort last. Among the rest, a 4-bit code
-            # trains in fewer steps than an 8-bit code at the same raw bpp,
-            # so the lowest depth that still meets the floor wins the tie.
-            # Scale bytes move the raw bpp by about 1e-5, which is not a
-            # different rate. Quantize the error so that tie uses bit depth.
-            score_q = round(err + 0.25 * over, 2)
-            if depth >= min_bits:
-                scored.append((score_q, 0, peak, depth, len(grids), err + 0.25 * over, grids))
-            else:
-                scored.append((score_q, 1, 0, 0, len(grids), err + 0.25 * over, grids))
+            # Scale bytes move the raw bpp by about 1e-5. Quantize so grids
+            # at the same packed size are ordered by quality, not by that.
+            rate_pen = round(err + 0.25 * over, 2)
+            below = 0 if depth >= min_bits else 1
+            band = _bit_band(grids) if below == 0 else 2
+            scored.append((below, band, rate_pen, -_grid_quality(grids, width), grids))
         else:
             scored.append((err + 0.25 * over, -bpp, len(grids), grids))
     if min_bits > 0:
-        scored.sort(key=lambda t: (t[0], t[1], t[2], t[3], t[4], t[5]))
+        scored.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
     else:
         scored.sort(key=lambda t: (t[0], t[1], t[2]))
     # unique by grid tuple

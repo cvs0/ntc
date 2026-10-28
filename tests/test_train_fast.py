@@ -119,6 +119,11 @@ def test_fullres_grid_raises_a_sparse_batch():
     full, full_mode = fullres_batch_floor(2048, 2048, [(2048, 2048, 2, 4)], 0, "flat")
     assert full == 0
     assert full_mode == "flat"
+    deep, deep_mode = fullres_batch_floor(
+        2048, 2048, [(1024, 1024, 12, 8), (512, 512, 12, 8)], 256 * 1024, "area"
+    )
+    assert deep == image // 4
+    assert deep_mode == "flat"
 
 
 def test_fullres_sparse_batch_trains_above_init():
