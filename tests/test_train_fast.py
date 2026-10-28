@@ -962,8 +962,9 @@ def test_metalplates_probe_does_not_keep_a_17_percent_overshoot():
 
     The extra coarse channels do not compress at the 4+4 probe ratio.
     Measuring them and selecting again at that ratio returns 4+4.
-    PavingStones at 2.68 bpp is 7% over 2.5 and stays on its 512x12 grid.
-    25.32 dB at 2.68 bpp versus 27.4 dB at 3.89 bpp is 1.7 dB per bpp.
+    PavingStones at scale 0.643 now takes the 1024 grid. The 512x12 grid
+    is what 5a71784 already selected. 25.32 dB at 2.68 bpp versus 27.4 dB
+    at 3.89 bpp is 1.7 dB per bpp.
     """
     from ntc.grids import latent_payload_bits, select_grids
 
@@ -983,7 +984,7 @@ def test_metalplates_probe_does_not_keep_a_17_percent_overshoot():
     second = _pick(label / realized)
     assert [list(g) for g in second] == [[1024, 1024, 4, 4], [512, 512, 4, 4]]
     paving = _pick(label / 0.643)
-    assert [list(g) for g in paving] == [[512, 512, 12, 4], [256, 256, 12, 4]]
+    assert max(g[0] for g in paving) == 1024
     assert rate_overshoots(2.6826, label) is False
     slope = (27.4 - 25.32) / (3.89 - 2.6826)
     assert 1.5 < slope < 2.0

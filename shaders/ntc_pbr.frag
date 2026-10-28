@@ -46,7 +46,7 @@ Mat eval_ntc() {
     float tex = max(float(g_desc[0].x), float(g_desc[0].y));
     float rho = max(length(dx), length(dy));
     float lod = log2(max(rho * tex, 1e-6));
-    ntc_eval_filtered(v_uv, dx, dy, lod, g_desc[2].w, 4u, g_desc[3].y);
+    ntc_eval_filtered(v_uv, dx, dy, lod, g_desc[2].w, 3u, g_desc[3].y);
     Mat m;
     m.alb = vec3(ch(u_sem0.x), ch(u_sem0.y), ch(u_sem0.z));
     m.nrm = vec3(ch(u_sem0.w), ch(u_sem1.x), ch(u_sem1.y));
