@@ -1,4 +1,5 @@
 #include "bench.hpp"
+#include "stage.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -246,6 +247,8 @@ void run_vk_speed(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
         stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
         stage.module = mod;
         stage.pName = "main";
+        VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_req{};
+        ntc_attach_subgroup_32(stage, subgroup_req, phys);
         VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         cpi.stage = stage;
         cpi.layout = layout;

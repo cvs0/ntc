@@ -136,12 +136,15 @@ float ntc_code(uint base, uint stride, int bits, int W, int H, int ch, int x, in
     return float((b >> (uint(x & 3) * 2u)) & 3u);
 }
 
-float ntc_acc(float acc, float w, float x) {
+precise float ntc_acc(float acc, float w, float x) {
 #ifdef NTC_FP16
     float16_t a = float16_t(acc) + float16_t(w) * float16_t(x);
     return float(a);
 #else
-    return acc + w * x;
+    // NoContraction. This glslang has no denorm or rounding layout, so the
+    // device default is what runs. The bench prints those properties.
+    precise float prod = acc * w;
+    return prod + x;
 #endif
 }
 

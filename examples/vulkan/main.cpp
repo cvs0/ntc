@@ -237,7 +237,20 @@ int main(int argc, char** argv) {
         std::cout << "driver_raw " << props.driverVersion << "\n";
         std::cout << "api_version " << VK_VERSION_MAJOR(props.apiVersion) << "."
                   << VK_VERSION_MINOR(props.apiVersion) << "." << VK_VERSION_PATCH(props.apiVersion) << "\n";
+        VkPhysicalDeviceFloatControlsProperties fctl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceVulkan13Properties v13p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        fctl.pNext = &v13p;
+        VkPhysicalDeviceProperties2 pfloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pfloat.pNext = &fctl;
+        vkGetPhysicalDeviceProperties2(phys, &pfloat);
         std::cout << "subgroup_size " << sg.subgroupSize << "\n";
+        std::cout << "subgroup_size_range " << v13p.minSubgroupSize << " " << v13p.maxSubgroupSize << "\n";
+        std::cout << "subgroup_size_control " << v13q.subgroupSizeControl
+                  << " required_stages " << v13p.requiredSubgroupSizeStages << "\n";
+        std::cout << "float32_denorm_flush " << fctl.shaderDenormFlushToZeroFloat32
+                  << " denorm_preserve " << fctl.shaderDenormPreserveFloat32
+                  << " rte " << fctl.shaderRoundingModeRTEFloat32
+                  << " rtz " << fctl.shaderRoundingModeRTZFloat32 << "\n";
         std::cout << "timestamp_period_ns " << props.limits.timestampPeriod << "\n";
         std::cout << "device " << props.deviceName << " vendor 0x" << std::hex << props.vendorID << std::dec
                   << " type " << props.deviceType << " api " << VK_VERSION_MAJOR(props.apiVersion) << "."
@@ -285,6 +298,8 @@ int main(int argc, char** argv) {
         cm_on.cooperativeMatrix = coop ? VK_TRUE : VK_FALSE;
         VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         v13.dynamicRendering = v13q.dynamicRendering;
+        v13.subgroupSizeControl = v13q.subgroupSizeControl;
+        v13.computeFullSubgroups = v13q.computeFullSubgroups;
         void* feat_tail = nullptr;
         if (has_f16ext) {
             f16.pNext = feat_tail;

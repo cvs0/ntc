@@ -1,4 +1,5 @@
 #include "bench.hpp"
+#include "stage.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -132,8 +133,8 @@ void destroy_pipe(VkDevice dev, Pipe& p) {
     p = {};
 }
 
-Pipe make_compute(VkDevice dev, const std::string& spv, VkBuffer desc, VkDeviceSize desc_size, VkBuffer blob,
-                  VkDeviceSize blob_size, VkBuffer outb, VkDeviceSize out_size) {
+Pipe make_compute(VkDevice dev, VkPhysicalDevice phys, const std::string& spv, VkBuffer desc, VkDeviceSize desc_size,
+                  VkBuffer blob, VkDeviceSize blob_size, VkBuffer outb, VkDeviceSize out_size) {
     Pipe p;
     VkDescriptorSetLayoutBinding binds[3]{};
     for (uint32_t i = 0; i < 3; ++i) {
@@ -160,6 +161,8 @@ Pipe make_compute(VkDevice dev, const std::string& spv, VkBuffer desc, VkDeviceS
     stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     stage.module = p.mod;
     stage.pName = "main";
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_req{};
+    ntc_attach_subgroup_32(stage, subgroup_req, phys);
     VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     cpi.stage = stage;
     cpi.layout = p.layout;
@@ -261,21 +264,21 @@ void run_vk_bench(VkDevice dev, VkPhysicalDevice phys, VkQueue queue, uint32_t q
     Buf blob = make_buf(dev, phys, up.blob.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, up.blob.data());
     Buf outb = make_buf(dev, phys, max_floats * 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, nullptr);
 
-    Pipe fp32 = make_compute(dev, shader_dir + "/ntc_decompress.comp.spv", desc.buffer, desc.size, blob.buffer,
+    Pipe fp32 = make_compute(dev, phys, shader_dir + "/ntc_decompress.comp.spv", desc.buffer, desc.size, blob.buffer,
                              blob.size, outb.buffer, outb.size);
-    Pipe sample = make_compute(dev, shader_dir + "/ntc_sample_res.comp.spv", desc.buffer, desc.size, blob.buffer,
+    Pipe sample = make_compute(dev, phys, shader_dir + "/ntc_sample_res.comp.spv", desc.buffer, desc.size, blob.buffer,
                                blob.size, outb.buffer, outb.size);
     Pipe lit;
     const bool can_lit = channels >= 6;
     if (can_lit) {
-        lit = make_compute(dev, shader_dir + "/ntc_lit.comp.spv", desc.buffer, desc.size, blob.buffer, blob.size,
+        lit = make_compute(dev, phys, shader_dir + "/ntc_lit.comp.spv", desc.buffer, desc.size, blob.buffer, blob.size,
                            outb.buffer, outb.size);
     }
     auto maybe_pipe = [&](const std::string& file) {
         Pipe p;
         std::ifstream probe(file);
         if (probe) {
-            p = make_compute(dev, file, desc.buffer, desc.size, blob.buffer, blob.size, outb.buffer, outb.size);
+            p = make_compute(dev, phys, file, desc.buffer, desc.size, blob.buffer, blob.size, outb.buffer, outb.size);
         }
         return p;
     };
