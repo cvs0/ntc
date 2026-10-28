@@ -47,6 +47,39 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
     return float(lr) * (float(batch_pixels) / float(ref_pixels))
 
 
+# A run that finishes within this many dB of its init did not train the latent.
+NEAR_INIT_DB = 4.0
+
+
+def fullres_batch_floor(
+    height: int,
+    width: int,
+    grids: list,
+    batch_pixels: int,
+    batch_mip: str,
+) -> tuple[int, str]:
+    """Keep a dense mip0 sample when a latent is as large as the image.
+
+    ``262144`` area samples on a 2048 grid touch 1/16 of the texels each step.
+    That schedule left MetalPlates013 b5 at 11.87 dB (init 10.02) and b10 at
+    12.45 dB (init 9.43). The same b5 shape at a flat ``1048576`` batch had
+    reached 28.84 dB. A 1024 grid still trains at ``262144``. ``rd_lambda``
+    is 0 on this path, so the loss has no rate term.
+    """
+    if not grids:
+        return int(batch_pixels), str(batch_mip)
+    finest = max(int(g[0]) * int(g[1]) for g in grids)
+    image = int(height) * int(width)
+    if finest < max(image // 2, 1):
+        return int(batch_pixels), str(batch_mip)
+    if int(batch_pixels) <= 0:
+        return int(batch_pixels), str(batch_mip)
+    floor = max(1, image // 4)
+    if int(batch_pixels) >= floor and str(batch_mip) != "area":
+        return int(batch_pixels), str(batch_mip)
+    return max(int(batch_pixels), floor), "flat"
+
+
 def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat") -> int:
     """Pixels to draw at this mip. 0 means every pixel.
 
@@ -876,6 +909,16 @@ def encode_arrays_fast(
     else:
         grids = cfg.grids
 
+    batch_pixels, batch_mip = fullres_batch_floor(
+        height, width, grids, int(cfg.batch_pixels or 0), str(cfg.batch_mip)
+    )
+    if batch_pixels != int(cfg.batch_pixels or 0) or batch_mip != str(cfg.batch_mip):
+        print(
+            f"fullres batch {cfg.batch_pixels} {cfg.batch_mip} -> {batch_pixels} {batch_mip}",
+            flush=True,
+        )
+        cfg = replace(cfg, batch_pixels=int(batch_pixels), batch_mip=str(batch_mip))
+
     if cfg.resume:
         preview = torch.load(cfg.resume, map_location="cpu", weights_only=False)
         if not _state_matches_grids(preview.get("model", {}), grids):
@@ -996,9 +1039,10 @@ def encode_arrays_fast(
                 best_val = score
                 stall = 0
                 best_state = [p.detach().clone() for p in stacked.parameters()]
-            elif score + 1e-4 < init_score:
-                # Still under the PCA initialization. A flat learning-rate
-                # schedule can sit here for several evals. Do not stop yet.
+            elif score < init_score + NEAR_INIT_DB:
+                # Still within a few dB of the init. A sparse batch climbs
+                # slower than 0.01 dB per eval, and patience would keep the
+                # near-init weights. Do not stop yet.
                 stall = 0
             else:
                 stall += 1
@@ -1129,6 +1173,8 @@ def encode_arrays_fast(
         "lr_scale": scaled_lr(1.0, int(cfg.batch_pixels or 0), int(cfg.lr_batch_ref or 0))
         if cfg.lr_batch_ref and cfg.batch_pixels
         else 1.0,
+        "batch_pixels": int(cfg.batch_pixels or 0),
+        "batch_mip": str(cfg.batch_mip),
         "device": device_report(device),
         "steps": cfg.steps,
         "grids": [list(g) for g in grids],

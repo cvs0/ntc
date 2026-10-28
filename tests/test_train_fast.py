@@ -6,10 +6,12 @@ import torch
 from ntc.encode import TrainConfig, encode_arrays
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
+    NEAR_INIT_DB,
     StackedTrain,
     _mesh_uv,
     bilinear_batched,
     encode_arrays_fast,
+    fullres_batch_floor,
     scaled_lr,
 )
 
@@ -104,3 +106,62 @@ def test_halving_drops_seeds():
 def test_lr_scales_linearly_with_batch():
     assert scaled_lr(1e-3, 65536, 16384) == 4e-3
     assert scaled_lr(1e-3, 100, 0) == 1e-3
+
+
+def test_fullres_grid_raises_a_sparse_batch():
+    image = 2048 * 2048
+    batch, mode = fullres_batch_floor(2048, 2048, [(2048, 2048, 2, 4), (1024, 1024, 2, 4)], 256 * 1024, "area")
+    assert batch == image // 4
+    assert mode == "flat"
+    kept, kept_mode = fullres_batch_floor(2048, 2048, [(1024, 1024, 4, 4), (512, 512, 4, 4)], 256 * 1024, "area")
+    assert kept == 256 * 1024
+    assert kept_mode == "area"
+    full, full_mode = fullres_batch_floor(2048, 2048, [(2048, 2048, 2, 4)], 0, "flat")
+    assert full == 0
+    assert full_mode == "flat"
+
+
+def test_fullres_sparse_batch_trains_above_init():
+    """A 1:1 latent with a 1/16 area batch must not finish next to its init.
+
+    The trainer raises that batch to a flat quarter of the frame. The image
+    is 32 so the run stays on CPU. pca is off so the init is not already the
+    answer.
+    """
+    rng = np.random.default_rng(4)
+    n = 32
+    yy, xx = np.mgrid[0:n, 0:n]
+    img = np.stack(
+        [
+            0.5 + 0.4 * np.sin(xx / 1.7) * np.cos(yy / 2.1),
+            0.2 + 0.6 * ((xx // 4 + yy // 3) % 2),
+            np.clip(rng.random((n, n)) * 0.35 + (xx + yy) / (2 * n), 0, 1),
+        ],
+        0,
+    ).astype(np.float32)
+    cfg = TrainConfig(
+        steps=80,
+        hidden=(16,),
+        grids=[(n, n, 2, 4), (n // 2, n // 2, 2, 4)],
+        seed=1,
+        seed_pool=1,
+        adaptive_pool=1,
+        with_ssim=False,
+        mip_levels=4,
+        mip_loss="footprint",
+        warmup_steps=8,
+        eval_every=0,
+        early_stop=0,
+        fast=True,
+        device="cpu",
+        pca_init=False,
+        batch_pixels=max(1, (n * n) // 16),
+        batch_mip="area",
+        compile_step="off",
+        cuda_graph="off",
+        log_every=10**9,
+    )
+    _blob, stats = encode_arrays_fast(img, [1, 1, 1], cfg)
+    assert stats["batch_pixels"] == (n * n) // 4
+    assert stats["batch_mip"] == "flat"
+    assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"] + NEAR_INIT_DB

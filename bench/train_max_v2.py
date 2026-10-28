@@ -26,7 +26,7 @@ from bench.train_max import G16
 from ntc.device import device_report, pick_device
 from ntc.encode import TrainConfig
 from ntc.materials import load_material
-from ntc.train_fast import choose_precision, encode_arrays_fast
+from ntc.train_fast import NEAR_INIT_DB, choose_precision, encode_arrays_fast
 
 
 def parse_shard(text: str) -> tuple[int, int]:
@@ -145,6 +145,8 @@ def _job_blocked(out: Path, job: dict) -> bool:
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     if prev.get("done"):
+        return True
+    if prev.get("collapsed"):
         return True
     if prev.get("error"):
         mat = Path(job["material"])
@@ -308,9 +310,9 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         "steps_per_s": stats.get("steps_per_s"),
         "shard": shard_label,
         "worker_pid": os.getpid(),
-        "batch_pixels": int(job.get("batch_pixels", 0)),
+        "batch_pixels": int(stats.get("batch_pixels", job.get("batch_pixels", 0))),
         "lr_batch_ref": int(job.get("lr_batch_ref", 0)),
-        "batch_mip": str(job.get("batch_mip", "flat")),
+        "batch_mip": str(stats.get("batch_mip", job.get("batch_mip", "flat"))),
         "target_bpp": float(job["bpp"]),
         "latent_rate_scale": float(job.get("latent_rate_scale", 1.0)),
         "min_latent_bits": int(job.get("min_latent_bits", 0)),
@@ -319,6 +321,39 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         "halving": stats.get("halving"),
         "device": stats.get("device"),
     }
+    trained = row.get("psnr_u8_trained")
+    init = row.get("psnr_u8_init")
+    near_init = (
+        isinstance(trained, (int, float))
+        and isinstance(init, (int, float))
+        and float(trained) < float(init) + NEAR_INIT_DB
+    )
+    pixels = int(job["size"]) * int(job["size"])
+    requested = int(job.get("batch_pixels") or 0)
+    if near_init and not job.get("_fallback") and 0 < requested < pixels // 4:
+        print(
+            f"near init {job['name']} trained {float(trained):.2f} init {float(init):.2f}, "
+            f"retry flat {pixels // 4}",
+            flush=True,
+        )
+        if ckpt.is_file():
+            ckpt.unlink()
+        if ntc_path.is_file():
+            ntc_path.unlink()
+        if dest.is_file():
+            dest.unlink()
+        fallback = dict(job)
+        fallback["batch_pixels"] = pixels // 4
+        fallback["batch_mip"] = "flat"
+        fallback["_fallback"] = True
+        return _run_claimed(fallback, out, precision, shard_label, dest, ntc_path, ckpt)
+    if near_init:
+        row["done"] = False
+        row["collapsed"] = True
+        row["error"] = (
+            f"trained PSNR {float(trained):.2f} stayed within {NEAR_INIT_DB:.0f} dB of init {float(init):.2f}"
+        )
+        print("collapsed", job["name"], row["error"], flush=True)
     dest.write_text(json.dumps(row, indent=2))
     sps = row["steps_per_s"]
     sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
@@ -399,10 +434,9 @@ def build_jobs(root: Path, batch_pixels: int | None) -> list[dict]:
                 eval_every=500,
                 early_stop=6,
             ))
-    # A 2048 frame is 4M pixels. The 1M flat batch also trained all of mip 1.
-    # 256K samples at mip 0, and 1/4 of that per coarser mip, is the stand-in
-    # trade that stayed within 0.1 dB of a full frame. The loss is a mean, so
-    # the learning rate stays at the full-frame step (lr_batch_ref 0).
+    # Half-resolution 2048 jobs stay on a 256K area batch. A latent whose
+    # grid is as large as the image is raised to a flat quarter-frame batch
+    # inside the trainer. 256K area samples left those 2048 grids near the init.
     for row in jobs:
         if int(row["size"]) >= 2048 and int(row.get("batch_pixels") or 0) >= 1024 * 1024:
             row["batch_pixels"] = 256 * 1024

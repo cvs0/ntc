@@ -72,17 +72,28 @@ source "$ROOT/.venv-wsl/bin/activate"
 export HSA_ENABLE_DXG_DETECTION=1
 python -m pip install --upgrade pip wheel
 python -m pip install numpy pillow
-# torch 2.9.1+rocm6.4 from download.pytorch.org. The repo.radeon.com
-# manylinux directory is not a pip index ("no versions found" with
-# --index-url). These are the wheel files themselves. The venv's CPython
-# tag selects cp310 through cp314. This build sees an RX 9070 when the
-# system ROCm 7.2 libhsa and librocdxg are the ones that load.
-PYTAG="$(python -c 'import sys; print(f"cp{sys.version_info[0]}{sys.version_info[1]}")')"
-WHEEL="https://download.pytorch.org/whl/rocm6.4"
-python -m pip install \
-  "${WHEEL}/torch-2.9.1%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl" \
-  "${WHEEL}/torchvision-0.24.0%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl" \
-  "${WHEEL}/torchaudio-2.9.0%2Brocm6.4-${PYTAG}-${PYTAG}-manylinux_2_28_x86_64.whl"
+# torch 2.9.1+rocm6.4 from the rocm6.4 index. The repo.radeon.com manylinux
+# directory is not a pip index. This build sees an RX 9070 when the system
+# ROCm 7.2 libhsa and librocdxg are the ones that load.
+# Install from the rocm6.4 index, not from bare wheel URLs. A direct torch
+# wheel is 4.4 GB and then pip looks up pytorch-triton-rocm==3.5.1 on PyPI,
+# where it does not exist. The index hosts torch and pytorch-triton-rocm
+# together, and it resolves that pin before downloading the wheel. Skip the
+# download when this venv already has torch 2.9.1+rocm.
+export HSA_ENABLE_DXG_DETECTION=1
+if python -c 'import os; os.environ["HSA_ENABLE_DXG_DETECTION"]="1"; import torch; raise SystemExit(0 if str(torch.__version__).startswith("2.9.1") and "rocm" in str(torch.__version__) else 1)'; then
+  echo "torch $(python -c 'import os; os.environ["HSA_ENABLE_DXG_DETECTION"]="1"; import torch; print(torch.__version__)') already installed"
+else
+  set +e
+  python -m pip install --index-url https://download.pytorch.org/whl/rocm6.4 \
+    "torch==2.9.1" "torchvision==0.24.0" "torchaudio==2.9.0"
+  pip_status=$?
+  set -e
+  if [[ "$pip_status" -ne 0 ]]; then
+    echo "pip install of torch 2.9.1+rocm6.4 failed with status ${pip_status}" >&2
+    exit "$pip_status"
+  fi
+fi
 
 # Drop every libhsa-runtime64 the wheel unpacked. The dynamic linker then
 # uses the system libhsa, which is the one that loads librocdxg.

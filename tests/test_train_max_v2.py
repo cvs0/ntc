@@ -143,6 +143,18 @@ def test_queue_packs_a_matching_pair(tmp_path: Path):
     assert [job["name"] for job in one] == ["a"]
 
 
+def test_collapsed_json_is_not_claimed_again(tmp_path: Path):
+    mat = tmp_path / "mat"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+    job = _tiny("stuck", 20, str(mat))
+    (out / "stuck.json").write_text(json.dumps({"name": "stuck", "done": False, "collapsed": True}))
+    assert _job_blocked(out, job)
+    assert claim_next([job], out, 3600, pack=False) == []
+
+
 def test_error_json_blocks_only_while_the_material_is_missing(tmp_path: Path):
     mat = tmp_path / "mat"
     out = tmp_path / "out"
