@@ -17,6 +17,7 @@ from ntc.train_fast import (
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
+    portable_step_plan,
     preferred_compile_mode,
     refill_sample_indices,
     scaled_lr,
@@ -293,6 +294,15 @@ def test_wide_latent_is_eight_channels_or_more():
     assert wide_latent([(2048, 2048, 4, 4), (1024, 1024, 12, 4)])
     assert wide_latent([(2048, 2048, 8, 4), (1024, 1024, 8, 4)])
     assert not wide_latent([(2048, 2048, 4, 4), (1024, 1024, 4, 4)])
+
+
+def test_windows_rocm_uses_a_hip_graph_instead_of_compile():
+    # 9070 eager 2.35 steps/s, 5070 reduce-overhead 19.99. Compile does not
+    # run on Windows ROCm, so that platform captures a HIP graph.
+    assert portable_step_plan("auto", "auto", "cosine", hip=True, win32=True) == ("off", True)
+    assert portable_step_plan("auto", "auto", "cosine", hip=False, win32=False) == ("auto", False)
+    assert portable_step_plan("auto", "auto", "constant", hip=False, win32=False) == ("auto", True)
+    assert portable_step_plan("auto", "off", "cosine", hip=True, win32=True) == ("auto", False)
 
 
 def test_cuda_compile_mode_is_reduce_overhead():

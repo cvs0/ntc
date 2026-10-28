@@ -776,6 +776,33 @@ def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
     stacked.quantize_weights = bool(on and stacked.allow_weight_qat)
 
 
+def portable_step_plan(
+    compile_step: str,
+    cuda_graph: str,
+    schedule: str,
+    *,
+    hip: bool,
+    win32: bool,
+) -> tuple[str, bool]:
+    """Choose compile versus a manual CUDA/HIP graph.
+
+    ``torch.compile`` does not run on Windows ROCm. The RX 9070 eager path
+    was 2.35 steps/s. The RTX 5070 with ``reduce-overhead`` was 19.99, about
+    8.5x, and that mode is a CUDA graph around the same eager kernels. On
+    Windows ROCm the trainer skips compile and captures a HIP graph instead.
+    The learning-rate tensor is filled before every replay, so a cosine
+    schedule is not frozen at the first rate. Triton stays an optional
+    gather on devices where it loads. It is not required for this path.
+    """
+    if hip and win32 and compile_step == "auto" and cuda_graph != "off":
+        return "off", True
+    if cuda_graph == "off":
+        return compile_step, False
+    if cuda_graph == "on":
+        return compile_step, True
+    return compile_step, schedule == "constant"
+
+
 def preferred_compile_mode(device_type: str) -> str:
     """``reduce-overhead`` on every CUDA device, ``default`` on CPU.
 
@@ -873,8 +900,9 @@ def _run_loop(
             else:
                 _assign_lr(group, lr)
 
-    def one_step(step: int, replay: bool) -> torch.Tensor:
-        _group_lr(step)
+    def one_step(step: int, replay: bool, apply_lr: bool = True) -> torch.Tensor:
+        if apply_lr:
+            _group_lr(step)
         _sync_step_qat(stacked, cfg, step)
         if cfg.coarse_to_fine:
             from ntc.train_steps import coarse_lowpass
@@ -991,8 +1019,10 @@ def _run_loop(
             torch.cuda.current_stream().wait_stream(side)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph = torch.cuda.CUDAGraph()
+            # Leave the learning rate out of the capture. Replay fills the
+            # same device tensor first, then the captured Adam reads it.
             with torch.cuda.graph(graph):
-                static_loss = one_step(start_step, replay=True)
+                static_loss = one_step(start_step, replay=True, apply_lr=False)
         except Exception as exc:
             graph_error = str(exc)
             graph = None
@@ -1002,6 +1032,7 @@ def _run_loop(
     if warmup > 0:
         if graph is not None:
             for _ in range(warmup):
+                _group_lr(start_step)
                 refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
                 graph.replay()
         else:
@@ -1015,10 +1046,9 @@ def _run_loop(
     t0 = time.perf_counter()
     if graph is not None:
         for step in range(start_step, start_step + steps):
-            # The captured step bakes the learning rate. Replay is the fast
-            # path for a fixed lr. Cosine schedules fall back when the caller
-            # passes use_graph False. New sample indices are written into the
-            # captured buffers before each replay.
+            # Sample indices and the learning-rate tensor are written before
+            # replay. The captured kernels only read them.
+            _group_lr(step)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph.replay()
             if static_loss is not None and step == start_step + steps - 1:
@@ -1278,16 +1308,21 @@ def encode_arrays_fast(
             slot["tgt"] = slot["tgt"].expand(stacked.n_seeds, -1, -1).contiguous()
     capturable = False
     use_graph = False
-    if device.type == "cuda" and cfg.cuda_graph == "on":
-        capturable = True
-        use_graph = cfg.schedule == "constant" or (cfg.warmup_steps <= 0 and cfg.steps <= 1)
-    elif device.type == "cuda" and cfg.cuda_graph == "auto":
-        # A cosine schedule changes the learning rate every step. A captured
-        # graph would freeze the first rate. Leave the graph off unless the
-        # schedule is constant.
-        if cfg.schedule == "constant":
-            capturable = True
-            use_graph = True
+    if device.type == "cuda" and cfg.cuda_graph != "off":
+        import sys as _sys
+
+        hip = bool(getattr(torch.version, "hip", None))
+        compile_step, use_graph = portable_step_plan(
+            cfg.compile_step,
+            cfg.cuda_graph,
+            cfg.schedule,
+            hip=hip,
+            win32=_sys.platform == "win32",
+        )
+        if compile_step != cfg.compile_step:
+            print("portable hip graph, compile skipped", flush=True)
+            cfg = replace(cfg, compile_step=compile_step)
+        capturable = use_graph
     opt = _adam_on(stacked, cfg, capturable=capturable)
     start_step = 0
     if cfg.resume:
