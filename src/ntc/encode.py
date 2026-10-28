@@ -106,6 +106,17 @@ class TrainConfig:
     target_psnr: float | None = None
     # 0 selects min(20, steps) for those probes.
     search_steps: int = 0
+    # Off by default. train_max does not set it. The fast path is
+    # encode_arrays_fast in src/ntc/train_fast.py.
+    fast: bool = False
+    # 0 means 250 when fast is on and seed_pool > 1, otherwise no halving.
+    halve_steps: int = 0
+    # "auto" compiles on CUDA and stays eager on CPU. "on" and "off" force it.
+    compile_step: str = "auto"
+    # "auto" tries a CUDA graph on CUDA. Failures fall back to eager steps.
+    cuda_graph: str = "auto"
+    # Linear LR scale batch_pixels / lr_batch_ref when both are positive.
+    lr_batch_ref: int = 0
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
@@ -426,6 +437,10 @@ def encode_arrays(
     """``images`` is float32 ``[C,H,W]`` in ``[0,1]``."""
     if cfg.target_psnr is not None:
         return _encode_for_psnr(images, semantics, cfg)
+    if cfg.fast:
+        from ntc.train_fast import encode_arrays_fast
+
+        return encode_arrays_fast(images, semantics, cfg)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = pick_device(cfg.device)

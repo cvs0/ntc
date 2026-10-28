@@ -38,6 +38,8 @@ def encode_main(argv: list[str] | None = None) -> None:
     p.add_argument("--target-psnr", type=float, default=None)
     p.add_argument("--rd-lambda", type=float, default=0.0)
     p.add_argument("--search-steps", type=int, default=0)
+    p.add_argument("--fast", action="store_true")
+    p.add_argument("--halve-steps", type=int, default=0)
     p.add_argument("--mip-levels", type=int, default=4)
     p.add_argument("--mip-loss", default="footprint", choices=("geom", "footprint", "uniform"))
     args = p.parse_args(argv)
@@ -56,6 +58,8 @@ def encode_main(argv: list[str] | None = None) -> None:
         target_psnr=args.target_psnr,
         rd_lambda=args.rd_lambda,
         search_steps=args.search_steps,
+        fast=args.fast,
+        halve_steps=args.halve_steps,
         mip_levels=args.mip_levels,
         mip_loss=args.mip_loss,
     )

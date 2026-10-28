@@ -1,0 +1,28 @@
+{
+  "measured_on_this_vm": false,
+  "source": "RX 9070, ROCm 7.2.1, torch 2.9.1, Windows, train_max at c33648b",
+  "per_1000_steps_s": 30.0,
+  "s20000_wall_s": 648.0,
+  "step_s_256": 0.03,
+  "precision_probe": {
+    "rule": "higher 8-bit PSNR after 400 steps",
+    "fp32_400_s": 17.0,
+    "bf16_400_s": 12.0,
+    "bf16_steps_per_s_over_fp32": 1.4167,
+    "chosen": "fp32",
+    "why": "Equal step count. bf16 finished the 400 steps in 12.0 s and fp32 in 17.0 s. The extra steps bf16 could have run in those 17.0 s were not trained, so the faster precision lost the comparison."
+  },
+  "seed_search": "seeds run one after another, each a separate encode_arrays call",
+  "partial_results": [
+    {"name": "metal_g16_s20000", "psnr_u8": 39.4655, "total_bpp": 11.7025},
+    {"name": "paving_g16_s20000", "psnr_u8": 34.4812, "total_bpp": 11.8823},
+    {"name": "metal_b6_s10000", "psnr_u8": 33.6462, "total_bpp": 5.3630},
+    {"name": "paving_b6", "psnr_u8": 29.6474, "total_bpp": 4.9972},
+    {"name": "metal_b4", "psnr_u8": 29.7362, "total_bpp": 3.0980},
+    {"name": "paving_b4", "psnr_u8": 29.2320, "total_bpp": 3.4713}
+  ],
+  "gpu_idle_fraction": null,
+  "launch_cpu_fraction": null,
+  "fast_path_speedup_time_to_target": null,
+  "note": "gpu_idle_fraction and the fast-path speedup are filled by bench/train_speed.py on this GPU. The command is in bench/train_speed.ps1."
+}
