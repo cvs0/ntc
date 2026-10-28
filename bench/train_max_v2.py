@@ -177,6 +177,9 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
         "latent_plain_bytes": stats.get("latent_plain_bytes"),
         "flags_coder": stats.get("latent_coder"),
         "checkpoint": stats.get("checkpoint"),
+        "steps_ran": stats.get("steps_ran"),
+        "psnr_u8_init": stats.get("psnr_u8_init"),
+        "psnr_u8_trained": stats.get("psnr_u8_trained"),
         "seed": stats.get("seed"),
         "grids": stats.get("grids"),
         "stopped_early": stats.get("stopped_early"),
@@ -200,8 +203,9 @@ def _run_claimed(job: dict, out: Path, precision: str, shard_label: str, dest: P
     sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
     print(
         f"worker {shard_label or '0/1'} pid {os.getpid()} {job['name']} "
-        f"steps/s {sps_txt} psnr {row['psnr_u8']:.4f} total_bpp {row['total_bpp']:.4f} "
-        f"wall {wall:.1f}",
+        f"steps/s {sps_txt} steps_ran {row.get('steps_ran')} ckpt {row.get('checkpoint')} "
+        f"psnr {row['psnr_u8']:.4f} init {row.get('psnr_u8_init')} trained {row.get('psnr_u8_trained')} "
+        f"total_bpp {row['total_bpp']:.4f} stopped {row.get('stopped_early')} wall {wall:.1f}",
         flush=True,
     )
     return row
@@ -344,6 +348,173 @@ def _spawn_workers(args: argparse.Namespace) -> int:
     return rc
 
 
+def _pack_key(job: dict) -> tuple | None:
+    grids = job.get("grids")
+    if not grids:
+        return None
+    return (
+        int(job["size"]),
+        int(job["steps"]),
+        str(job["schedule"]),
+        int(job["mip_levels"]),
+        int(job["seed_pool"]),
+        int(job["warmup"]),
+        tuple(tuple(int(x) for x in g) for g in grids),
+    )
+
+
+def _run_group(group: list[dict], out: Path, precision: str, shard_label: str, stale_s: float) -> None:
+    from ntc.train_fast import encode_bank
+
+    live = []
+    for job in group:
+        dest = out / f"{job['name']}.json"
+        if dest.is_file() and json.loads(dest.read_text()).get("done"):
+            print("skip", job["name"], flush=True)
+            continue
+        live.append(job)
+    if len(live) <= 1:
+        for job in live:
+            _run(job, out, precision, shard_label, stale_s)
+        return
+    claimed = []
+    try:
+        for job in live:
+            if claim_job(out, job["name"], stale_s):
+                claimed.append(job)
+            else:
+                print("locked", job["name"], flush=True)
+        if len(claimed) <= 1:
+            for job in claimed:
+                release_job(out, job["name"])
+            for job in claimed:
+                _run(job, out, precision, shard_label, stale_s)
+            claimed = []
+            return
+        buckets: dict[tuple, list] = {}
+        for job in claimed:
+            mat = Path(job["material"])
+            if not (mat / "manifest.json").is_file():
+                row = {"name": job["name"], "done": False, "error": f"missing {mat}"}
+                (out / f"{job['name']}.json").write_text(json.dumps(row, indent=2))
+                print("missing", job["name"], mat, flush=True)
+                continue
+            images, sems, _info = load_material(mat, int(job["size"]))
+            buckets.setdefault((images.shape[0], tuple(sems)), []).append((job, images, sems))
+        for (_channels, sems), items in buckets.items():
+            if len(items) == 1:
+                release_job(out, items[0][0]["name"])
+                _run(items[0][0], out, precision, shard_label, stale_s)
+                claimed = [job for job in claimed if job["name"] != items[0][0]["name"]]
+                continue
+            first = items[0][0]
+            cfg = TrainConfig(
+                steps=int(first["steps"]),
+                target_bpp=float(first["bpp"]),
+                grids=[tuple(g) for g in first["grids"]],
+                seed=int(first["seed"]),
+                adaptive_pool=1,
+                seed_pool=int(first["seed_pool"]),
+                latent_deflate=True,
+                latent_coder="best",
+                rate=str(first.get("rate", "payload")),
+                mip_levels=int(first["mip_levels"]),
+                mip_loss="footprint",
+                warmup_steps=int(first["warmup"]),
+                schedule=str(first["schedule"]),
+                precision=precision,
+                eval_every=0,
+                early_stop=0,
+                batch_pixels=int(first.get("batch_pixels", 0)),
+                lr_batch_ref=int(first.get("lr_batch_ref", 0)),
+                log_every=10**9,
+                device="auto",
+                with_ssim=False,
+                fast=True,
+                halve_steps=0,
+                compile_step="auto",
+                cuda_graph="auto",
+            )
+            packed = encode_bank(
+                [image for _job, image, _sems in items],
+                list(sems),
+                cfg,
+                seeds_per_image=[int(job["seed"]) for job, _image, _sems in items],
+            )
+            for (job, _image, _sems), (blob, stats) in zip(items, packed, strict=True):
+                (out / f"{job['name']}.ntc").write_bytes(blob)
+                sps = stats.get("steps_per_s")
+                row = {
+                    "name": job["name"],
+                    "done": True,
+                    "fast": True,
+                    "packed_jobs": stats.get("packed_jobs"),
+                    "wall_s": stats.get("seconds_train"),
+                    "psnr_u8": stats["metrics"]["psnr_u8"],
+                    "total_bpp": stats["total_bpp"],
+                    "latent_bpp_mip0": stats.get("latent_bpp_mip0"),
+                    "file_bpp_chain": stats.get("file_bpp_chain"),
+                    "bppc": stats.get("bppc"),
+                    "latent_stored_bytes": stats.get("latent_stored_bytes"),
+                    "latent_plain_bytes": stats.get("latent_plain_bytes"),
+                    "flags_coder": stats.get("latent_coder"),
+                    "checkpoint": stats.get("checkpoint"),
+                    "steps_ran": stats.get("steps_ran"),
+                    "psnr_u8_init": stats.get("psnr_u8_init"),
+                    "psnr_u8_trained": stats.get("psnr_u8_trained"),
+                    "seed": stats.get("seed"),
+                    "grids": stats.get("grids"),
+                    "stopped_early": False,
+                    "precision": precision,
+                    "steps": job["steps"],
+                    "size": job["size"],
+                    "seconds_train": stats.get("seconds_train"),
+                    "steps_per_s": sps,
+                    "compiled": stats.get("compiled"),
+                    "cuda_graph": stats.get("cuda_graph"),
+                    "shard": shard_label,
+                    "worker_pid": os.getpid(),
+                    "batch_pixels": int(job.get("batch_pixels", 0)),
+                    "lr_batch_ref": int(job.get("lr_batch_ref", 0)),
+                }
+                (out / f"{job['name']}.json").write_text(json.dumps(row, indent=2))
+                sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
+                print(
+                    f"worker {shard_label or '0/1'} pid {os.getpid()} {job['name']} "
+                    f"steps/s {sps_txt} packed {stats.get('packed_jobs')} "
+                    f"psnr {row['psnr_u8']:.4f} total_bpp {row['total_bpp']:.4f}",
+                    flush=True,
+                )
+    finally:
+        for job in claimed:
+            release_job(out, job["name"])
+
+
+def _run_packed(jobs: list[dict], out: Path, precision: str, shard_label: str, stale_s: float) -> None:
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple | None] = []
+    for job in jobs:
+        key = _pack_key(job)
+        if key is None:
+            order.append(None)
+            groups.setdefault(None, []).append(job)
+        else:
+            if key not in groups:
+                order.append(key)
+            groups.setdefault(key, []).append(job)
+    seen = set()
+    for job in jobs:
+        key = _pack_key(job)
+        token = ("single", job["name"]) if key is None else ("group", key)
+        if token in seen:
+            continue
+        seen.add(token)
+        if key is None:
+            _run(job, out, precision, shard_label, stale_s)
+        else:
+            _run_group(groups[key], out, precision, shard_label, stale_s)
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--out", type=Path, default=Path("results/train_max_v2"))
@@ -353,6 +524,7 @@ def main() -> None:
     p.add_argument("--shard", default="", help="I/N. This process runs jobs where index %% N == I.")
     p.add_argument("--workers", type=int, default=0, help="Spawn N shard subprocesses and wait.")
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
+    p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
     p.add_argument("--stale-lock-s", type=float, default=86400.0)
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
@@ -383,10 +555,12 @@ def main() -> None:
                 print(f"plan {index} {job['name']} batch {job['batch_pixels']} lr_ref {job['lr_batch_ref']}", flush=True)
         return
     precision = _ensure_precision(args)
-    for index, job in enumerate(jobs):
-        if not owns_index(index, shard_i, shard_n):
-            continue
-        _run(job, args.out, precision, shard_label, args.stale_lock_s)
+    selected = [job for index, job in enumerate(jobs) if owns_index(index, shard_i, shard_n)]
+    if args.pack:
+        _run_packed(selected, args.out, precision, shard_label, args.stale_lock_s)
+    else:
+        for job in selected:
+            _run(job, args.out, precision, shard_label, args.stale_lock_s)
     print("wrote", args.out, "shard", shard_label or "0/1", flush=True)
 
 

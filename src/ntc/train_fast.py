@@ -61,8 +61,14 @@ def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     """``codes`` ``[S,C,H,W]``, ``uv`` ``[N,2]`` in ``[0,1]``. Returns ``[S,N,C]``.
 
     Same taps as ``bilinear_codes_torch``: pixel centers at integer + 0.5,
-    wrapped with remainder.
+    wrapped with remainder. CUDA may use a Triton kernel after a numeric check.
     """
+    if codes.is_cuda:
+        from ntc.triton_bilinear import try_triton_bilinear
+
+        fused = try_triton_bilinear(codes, uv)
+        if fused is not None:
+            return fused
     _s, _c, height, width = codes.shape
     x = uv[:, 0] * width - 0.5
     y = uv[:, 1] * height - 0.5
@@ -430,6 +436,18 @@ def _copy_adam_slice(src: torch.optim.Optimizer, dst: torch.optim.Optimizer, ind
         dst.state[new] = copied
 
 
+def _clamp_latents(stacked: StackedTrain) -> None:
+    """Keep code-unit latents inside the representable bins.
+
+    The straight-through estimator passes gradient outside the bin range, so a
+    long run at a flat learning rate can push every code to 0 or to the max.
+    The exported file is then a smooth field: low PSNR and a very small rate.
+    """
+    with torch.no_grad():
+        for lat, bits in zip(stacked.latents, stacked.grid_bits, strict=True):
+            lat.clamp_(0, (1 << int(bits)) - 1)
+
+
 def _step_lr(cfg: TrainConfig, step: int) -> float:
     if cfg.schedule == "onecycle":
         peak = cfg.lr * max(float(cfg.onecycle_peak), 1.0)
@@ -564,6 +582,7 @@ def _run_loop(
                 _clip_no_sync(params, 1.0)
                 scaler.step(opt)
                 scaler.update()
+                _clamp_latents(stacked)
                 return loss
         loss.backward()
         if cfg.optimizer == "shampoo":
@@ -572,6 +591,7 @@ def _run_loop(
             shampoo_precondition(params)
         _clip_no_sync(params, 1.0)
         opt.step()
+        _clamp_latents(stacked)
         return loss
 
     if amp_dtype == torch.float16 and device_type == "cuda":
@@ -579,16 +599,24 @@ def _run_loop(
 
     compiled = False
     compile_error = None
+    loop_graph_from_compile = False
+    import sys as _sys
+
+    linux_cuda = device_type == "cuda" and _sys.platform.startswith("linux")
+    compile_mode = "reduce-overhead" if linux_cuda else "default"
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
         try:
-            compiled_loss = torch.compile(_loss_from_mips, dynamic=False)
+            compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
             # Touch it once outside the timed region of the caller. A failure
             # here is recorded and the eager function stays in use.
             probe = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
             probe.sum().backward()
             opt.zero_grad(set_to_none=True)
             compiled = True
+            if compile_mode == "reduce-overhead":
+                # Inductor reduce-overhead replays the step as a CUDA/HIP graph.
+                loop_graph_from_compile = True
             # The compiled function replaces the fp32 loss path only.
             def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
                 lr = _step_lr(cfg, step) * lr_scale
@@ -607,13 +635,15 @@ def _run_loop(
                     shampoo_precondition(params)
                 _clip_no_sync(params, 1.0)
                 opt.step()
+                _clamp_latents(stacked)
                 return loss
         except Exception as exc:
             compile_error = str(exc)
             compiled = False
             opt.zero_grad(set_to_none=True)
 
-    if use_graph and device_type == "cuda":
+    try_graph = device_type == "cuda" and cfg.cuda_graph != "off" and (use_graph or (linux_cuda and not compiled))
+    if try_graph:
         try:
             for warm in range(3):
                 one_step(start_step + warm, replay=True)
@@ -643,7 +673,8 @@ def _run_loop(
         "steps": steps,
         "compiled": compiled,
         "compile_error": compile_error,
-        "cuda_graph": graph is not None,
+        "cuda_graph": graph is not None or loop_graph_from_compile,
+        "compile_mode": compile_mode if compiled else None,
         "cuda_graph_error": graph_error,
         "steps_per_s": (steps / elapsed) if elapsed > 0 else None,
     }
@@ -912,6 +943,7 @@ def encode_arrays_fast(
     best_state = None
     if done_steps < cfg.steps and cfg.eval_every and cfg.early_stop and stacked.n_seeds == 1:
         stall = 0
+        init_score = _psnr_per_seed(stacked, images_bank, device)[0]
         while done_steps < cfg.steps:
             span = min(int(cfg.eval_every), cfg.steps - done_steps)
             info = _run_loop(
@@ -925,6 +957,10 @@ def encode_arrays_fast(
                 best_val = score
                 stall = 0
                 best_state = [p.detach().clone() for p in stacked.parameters()]
+            elif score + 1e-4 < init_score:
+                # Still under the PCA initialization. A flat learning-rate
+                # schedule can sit here for several evals. Do not stop yet.
+                stall = 0
             else:
                 stall += 1
                 if stall >= cfg.early_stop:
@@ -1237,6 +1273,104 @@ def _triton_status() -> str:
     except Exception:
         return "not_installed"
     return "installed"
+
+
+def encode_bank(
+    images: list[np.ndarray],
+    semantics: list[int],
+    cfg: TrainConfig,
+    seeds_per_image: list[int] | None = None,
+) -> list[tuple[bytes, dict]]:
+    """Train several materials of the same shape in one stacked module.
+
+    Row ``i`` of the batch is material ``i``. ``cfg.seed_pool`` seeds are built
+    for every material. Halving is off: dropping a row would drop a material.
+    Grids must already be chosen.
+    """
+    from ntc.container import parse_texture_set, rate_report
+    from ntc.decode_ref import decode_mip
+    from ntc.device import device_report, pick_device
+    from ntc.metrics import group_metrics, psnr_u8
+
+    if not images:
+        return []
+    if cfg.grids is None:
+        raise ValueError("encode_bank needs explicit grids")
+    device = pick_device(cfg.device)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
+    shape = images[0].shape
+    if any(im.shape != shape for im in images):
+        raise ValueError("packed materials must share C,H,W")
+    grids = [tuple(g) for g in cfg.grids]
+    per = max(1, cfg.seed_pool if cfg.steps > 0 else 1)
+    bases = seeds_per_image or [cfg.seed] * len(images)
+    nets = []
+    owners: list[int] = []
+    seed_ids: list[int] = []
+    targets = []
+    for i, image in enumerate(images):
+        target = torch.from_numpy(np.ascontiguousarray(image)).to(device)
+        these = [int(bases[i]) + s for s in range(per)]
+        built = _build_nets(target, cfg, grids, these, device)
+        nets.extend(built)
+        owners.extend([i] * len(built))
+        seed_ids.extend(these)
+        targets.extend([target] * len(built))
+    stacked = StackedTrain(nets)
+    bank = torch.stack(targets, 0)
+    mips = _prep_mips(bank, cfg, device)
+    opt = _adam_on(stacked, cfg, capturable=False)
+    info = _run_loop(
+        stacked, opt, mips, cfg, semantics, cfg.steps, 0, None, device.type, use_graph=False,
+    )
+    scores = _psnr_per_seed(stacked, bank, device)
+    channels, height, width = shape
+    num_mips = min(8, int(math.floor(math.log2(max(width, height)))) + 1)
+    coder = cfg.latent_coder if cfg.latent_deflate else "raw"
+    out = []
+    for i, image in enumerate(images):
+        idxs = [k for k, owner in enumerate(owners) if owner == i]
+        winner = max(idxs, key=lambda k: scores[k])
+        net = _build_nets(targets[winner], replace(cfg, pca_init=False), grids, [seed_ids[winner]], device)[0]
+        stacked.write_seed(winner, net)
+        blob = export_network(
+            net, semantics, width, height, num_mips,
+            latent_deflate=cfg.latent_deflate, latent_coder=coder,
+        )
+        ts = parse_texture_set(blob)
+        recon = decode_mip(ts, 0)
+        ref = np.transpose(image, (1, 2, 0))
+        file_psnr = psnr_u8(recon, ref)
+        metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {"psnr_u8": file_psnr}
+        stats = {
+            "fast": True,
+            "packed_jobs": len(images),
+            "packed_rows": stacked.n_seeds,
+            "checkpoint": "trained",
+            "seed": seed_ids[winner],
+            "steps_ran": cfg.steps,
+            "seconds_train": info["seconds"],
+            "steps_per_s": (cfg.steps / info["seconds"]) if info.get("seconds") else None,
+            "compiled": info.get("compiled"),
+            "cuda_graph": info.get("cuda_graph"),
+            "compile_error": info.get("compile_error"),
+            "cuda_graph_error": info.get("cuda_graph_error"),
+            "stopped_early": False,
+            "psnr_u8_init": None,
+            "psnr_u8_trained": float(scores[winner]),
+            "best_val_psnr": None,
+            "grids": [list(g) for g in grids],
+            "latent_coder": coder,
+            "latent_stored_bytes": ts.latent_stored_bytes,
+            "latent_plain_bytes": ts.latent_plain_bytes,
+            "metrics": metrics,
+            "device": device_report(device),
+            **rate_report(ts),
+        }
+        out.append((blob, stats))
+    return out
 
 
 def choose_precision(
