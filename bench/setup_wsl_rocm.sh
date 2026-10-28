@@ -1,12 +1,18 @@
 #!/usr/bin/env bash
 # ROCm 7.2 userspace inside WSL2 for an RX 9070 (gfx1201).
 # The Windows host already owns the GPU. This script does not install a
-# kernel driver. AMD's WSL usecase is:
-#   amdgpu-install -y --usecase=wsl,rocm --no-dkms
-# Docs: https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-7.2/docs/install/installrad/wsl/install-radeon.html
-# The host driver used with this tree is Adrenalin 26.10.1. The 7.2 WSL
-# doc names 26.1.1 as the driver it was written against. Do not downgrade
-# the host driver from this script.
+# kernel driver and does not change the host Adrenalin driver (26.10.1 here).
+#
+# ROCm 7.2 rejects `amdgpu-install --usecase=wsl` with
+# "Usecase implementation 'wsl' is not supported or invalid".
+# Install the ROCm userspace, then the librocdxg runtime:
+#   sudo amdgpu-install -y --usecase=rocm --no-dkms
+#   rocdxg-roct_1.2.2_amd64.deb
+#   https://github.com/ROCm/librocdxg/releases/download/v1.2.2/rocdxg-roct_1.2.2_amd64.deb
+# Legacy ROCm (this 7.2 stack, before 7.13) needs HSA_ENABLE_DXG_DETECTION=1
+# so libhsa loads librocdxg and sees /dev/dxg.
+# The torch wheel ships its own libhsa-runtime64.so. That copy does not load
+# librocdxg. Remove it after pip so the system runtime is the one that is used.
 set -euo pipefail
 
 if ! grep -qi microsoft /proc/version 2>/dev/null; then
@@ -28,7 +34,25 @@ if ! dpkg -s amdgpu-install >/dev/null 2>&1; then
   wget -O "/tmp/${DEB}" "$URL"
   sudo apt-get install -y "/tmp/${DEB}"
 fi
-sudo amdgpu-install -y --usecase=wsl,rocm --no-dkms
+sudo amdgpu-install -y --usecase=rocm --no-dkms
+sudo ldconfig
+
+ROCDXG_DEB="rocdxg-roct_1.2.2_amd64.deb"
+ROCDXG_URL="https://github.com/ROCm/librocdxg/releases/download/v1.2.2/${ROCDXG_DEB}"
+# Digest published on the v1.2.2 release asset.
+ROCDXG_SHA256="28ded1254811192ebace1f76c0227580184af7b27ab2475fb9728295a702d541"
+wget -O "/tmp/${ROCDXG_DEB}" "$ROCDXG_URL"
+printf '%s  %s\n' "$ROCDXG_SHA256" "/tmp/${ROCDXG_DEB}" | sha256sum -c -
+sudo apt-get install -y "/tmp/${ROCDXG_DEB}" || {
+  sudo dpkg -i "/tmp/${ROCDXG_DEB}"
+  sudo apt-get install -y -f
+}
+sudo ldconfig
+if ! find /opt/rocm /usr/lib /usr/local/lib -name 'librocdxg.so*' -print -quit 2>/dev/null | grep -q .; then
+  echo "librocdxg.so was not found after installing ${ROCDXG_DEB}"
+  exit 1
+fi
+
 sudo usermod -aG render,video "$USER" || true
 
 if ! grep -q HSA_ENABLE_DXG_DETECTION "$HOME/.bashrc" 2>/dev/null; then
@@ -38,6 +62,9 @@ fi
 python3 -m venv "$ROOT/.venv-wsl"
 # shellcheck disable=SC1091
 source "$ROOT/.venv-wsl/bin/activate"
+if ! grep -q HSA_ENABLE_DXG_DETECTION "$ROOT/.venv-wsl/bin/activate" 2>/dev/null; then
+  echo 'export HSA_ENABLE_DXG_DETECTION=1' >> "$ROOT/.venv-wsl/bin/activate"
+fi
 python -m pip install --upgrade pip wheel
 # Same torch the Windows ROCm 7.2.1 run used: 2.9.1. The Radeon wheel index
 # pulls the matching torchvision and the ROCm Triton build.
@@ -45,10 +72,23 @@ python -m pip install torch==2.9.1 torchvision==0.24.0 torchaudio==2.9.0 \
   -f https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2/
 python -m pip install numpy pillow
 
-# AMD's WSL note: drop the libhsa copy shipped inside the wheel so the
-# userspace ROCm runtime is the one that sees /dev/dxg.
+# Drop every libhsa-runtime64 the wheel unpacked. The dynamic linker then
+# uses the system libhsa, which is the one that loads librocdxg.
 TORCH_LIB="$(python -c 'import torch, pathlib; print(pathlib.Path(torch.__file__).parent / "lib")')"
-rm -f "$TORCH_LIB"/libhsa-runtime64.so*
+mapfile -t HSA_BUNDLED < <(find "$TORCH_LIB" -name 'libhsa-runtime64.so*' -print)
+if ((${#HSA_BUNDLED[@]})); then
+  rm -f "${HSA_BUNDLED[@]}"
+  printf 'removed bundled libhsa-runtime64:\n'
+  printf '  %s\n' "${HSA_BUNDLED[@]}"
+fi
+mapfile -t HSA_LEFT < <(find "$TORCH_LIB" -name 'libhsa-runtime64.so*' -print)
+if ((${#HSA_LEFT[@]})); then
+  echo "torch still contains libhsa-runtime64; the system runtime would not be used"
+  printf '  %s\n' "${HSA_LEFT[@]}"
+  exit 1
+fi
+echo "system libhsa-runtime64:"
+ldconfig -p | grep 'libhsa-runtime64' || echo "warning: ldconfig has no libhsa-runtime64"
 
 python - << 'PY'
 import torch
@@ -72,5 +112,6 @@ except Exception as exc:
 PY
 
 echo "venv: $ROOT/.venv-wsl"
+echo "If this user was just added to render and video, open a new shell before training."
 echo "Next: source .venv-wsl/bin/activate && export PYTHONPATH=src:. && export HSA_ENABLE_DXG_DETECTION=1"
-echo "Then: python bench/train_max_v2.py --workers 2 --out results/train_max_v2 --materials data/materials --probe-steps 400"
+echo "Then: python bench/train_max_v2.py --workers 3 --out results/train_max_v2 --materials data/materials --probe-steps 400"
