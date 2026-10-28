@@ -35,6 +35,21 @@ def laplace_bits(values: torch.Tensor, log_b: torch.Tensor) -> torch.Tensor:
     return discrete + continuous - continuous.detach()
 
 
+def file_rate_bpp(model_bpp: torch.Tensor, latent_rate_scale: float) -> torch.Tensor:
+    """Laplace bits times the stored/plain ratio, in file bpp.
+
+    The label is a file rate. A 4-bit grid's Laplace rate is often near 4
+    raw bpp while the range coder stores about half of that. Comparing the
+    raw rate to the label penalizes a file that is already under the label.
+    Tiles135D b2.5 on 5a71784 sat at 31.7 dB from step 3000 with a file at
+    2.21 bpp. A scale outside (0, 1) leaves the model bpp unchanged.
+    """
+    scale = float(latent_rate_scale)
+    if not (0.0 < scale < 1.0):
+        scale = 1.0
+    return model_bpp * scale
+
+
 def latent_rate_bits(latents: list[torch.Tensor], grid_bits: list[int]) -> torch.Tensor:
     """Bits for every latent code under a per-channel Laplace.
 

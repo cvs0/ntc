@@ -1,9 +1,10 @@
 """Laplace code rate against the range coder on three smooth fields."""
 
 import numpy as np
+import pytest
 import torch
 
-from ntc.entropy import laplace_bits
+from ntc.entropy import file_rate_bpp, laplace_bits
 from ntc.range_coder import range_encode
 
 
@@ -20,6 +21,20 @@ def _fit_bits(raw: np.ndarray) -> tuple[float, int]:
         if best is None or abs(estimate - coded) < abs(best - coded):
             best = estimate
     return float(best), coded
+
+
+def test_file_rate_does_not_penalize_a_coder_that_is_under_the_label():
+    """Tiles sat under 2.5 bpp while a raw Laplace near 4 bpp was still penalized.
+
+    The file rate is the model times the stored/plain ratio. 4 raw bpp at
+    the Tiles ratio is under the label, so the excess is zero. The same
+    model with no ratio is over the label.
+    """
+    model = torch.tensor(4.0)
+    assert float(file_rate_bpp(model, 0.55)) == pytest.approx(2.2)
+    assert float(file_rate_bpp(model, 0.55)) < 2.5
+    assert float(file_rate_bpp(model, 1.0)) > 2.5
+    assert float(file_rate_bpp(model, 0.0)) == pytest.approx(4.0)
 
 
 def test_trained_laplace_rate_is_within_3_percent_on_three_smooth_sets():

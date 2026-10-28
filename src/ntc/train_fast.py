@@ -996,14 +996,14 @@ def _loss_from_mips(
             scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=COARSE_LOSS_FRACTION)
             distortion = fine + coarse * scale
         if cfg.entropy_rate and float(cfg.target_bpp) > 0 and mips:
-            from ntc.entropy import latent_rate_bits
+            from ntc.entropy import file_rate_bpp, latent_rate_bits
 
             height = int(mips[0]["height"])
             width = int(mips[0]["width"])
             pixels = max(1, height * width * stacked.n_seeds)
-            rate_bpp = latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels)
-            # Only rate above the label is penalized, so a low-rate fit is
-            # not pulled off its distortion minimum.
+            model_bpp = latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels)
+            # The label is file bpp. Scale the model by the coder ratio first.
+            rate_bpp = file_rate_bpp(model_bpp, float(cfg.latent_rate_scale))
             excess = (rate_bpp - float(cfg.target_bpp)).clamp(min=0.0)
             weight = 0.002 / max(float(cfg.target_bpp), 0.5)
             distortion = distortion + excess * weight
