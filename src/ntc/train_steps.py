@@ -12,13 +12,82 @@ import torch.nn.functional as F
 from ntc.model import NtcNet, _soft_box
 
 
+def _transplant_checkpoint(net: NtcNet, state: dict) -> bool:
+    """Copy a trained net into ``net`` when the grids match spatially.
+
+    Extra channels on ``net`` stay at the bin midpoint with a zero column in
+    the first layer, so the forward matches the checkpoint at step 0. Later
+    layers are copied when their shapes match.
+    """
+    src_ids = []
+    for key in state:
+        if key.startswith("latents.") and key.count(".") == 1:
+            src_ids.append(int(key.split(".")[1]))
+    src_ids.sort()
+    if len(src_ids) != len(net.latents):
+        return False
+    for index, src_i in enumerate(src_ids):
+        src = state[f"latents.{src_i}"]
+        lat = net.latents[index]
+        if tuple(src.shape[1:]) != tuple(lat.shape[1:]):
+            return False
+    with torch.no_grad():
+        src_off = 0
+        dst_off = 0
+        first = net.linears[0].weight
+        first.zero_()
+        net.linears[0].bias.zero_()
+        src_w = state.get("linears.0.weight")
+        src_b = state.get("linears.0.bias")
+        for index, src_i in enumerate(src_ids):
+            src = state[f"latents.{src_i}"]
+            lat = net.latents[index]
+            take = min(int(src.shape[0]), int(lat.shape[0]))
+            lat[:take].copy_(src[:take].to(device=lat.device, dtype=lat.dtype))
+            bits = int(net.grid_bits[index])
+            mid = float((1 << bits) - 1) / 2.0
+            if take < int(lat.shape[0]):
+                lat[take:].fill_(mid)
+            src_scale = state.get(f"log_scales.{src_i}")
+            if src_scale is not None:
+                net.log_scales[index][:take].copy_(
+                    src_scale[:take].to(device=lat.device, dtype=net.log_scales[index].dtype)
+                )
+            if src_w is not None and int(src_w.shape[1]) >= src_off + take:
+                cols = take
+                first[:, dst_off : dst_off + cols].copy_(
+                    src_w[:, src_off : src_off + cols].to(device=first.device, dtype=first.dtype)
+                )
+            src_off += int(src.shape[0])
+            dst_off += int(lat.shape[0])
+        if src_b is not None:
+            take_b = min(int(src_b.shape[0]), int(net.linears[0].bias.shape[0]))
+            net.linears[0].bias[:take_b].copy_(src_b[:take_b].to(device=net.linears[0].bias.device))
+        for layer in range(1, len(net.linears)):
+            weight = state.get(f"linears.{layer}.weight")
+            bias = state.get(f"linears.{layer}.bias")
+            if weight is not None and tuple(weight.shape) == tuple(net.linears[layer].weight.shape):
+                net.linears[layer].weight.copy_(weight.to(device=net.linears[layer].weight.device))
+            if bias is not None and tuple(bias.shape) == tuple(net.linears[layer].bias.shape):
+                net.linears[layer].bias.copy_(bias.to(device=net.linears[layer].bias.device))
+    return True
+
+
 def apply_warm_start(net: NtcNet, path: str, freeze: bool) -> None:
     """Copy a saved MLP into ``net``. Overlapping output rows and input columns.
 
     The file is a dict with ``weights`` and ``biases``, each a list of tensors
     in layer order, plus ``hidden``, ``latent_channels``, and ``out_channels``.
+    A train checkpoint (``model`` state dict) is transplanted instead: matching
+    latent channels are copied and new channels stay silent.
     """
     blob = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(blob, dict) and "model" in blob and "weights" not in blob:
+        _transplant_checkpoint(net, blob["model"])
+        if freeze:
+            for param in net.linears.parameters():
+                param.requires_grad_(False)
+        return
     weights = blob["weights"]
     biases = blob["biases"]
     with torch.no_grad():

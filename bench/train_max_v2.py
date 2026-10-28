@@ -13,6 +13,11 @@ same cost order, split longest-job-first, and does not steal.
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import os
@@ -80,6 +85,52 @@ def collapse_reason(trained: float, init: float, effective: int, pixels: int) ->
     return (
         f"trained PSNR {float(trained):.2f} stayed within {NEAR_INIT_DB:.0f} dB of init {float(init):.2f}"
     )
+
+
+def _rate_family(name: str) -> tuple[str, float] | None:
+    if "_b" not in name:
+        return None
+    stem, bpp_s = name.rsplit("_b", 1)
+    try:
+        return stem, float(bpp_s)
+    except ValueError:
+        return None
+
+
+def cheaper_better(out: Path, job: dict, psnr: float) -> dict | None:
+    """Finished lower-bitrate sibling of ``job`` whose file PSNR beats ``psnr``.
+
+    ``b5`` at 33.45 dB beat ``b10`` at 33.07 dB. The higher label is retrained
+    from a channel-grown copy of the cheaper grid so step 0 matches that file.
+    """
+    parsed = _rate_family(str(job.get("name") or ""))
+    if parsed is None or not out.is_dir():
+        return None
+    stem, bpp = parsed
+    best = None
+    for path in out.glob(f"{stem}_b*.json"):
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError, json.JSONDecodeError):
+            continue
+        if not row.get("done") or not row.get("grids"):
+            continue
+        other = _rate_family(str(row.get("name") or path.stem))
+        if other is None or other[0] != stem or other[1] >= bpp - 1e-6:
+            continue
+        score = row.get("psnr_u8")
+        if not isinstance(score, (int, float)):
+            continue
+        if float(score) <= float(psnr) + 0.05:
+            continue
+        if best is None or float(score) > float(best["psnr"]):
+            best = {
+                "name": str(row.get("name") or path.stem),
+                "psnr": float(score),
+                "grids": row["grids"],
+                "checkpoint": row.get("checkpoint"),
+            }
+    return best
 
 
 def job_cost(job: dict) -> float:
@@ -405,7 +456,9 @@ def _run_claimed(
         latent_rate_scale=float(job.get("latent_rate_scale", 1.0)),
         resume=str(ckpt) if ckpt.is_file() else "",
         ckpt=str(ckpt),
-        log_every=10**9,
+        log_every=100,
+        job_name=str(job["name"]),
+        warm_start=str(job.get("warm_start") or ""),
         device="auto",
         with_ssim=False,
         fast=True,
@@ -414,6 +467,11 @@ def _run_claimed(
         cuda_graph="auto",
     )
     t0 = time.perf_counter()
+    print(
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} start {job['name']} "
+        f"steps {job['steps']} batch {job.get('batch_pixels')} {job.get('batch_mip')}",
+        flush=True,
+    )
     blob, stats = encode_arrays_fast(images, sems, cfg)
     wall = time.perf_counter() - t0
     ntc_path.write_bytes(blob)
@@ -451,8 +509,8 @@ def _run_claimed(
         "target_bpp": float(job["bpp"]),
         "latent_rate_scale": float(job.get("latent_rate_scale", 1.0)),
         "min_latent_bits": int(job.get("min_latent_bits", 0)),
-        "wide_lr_mult": float(stats.get("wide_lr_mult", 1.0)),
         "compiled": stats.get("compiled"),
+        "compile_mode": stats.get("compile_mode"),
         "cuda_graph": stats.get("cuda_graph"),
         "halving": stats.get("halving"),
         "device": stats.get("device"),
@@ -489,11 +547,49 @@ def _run_claimed(
         row["collapsed"] = True
         row["error"] = collapse_reason(float(trained), float(init), effective, pixels)
         print("collapsed", job["name"], row["error"], flush=True)
+    if row.get("done") and not job.get("_rd_retry"):
+        lower = cheaper_better(out, job, float(row["psnr_u8"]))
+        if lower is not None:
+            from ntc.grids import grow_grids
+
+            scale = float(job.get("latent_rate_scale") or 1.0)
+            target = float(job["bpp"])
+            if str(job.get("rate") or "") == "latent" and 0 < scale < 1:
+                target = target / scale
+            grown = grow_grids(
+                [tuple(g) for g in lower["grids"]],
+                int(job["size"]),
+                int(job["size"]),
+                target,
+            )
+            trained_grids = [tuple(g) for g in (row.get("grids") or [])]
+            if grown and [tuple(g) for g in grown] != trained_grids:
+                print(
+                    f"rd {job['name']} {float(row['psnr_u8']):.2f} under {lower['name']} "
+                    f"{lower['psnr']:.2f}, retry grown {grown}",
+                    flush=True,
+                )
+                if ckpt.is_file():
+                    ckpt.unlink()
+                if ntc_path.is_file():
+                    ntc_path.unlink()
+                if dest.is_file():
+                    dest.unlink()
+                fallback = dict(job)
+                fallback["grids"] = [list(g) for g in grown]
+                fallback["_rd_retry"] = True
+                prior = out / f"{lower['name']}.pt"
+                if prior.is_file() and lower.get("checkpoint") == "trained":
+                    fallback["warm_start"] = str(prior)
+                return _run_claimed(
+                    fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s
+                )
     dest.write_text(json.dumps(row, indent=2))
     sps = row["steps_per_s"]
     sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
     print(
-        f"worker {shard_label or '0/1'} pid {os.getpid()} {job['name']} "
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} finish {job['name']} wall {wall:.1f}s "
+        f"worker {shard_label or '0/1'} pid {os.getpid()} "
         f"steps/s {sps_txt} steps_ran {row.get('steps_ran')} ckpt {row.get('checkpoint')} "
         f"psnr {row['psnr_u8']:.4f} init {row.get('psnr_u8_init')} trained {row.get('psnr_u8_trained')} "
         f"total_bpp {row['total_bpp']:.4f} stopped {row.get('stopped_early')} wall {wall:.1f}",
@@ -685,7 +781,16 @@ def claim_next(jobs: list[dict], out: Path, stale_s: float, pack: bool, skip: se
     """
     blocked = skip or set()
     units = work_units(jobs, pack)
-    units.sort(key=lambda unit: sum(job_cost(job) for job in unit), reverse=True)
+    # Heaviest first. Equal cost keeps the lower bitrate first so a higher
+    # rate can warm-start from a finished cheaper file instead of landing
+    # under it.
+    units.sort(
+        key=lambda unit: (
+            sum(job_cost(job) for job in unit),
+            -min(float(job.get("bpp") or 0) for job in unit),
+        ),
+        reverse=True,
+    )
     for unit in units:
         claimed: list[dict] = []
         try:
@@ -810,7 +915,8 @@ def _train_claimed_pack(claimed: list[dict], out: Path, precision: str, shard_la
             early_stop=0,
             batch_pixels=int(first.get("batch_pixels", 0)),
             lr_batch_ref=int(first.get("lr_batch_ref", 0)),
-            log_every=10**9,
+            log_every=100,
+            job_name=str(first["name"]),
             device="auto",
             with_ssim=False,
             fast=True,
@@ -854,6 +960,7 @@ def _train_claimed_pack(claimed: list[dict], out: Path, precision: str, shard_la
                 "seconds_train": stats.get("seconds_train"),
                 "steps_per_s": sps,
                 "compiled": stats.get("compiled"),
+                "compile_mode": stats.get("compile_mode"),
                 "cuda_graph": stats.get("cuda_graph"),
                 "shard": shard_label,
                 "worker_pid": os.getpid(),
@@ -862,8 +969,10 @@ def _train_claimed_pack(claimed: list[dict], out: Path, precision: str, shard_la
             }
             (out / f"{job['name']}.json").write_text(json.dumps(row, indent=2))
             sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
+            packed_wall = float(stats.get("seconds_train") or 0.0)
             print(
-                f"worker {shard_label or '0/1'} pid {os.getpid()} {job['name']} "
+                f"{time.strftime('%Y-%m-%d %H:%M:%S')} finish {job['name']} wall {packed_wall:.1f}s "
+                f"worker {shard_label or '0/1'} pid {os.getpid()} "
                 f"steps/s {sps_txt} packed {stats.get('packed_jobs')} "
                 f"psnr {row['psnr_u8']:.4f} total_bpp {row['total_bpp']:.4f}",
                 flush=True,

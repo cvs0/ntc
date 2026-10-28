@@ -38,6 +38,39 @@ def latent_payload_bits(grids: list[tuple[int, int, int, int]]) -> int:
     return bits
 
 
+def grow_grids(
+    base: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+    target_bpp: float,
+) -> list[tuple[int, int, int, int]]:
+    """Add channels on ``base`` until the packed latent rate meets ``target_bpp``.
+
+    Spatial sizes and bit depth stay put, and new channels are appended on
+    each grid. A checkpoint of ``base`` can be copied into the prefix of
+    those channels. Channels stop at 16.
+    """
+    grids = [list(g) for g in base]
+    pixels = float(max(width * height, 1))
+
+    def bpp() -> float:
+        return latent_payload_bits([tuple(g) for g in grids]) / pixels
+
+    guard = 0
+    while bpp() < float(target_bpp) * 0.95 and guard < 8:
+        guard += 1
+        order = sorted(range(len(grids)), key=lambda i: grids[i][0] * grids[i][1], reverse=True)
+        grew = False
+        for index in order:
+            if int(grids[index][2]) + 4 <= 16:
+                grids[index][2] = int(grids[index][2]) + 4
+                grew = True
+                break
+        if not grew:
+            break
+    return [tuple(g) for g in grids]
+
+
 def weight_payload_bits(
     in_features: int,
     hidden: list[int],

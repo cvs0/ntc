@@ -51,14 +51,6 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
 NEAR_INIT_DB = 4.0
 
 
-# Learning-rate multiplier for a grid with 8 or more channels. 1 is the
-# historical rate. On a 32 checker stand-in the historical rate put a
-# 4+12 file 7 dB under its init at step 500 (the first v2 eval) and a
-# 4+4 file did not. Half of that rate stayed within 1 dB of the init there
-# and finished higher.
-WIDE_LR_MULT = 0.5
-
-
 def wide_latent(grids) -> bool:
     """True when any latent grid has 8 or more channels."""
     return any(int(g[2]) >= 8 for g in grids)
@@ -101,6 +93,31 @@ def fullres_batch_floor(
     if int(batch_pixels) >= floor and str(batch_mip) != "area":
         return int(batch_pixels), str(batch_mip)
     return max(int(batch_pixels), floor), "flat"
+
+
+def cap_batch_for_vram(batch_pixels: int, grids: list, device: torch.device) -> int:
+    """Keep a dense 2K step inside an 8 GB card.
+
+    ``b15`` at batch 1048576 used about 6.5 GB. Cards larger than 9 GB are
+    left alone. A smaller card shrinks the batch so parameters, Adam, and
+    the gather stay under the device with about 1.2 GB free.
+    """
+    if device.type != "cuda" or int(batch_pixels) <= 0 or not grids:
+        return int(batch_pixels)
+    total = int(torch.cuda.get_device_properties(device).total_memory)
+    if total > 9 * (1 << 30):
+        return int(batch_pixels)
+    channels = max(1, sum(int(g[2]) for g in grids))
+    params = sum(int(g[0]) * int(g[1]) * int(g[2]) for g in grids)
+    fixed = params * 20
+    reserve = int(1.2 * (1 << 30))
+    room = total - reserve - fixed
+    per = channels * 48
+    if room <= per:
+        capped = max(65536, int(batch_pixels) // 2)
+    else:
+        capped = max(65536, int(room // per))
+    return min(int(batch_pixels), capped)
 
 
 def mip_sample_count(batch_pixels: int, mip: int, count: int, mode: str = "flat") -> int:
@@ -250,7 +267,6 @@ class StackedTrain(nn.Module):
         self.quantize = True
         self.quantize_weights = True
         self.allow_weight_qat = True
-        self.wide_lr_mult = 1.0
 
     def layer_bits_of(self, index: int) -> int:
         if self.layer_bits:
@@ -342,7 +358,6 @@ class StackedTrain(nn.Module):
         out.quantize = self.quantize
         out.quantize_weights = self.quantize_weights
         out.allow_weight_qat = self.allow_weight_qat
-        out.wide_lr_mult = self.wide_lr_mult
         with torch.no_grad():
             for dst, src in zip(out.latents, self.latents, strict=True):
                 dst.copy_(src.index_select(0, index))
@@ -496,14 +511,13 @@ def _clip_no_sync(params, max_norm: float) -> None:
 
 
 def _adam_on(stacked: StackedTrain, cfg: TrainConfig, capturable: bool):
-    mult = float(stacked.wide_lr_mult)
     latent = [p for p in list(stacked.latents.parameters()) + list(stacked.log_scales.parameters()) if p.requires_grad]
     mlp = [p for p in list(stacked.weights.parameters()) + list(stacked.biases.parameters()) if p.requires_grad]
     groups = []
     if latent:
-        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult * mult, "name": "latent"})
+        groups.append({"params": latent, "lr": cfg.lr * cfg.latent_lr_mult, "name": "latent"})
     if mlp:
-        groups.append({"params": mlp, "lr": cfg.lr * mult, "name": "mlp"})
+        groups.append({"params": mlp, "lr": cfg.lr, "name": "mlp"})
     if not groups:
         raise ValueError("no trainable parameters")
     if cfg.optimizer == "lion":
@@ -571,6 +585,48 @@ def _step_lr(cfg: TrainConfig, step: int) -> float:
     return max(cfg.lr * cos, cfg.lr * 0.05)
 
 
+def static_sample_indices(
+    mips: list[dict],
+    batch_pixels: int,
+    batch_mip: str,
+    device: torch.device,
+) -> list[torch.Tensor | None]:
+    """Long buffers the CUDA graph reads. Filled outside capture.
+
+    ``torch.randint`` during capture bumps the Philox offset outside the
+    graph (``Offset increment outside graph capture``). The captured step
+    only ``index_select``s these buffers. ``refill_sample_indices`` writes
+    new draws into the same storage before each replay.
+    """
+    slots: list[torch.Tensor | None] = []
+    for mip, slot in enumerate(mips):
+        count = int(slot["uv"].shape[0])
+        budget = mip_sample_count(batch_pixels, mip, count, batch_mip)
+        if budget:
+            buf = torch.empty(budget, device=device, dtype=torch.long)
+            slots.append(buf)
+        else:
+            slots.append(None)
+    refill_sample_indices(slots, mips, batch_pixels, batch_mip)
+    return slots
+
+
+def refill_sample_indices(
+    slots: list[torch.Tensor | None],
+    mips: list[dict],
+    batch_pixels: int,
+    batch_mip: str,
+) -> None:
+    for mip, (buf, slot) in enumerate(zip(slots, mips, strict=True)):
+        if buf is None:
+            continue
+        count = int(slot["uv"].shape[0])
+        budget = mip_sample_count(batch_pixels, mip, count, batch_mip)
+        if budget != int(buf.numel()):
+            raise RuntimeError("sample buffer does not match the mip budget")
+        buf.copy_(torch.randint(0, count, (budget,), device=buf.device))
+
+
 def _loss_from_mips(
     stacked: StackedTrain,
     mips: list[dict],
@@ -579,8 +635,9 @@ def _loss_from_mips(
     amp_dtype: torch.dtype | None,
     batch_pixels: int,
     step: int = 0,
+    indices: list[torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
-    total = None
+    mip_terms: list[torch.Tensor] = []
     chosen = list(enumerate(mips))
     if cfg.coarse_to_fine and step < int(cfg.steps * 0.4) and len(chosen) > 1:
         chosen = chosen[-1:]
@@ -590,7 +647,10 @@ def _loss_from_mips(
         count = uv.shape[0]
         budget = mip_sample_count(batch_pixels, mip, count, cfg.batch_mip)
         if budget:
-            if cfg.importance and mip == 0:
+            provided = None if indices is None else indices[mip]
+            if provided is not None:
+                idx = provided
+            elif cfg.importance and mip == 0:
                 from ntc.train_steps import importance_index
 
                 cache = getattr(stacked, "_importance", None)
@@ -613,30 +673,29 @@ def _loss_from_mips(
         # flattened batch would mix seeds. Apply _loss per seed only when
         # channel weights are on. The default path is a plain mean.
         if cfg.channel_weighting or cfg.normal_cosine:
-            pieces = []
+            seed_losses = []
             for s in range(pred.shape[0]):
-                pieces.append(_loss(pred[s].float(), tgt[s], semantics, cfg))
-            per = torch.stack(pieces)
+                seed_losses.append(_loss(pred[s].float(), tgt[s], semantics, cfg))
+            per = torch.stack(seed_losses)
         else:
             per = (pred.float() - tgt).square().mean(dim=(1, 2))
         term = per * float(slot["weight"])
-        total = term if total is None else total + term
-    if total is None:
+        mip_terms.append(term)
+    if not mip_terms:
         return stacked.latents[0].new_zeros((stacked.n_seeds,))
-    return total
-
-
-def configure_wide_step(stacked: StackedTrain, grids) -> None:
-    """Halve the step size when a latent grid has 8 or more channels.
-
-    A 4-channel pair keeps the historical learning rate. That pair is the
-    ``b10`` grid, which trained. The 12-channel and 8-channel grids fell
-    several dB under the init during warmup at that rate.
-    """
-    stacked.wide_lr_mult = WIDE_LR_MULT if wide_latent(grids) else 1.0
-    if stacked.wide_lr_mult != 1.0:
-        channels = [int(g[2]) for g in grids]
-        print(f"wide latent lr x{stacked.wide_lr_mult:g}", channels, flush=True)
+    # A wide latent's ReLU does not commute with the mip box. On the 4+12
+    # checker the mip-1 term was 0.047 against a mip-0 term of 0.00094, and
+    # the step left the PCA fit (11 dB under the init at step 200). The 4+4
+    # grid's coarse terms were already smaller than mip 0 and are unchanged.
+    # Keep the sum of the coarser terms from exceeding the finest term.
+    fine = mip_terms[0]
+    if len(mip_terms) == 1:
+        return fine
+    coarse = mip_terms[1]
+    for term in mip_terms[2:]:
+        coarse = coarse + term
+    scale = (fine.detach() / coarse.detach().clamp(min=1e-8)).clamp(max=1.0)
+    return fine + coarse * scale
 
 
 def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
@@ -646,6 +705,61 @@ def _sync_step_qat(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
     on = step >= int(cfg.steps * 0.7)
     stacked.quantize = on
     stacked.quantize_weights = bool(on and stacked.allow_weight_qat)
+
+
+def preferred_compile_mode(device_type: str) -> str:
+    """``reduce-overhead`` on every CUDA device, ``default`` on CPU.
+
+    An RTX 5070 Laptop (torch 2.11.0+cu128, Windows) timed the b10 dense
+    step at 19.99 steps/s with reduce-overhead, 19.57 with the default
+    compile mode, and 3.94 eager. Linux CUDA was already on reduce-overhead.
+    """
+    if device_type == "cuda":
+        return "reduce-overhead"
+    return "default"
+
+
+def _format_eta(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rem = divmod(seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
+
+
+def _log_progress(
+    cfg: TrainConfig,
+    step: int,
+    total: int,
+    loss: torch.Tensor,
+    t0: float,
+    span_start: int,
+    stacked: StackedTrain,
+    images: torch.Tensor | None,
+) -> None:
+    every = int(cfg.log_every or 0)
+    if every <= 0 or every >= 10**8 or step <= 0 or step % every != 0:
+        return
+    elapsed = max(time.perf_counter() - t0, 1e-9)
+    done = max(step - span_start, 1)
+    sps = done / elapsed
+    left = max(total - step, 0)
+    eta = _format_eta(left / sps) if sps > 0 else "?"
+    loss_v = float(loss.detach().float().mean())
+    psnr_txt = ""
+    if images is not None and step % (every * 5) == 0:
+        device = stacked.latents[0].device
+        score = max(_psnr_per_seed(stacked, images, device))
+        psnr_txt = f" psnr {score:.2f}"
+    name = cfg.job_name or "train"
+    stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(
+        f"{stamp} {name} step {step}/{total} steps/s {sps:.2f} loss {loss_v:.5f}{psnr_txt} eta {eta}",
+        flush=True,
+    )
 
 
 def _run_loop(
@@ -661,8 +775,13 @@ def _run_loop(
     use_graph: bool,
     warmup: int = 0,
     compile_mode_override: str | None = None,
+    progress_images: torch.Tensor | None = None,
 ) -> dict:
-    """Train ``steps`` Adam steps starting at ``start_step``. No ``.item()``."""
+    """Train ``steps`` Adam steps starting at ``start_step``.
+
+    The step itself does not call ``.item()``. A progress line every
+    ``log_every`` steps does, on purpose.
+    """
     batch = int(cfg.batch_pixels or 0)
     lr_scale = 1.0
     if cfg.lr_batch_ref and batch:
@@ -671,9 +790,14 @@ def _run_loop(
     graph = None
     graph_error = None
     static_loss = None
+    graph_idx = None
+    if use_graph and device_type == "cuda":
+        graph_idx = static_sample_indices(
+            mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+        )
 
     def _group_lr(step: int) -> None:
-        lr = _step_lr(cfg, step) * lr_scale * float(stacked.wide_lr_mult)
+        lr = _step_lr(cfg, step) * lr_scale
         for group in opt.param_groups:
             if group.get("name") == "latent":
                 group["lr"] = lr * cfg.latent_lr_mult
@@ -692,7 +816,9 @@ def _run_loop(
                 stacked._coarse = state
             coarse_lowpass(stacked, step, cfg.steps, state)
         opt.zero_grad(set_to_none=not replay)
-        per = _loss_from_mips(stacked, mips, cfg, semantics, amp_dtype, batch, step)
+        per = _loss_from_mips(
+            stacked, mips, cfg, semantics, amp_dtype, batch, step, graph_idx
+        )
         loss = per.sum()
         if amp_dtype == torch.float16 and device_type == "cuda":
             # GradScaler is constructed by the caller and stashed on cfg via a
@@ -722,62 +848,78 @@ def _run_loop(
     compiled = False
     compile_error = None
     loop_graph_from_compile = False
-    import sys as _sys
-
-    linux_cuda = device_type == "cuda" and _sys.platform.startswith("linux")
+    compile_mode = None
     if compile_mode_override:
-        compile_mode = compile_mode_override
+        attempts = [compile_mode_override]
     else:
-        compile_mode = "reduce-overhead" if linux_cuda else "default"
+        attempts = [preferred_compile_mode(device_type)]
+        if attempts[0] == "reduce-overhead":
+            # A cudagraph compile can OOM an 8 GB card. Fall back to the
+            # default mode, which still compiled at 19.57 steps/s on the 5070.
+            attempts.append("default")
     want_compile = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
     if want_compile and not use_graph:
-        try:
-            compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
-            # Touch it once outside the timed region of the caller. A failure
-            # here is recorded and the eager function stays in use.
-            probe = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
-            probe.sum().backward()
-            opt.zero_grad(set_to_none=True)
-            compiled = True
-            if compile_mode == "reduce-overhead":
-                # Inductor reduce-overhead replays the step as a CUDA/HIP graph.
-                loop_graph_from_compile = True
-            # The compiled function replaces the fp32 loss path only.
-            def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
-                _group_lr(step)
-                _sync_step_qat(stacked, cfg, step)
+        for compile_mode in attempts:
+            try:
+                compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
+                # Touch it once outside the timed region of the caller. A failure
+                # here is recorded and the eager function stays in use.
+                probe = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch)
+                probe.sum().backward()
                 opt.zero_grad(set_to_none=True)
-                per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
-                loss = per.sum()
-                loss.backward()
-                if cfg.optimizer == "shampoo":
-                    from ntc.train_steps import shampoo_precondition
+                compiled = True
+                if compile_mode == "reduce-overhead":
+                    # Inductor reduce-overhead replays the step as a CUDA/HIP graph.
+                    loop_graph_from_compile = True
+                # The compiled function replaces the fp32 loss path only.
+                def one_step(step: int, replay: bool) -> torch.Tensor:  # noqa: F811
+                    _group_lr(step)
+                    _sync_step_qat(stacked, cfg, step)
+                    opt.zero_grad(set_to_none=True)
+                    per = compiled_loss(stacked, mips, cfg, semantics, amp_dtype, batch, step)
+                    loss = per.sum()
+                    loss.backward()
+                    if cfg.optimizer == "shampoo":
+                        from ntc.train_steps import shampoo_precondition
 
-                    shampoo_precondition(params)
-                _clip_no_sync(params, 1.0)
-                opt.step()
-                _clamp_latents(stacked)
-                return loss
-        except Exception as exc:
-            compile_error = str(exc)
-            compiled = False
-            opt.zero_grad(set_to_none=True)
+                        shampoo_precondition(params)
+                    _clip_no_sync(params, 1.0)
+                    opt.step()
+                    _clamp_latents(stacked)
+                    return loss
+                break
+            except Exception as exc:
+                compile_error = str(exc)
+                compiled = False
+                loop_graph_from_compile = False
+                opt.zero_grad(set_to_none=True)
+                if device_type == "cuda":
+                    torch.cuda.empty_cache()
 
-    try_graph = device_type == "cuda" and cfg.cuda_graph != "off" and (use_graph or (linux_cuda and not compiled))
+    try_graph = device_type == "cuda" and cfg.cuda_graph != "off" and (use_graph or not compiled)
     if try_graph:
         try:
+            if graph_idx is None:
+                graph_idx = static_sample_indices(
+                    mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+                )
             for warm in range(3):
+                refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
                 one_step(start_step + warm, replay=True)
+            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 static_loss = one_step(start_step, replay=True)
         except Exception as exc:
             graph_error = str(exc)
             graph = None
+            if device_type == "cuda":
+                torch.cuda.empty_cache()
 
     if warmup > 0:
         if graph is not None:
             for _ in range(warmup):
+                refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
                 graph.replay()
         else:
             for step in range(start_step, start_step + warmup):
@@ -786,17 +928,23 @@ def _run_loop(
         if device_type == "cuda":
             torch.cuda.synchronize()
 
+    total_steps = int(cfg.steps) if int(cfg.steps) > start_step else start_step + steps
     t0 = time.perf_counter()
     if graph is not None:
         for step in range(start_step, start_step + steps):
             # The captured step bakes the learning rate. Replay is the fast
             # path for a fixed lr. Cosine schedules fall back when the caller
-            # passes use_graph False. See encode_arrays_fast.
+            # passes use_graph False. New sample indices are written into the
+            # captured buffers before each replay.
+            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph.replay()
+            if static_loss is not None and step == start_step + steps - 1:
+                _log_progress(cfg, step + 1, total_steps, static_loss, t0, start_step, stacked, progress_images)
         _ = static_loss
     else:
         for step in range(start_step, start_step + steps):
-            one_step(step, replay=False)
+            loss = one_step(step, replay=False)
+            _log_progress(cfg, step + 1, total_steps, loss, t0, start_step, stacked, progress_images)
     if device_type == "cuda":
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
@@ -997,6 +1145,10 @@ def encode_arrays_fast(
     batch_pixels, batch_mip = fullres_batch_floor(
         height, width, grids, int(cfg.batch_pixels or 0), str(cfg.batch_mip)
     )
+    capped = cap_batch_for_vram(int(batch_pixels), grids, device)
+    if capped != int(batch_pixels):
+        print(f"vram cap {batch_pixels} -> {capped}", flush=True)
+        batch_pixels = capped
     if batch_pixels != int(cfg.batch_pixels or 0) or batch_mip != str(cfg.batch_mip):
         print(
             f"dense batch {cfg.batch_pixels} {cfg.batch_mip} -> {batch_pixels} {batch_mip}",
@@ -1019,7 +1171,6 @@ def encode_arrays_fast(
         nets[0].load_state_dict(ckpt["model"])
     init_states = [{k: v.detach().clone() for k, v in net.state_dict().items()} for net in nets]
     stacked = StackedTrain(nets)
-    configure_wide_step(stacked, grids)
     amp_dtype = None
     if cfg.precision == "bf16":
         amp_dtype = torch.bfloat16
@@ -1052,6 +1203,14 @@ def encode_arrays_fast(
         if stacked.n_seeds == 1:
             opt = _load_resume_into_stack(stacked, opt, ckpt, cfg, nets[0])
 
+    if cfg.steps > 0 and int(cfg.log_every or 0) < 10**8:
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        name = cfg.job_name or "train"
+        print(
+            f"{stamp} start {name} steps {cfg.steps} batch {cfg.batch_pixels} {cfg.batch_mip} "
+            f"grids { [list(g) for g in grids] }",
+            flush=True,
+        )
     rung = _halving_rung(cfg)
     trace = [{"step": start_step, "alive": list(seeds)}]
     done_steps = start_step
@@ -1061,6 +1220,7 @@ def encode_arrays_fast(
         "compile_error": None,
         "cuda_graph": False,
         "cuda_graph_error": None,
+        "compile_mode": None,
         "hit_target": False,
     }
     stopped_early = False
@@ -1079,6 +1239,7 @@ def encode_arrays_fast(
             amp_dtype,
             device.type,
             use_graph=False,
+            progress_images=images_bank,
         )
         loop_info = _merge_info(loop_info, info)
         done_steps += span
@@ -1117,6 +1278,7 @@ def encode_arrays_fast(
             info = _run_loop(
                 stacked, opt, mips, cfg, semantics, span, done_steps, amp_dtype, device.type,
                 use_graph=False,
+                progress_images=images_bank,
             )
             loop_info = _merge_info(loop_info, info)
             done_steps += span
@@ -1145,6 +1307,7 @@ def encode_arrays_fast(
             info = _run_loop(
                 stacked, opt, mips, cfg, semantics, span, done_steps, amp_dtype, device.type,
                 use_graph=False,
+                progress_images=images_bank,
             )
             loop_info = _merge_info(loop_info, info)
             done_steps += span
@@ -1180,6 +1343,7 @@ def encode_arrays_fast(
             amp_dtype,
             device.type,
             use_graph=use_graph and stacked.n_seeds == 1,
+            progress_images=images_bank,
         )
         loop_info = _merge_info(loop_info, info)
         done_steps = cfg.steps
@@ -1257,6 +1421,7 @@ def encode_arrays_fast(
         "precision": cfg.precision if amp_dtype is not None else "fp32",
         "amp_dtype": None if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
         "compiled": loop_info["compiled"],
+        "compile_mode": loop_info.get("compile_mode"),
         "compile_error": loop_info["compile_error"],
         "cuda_graph": loop_info["cuda_graph"],
         "cuda_graph_error": loop_info["cuda_graph_error"],
@@ -1270,7 +1435,6 @@ def encode_arrays_fast(
         "freeze_decoder": cfg.freeze_decoder,
         "coarse_to_fine": cfg.coarse_to_fine,
         "qat_late": cfg.qat_late,
-        "wide_lr_mult": float(stacked.wide_lr_mult),
         "importance": cfg.importance,
         "plateau_stop": cfg.plateau_stop,
         "host_syncs_per_step": 0,
@@ -1311,6 +1475,8 @@ def _merge_info(acc: dict, info: dict) -> dict:
     acc["compile_error"] = info["compile_error"] or acc["compile_error"]
     acc["cuda_graph"] = bool(acc["cuda_graph"] or info["cuda_graph"])
     acc["cuda_graph_error"] = info["cuda_graph_error"] or acc["cuda_graph_error"]
+    if info.get("compile_mode"):
+        acc["compile_mode"] = info["compile_mode"]
     return acc
 
 
@@ -1514,7 +1680,6 @@ def encode_bank(
         seed_ids.extend(these)
         targets.extend([target] * len(built))
     stacked = StackedTrain(nets)
-    configure_wide_step(stacked, grids)
     bank = torch.stack(targets, 0)
     mips = _prep_mips(bank, cfg, device)
     opt = _adam_on(stacked, cfg, capturable=False)

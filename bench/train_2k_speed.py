@@ -24,9 +24,15 @@ python bench/train_2k_speed.py --out results/train_speed/train_2k_speed.json
 
 from __future__ import annotations
 
+import os
+
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import argparse
 import json
 import platform
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -133,9 +139,9 @@ def _prepare(cfg: TrainConfig, images: np.ndarray, device: torch.device):
     return stacked, mips, init
 
 
-def _reset(stacked: StackedTrain, init: dict, cfg: TrainConfig, device: torch.device):
+def _reset(stacked: StackedTrain, init: dict, cfg: TrainConfig, device: torch.device, capturable: bool = False):
     stacked.load_state_dict({key: value.to(device) for key, value in init.items()})
-    return _adam_on(stacked, cfg, capturable=False)
+    return _adam_on(stacked, cfg, capturable=capturable)
 
 
 def _amp(cfg: TrainConfig, device: torch.device):
@@ -191,7 +197,7 @@ def _time_mode(
         return {"name": name, "error": spec["error"], "steps_per_s": None}
     try:
         _set_triton(bool(spec["triton"]))
-        opt = _reset(stacked, init, cfg, device)
+        opt = _reset(stacked, init, cfg, device, capturable=bool(spec["use_graph"]))
         run_cfg = TrainConfig(
             **{
                 **cfg.__dict__,
@@ -293,39 +299,84 @@ def _profile_eager(
     return rows[:10]
 
 
-def run(args: argparse.Namespace) -> dict:
+def _child_env() -> dict:
+    env = os.environ.copy()
+    root = Path(__file__).resolve().parents[1]
+    prev = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join([str(root), str(root / "src"), prev])
+    env.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    return env
+
+
+def _run_isolated(args: argparse.Namespace) -> dict:
+    """One subprocess per mode so a failed CUDA graph does not poison the next."""
     out = Path(args.out)
     _forbid_v2(out)
-    device = pick_device("auto")
-    info = device_report(device)
-    precision = args.precision
-    if precision == "auto":
-        precision = "bf16" if device.type == "cuda" else "fp32"
-    images, sems, source = _load_image(Path(args.materials), args.job, args.size)
-    cfg = _cfg(args.size, precision if device.type == "cuda" else "fp32", args.warmup + args.timed_steps)
-    stacked, mips, init = _prepare(cfg, images, device)
     modes = [name.strip() for name in args.modes.split(",") if name.strip()]
+    script = str(Path(__file__).resolve())
     results = []
     for name in modes:
-        t0 = time.perf_counter()
-        row = _time_mode(name, stacked, mips, init, cfg, sems, device, args.warmup, args.timed_steps)
-        row["wall_s"] = time.perf_counter() - t0
-        sps = row.get("steps_per_s")
-        err = row.get("error")
-        if err:
+        fragment = out.with_name(out.stem + f".{name}.partial.json")
+        cmd = [
+            sys.executable,
+            script,
+            "--worker-mode",
+            name,
+            "--job",
+            args.job,
+            "--materials",
+            str(args.materials),
+            "--size",
+            str(args.size),
+            "--warmup",
+            str(args.warmup),
+            "--timed-steps",
+            str(args.timed_steps),
+            "--profile-steps",
+            "0",
+            "--precision",
+            args.precision,
+            "--modes",
+            name,
+            "--out",
+            str(fragment),
+        ]
+        proc = subprocess.run(cmd, env=_child_env(), capture_output=True, text=True)
+        if proc.stdout:
+            print(proc.stdout, end="" if proc.stdout.endswith("\n") else "\n", flush=True)
+        if proc.returncode != 0 or not fragment.is_file():
+            err = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+            err = err[-800:]
             print(f"{name:24} error {err}", flush=True)
+            results.append({"name": name, "error": err, "steps_per_s": None, "wall_s": None})
         else:
-            print(f"{name:24} steps/s {sps:.2f}", flush=True)
-        results.append(row)
+            results.append(json.loads(fragment.read_text()))
+            fragment.unlink()
     kernels = []
-    if "eager" in modes and not any(row["name"] == "eager" and row.get("error") for row in results):
+    eager_ok = any(row["name"] == "eager" and not row.get("error") for row in results)
+    if eager_ok and args.profile_steps > 0:
         try:
+            device = pick_device("auto")
+            precision = args.precision
+            if precision == "auto":
+                precision = "bf16" if device.type == "cuda" else "fp32"
+            images, sems, _source = _load_image(Path(args.materials), args.job, args.size)
+            cfg = _cfg(args.size, precision if device.type == "cuda" else "fp32", args.profile_steps)
+            stacked, mips, init = _prepare(cfg, images, device)
             kernels = _profile_eager(stacked, mips, init, cfg, sems, device, args.profile_steps)
         except Exception as exc:
             kernels = [{"name": "profile_failed", "error": str(exc)}]
         for row in kernels:
             us = row.get("self_device_us") or row.get("self_cpu_us") or 0
             print(f"kernel {us:12.1f} us  {row.get('name')}", flush=True)
+    device = pick_device("auto")
+    info = device_report(device)
+    precision = args.precision
+    if precision == "auto":
+        precision = "bf16" if device.type == "cuda" else "fp32"
+    _images, _sems, source = _load_image(Path(args.materials), args.job, args.size)
+    cfg = _cfg(args.size, precision if device.type == "cuda" else "fp32", args.warmup + args.timed_steps)
     report = {
         "platform": platform.platform(),
         "system": sys.platform,
@@ -346,13 +397,41 @@ def run(args: argparse.Namespace) -> dict:
         "eager_top_kernels": kernels,
         "workers_note": (
             "One dense 2K job fills this GPU. Three processes made each job about 3x slower. "
-            "Packing three tiny CPU steps raised throughput, and that does not carry to a 2.35 steps/s 2K step."
+            "Packing three tiny CPU steps raised throughput, and that does not carry to a 2.35 steps/s 2K step. "
+            "On an RTX 5070 Laptop, compile reduce-overhead was 19.99 steps/s, compile default 19.57, eager 3.94."
         ),
     }
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     print("wrote", out, flush=True)
     return report
+
+
+def run(args: argparse.Namespace) -> dict:
+    if not args.worker_mode:
+        return _run_isolated(args)
+    out = Path(args.out)
+    _forbid_v2(out)
+    device = pick_device("auto")
+    info = device_report(device)
+    precision = args.precision
+    if precision == "auto":
+        precision = "bf16" if device.type == "cuda" else "fp32"
+    images, sems, source = _load_image(Path(args.materials), args.job, args.size)
+    cfg = _cfg(args.size, precision if device.type == "cuda" else "fp32", args.warmup + args.timed_steps)
+    stacked, mips, init = _prepare(cfg, images, device)
+    name = args.worker_mode
+    t0 = time.perf_counter()
+    row = _time_mode(name, stacked, mips, init, cfg, sems, device, args.warmup, args.timed_steps)
+    row["wall_s"] = time.perf_counter() - t0
+    err = row.get("error")
+    if err:
+        print(f"{name:24} error {err}", flush=True)
+    else:
+        print(f"{name:24} steps/s {row.get('steps_per_s'):.2f}", flush=True)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(row, indent=2))
+    return {"modes": [row], "device": info, "image_source": source}
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -365,6 +444,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--profile-steps", type=int, default=4)
     p.add_argument("--precision", default="auto", choices=("auto", "fp32", "bf16", "fp16"))
     p.add_argument("--modes", default=",".join(MODES))
+    p.add_argument("--worker-mode", default="")
     p.add_argument("--out", type=Path, default=Path("results/train_speed/train_2k_speed.json"))
     args = p.parse_args(argv)
     run(args)

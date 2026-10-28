@@ -145,6 +145,8 @@ class TrainConfig:
     plateau_stop: bool = False
     # Used when schedule == "onecycle". Peak learning rate is lr * onecycle_peak.
     onecycle_peak: float = 5.0
+    # Printed on the fast-path progress line. encode_arrays does not read it.
+    job_name: str = ""
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

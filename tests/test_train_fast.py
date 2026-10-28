@@ -1,5 +1,7 @@
 """Fast trainer: same mip-0 math as NtcNet, halving, and the off-by-default flag."""
 
+from pathlib import Path
+
 import numpy as np
 import torch
 
@@ -7,13 +9,15 @@ from ntc.encode import TrainConfig, encode_arrays
 from ntc.model import NtcNet, bilinear_codes_torch
 from ntc.train_fast import (
     NEAR_INIT_DB,
-    WIDE_LR_MULT,
     StackedTrain,
     _mesh_uv,
     bilinear_batched,
     encode_arrays_fast,
     fullres_batch_floor,
+    preferred_compile_mode,
+    refill_sample_indices,
     scaled_lr,
+    static_sample_indices,
     wide_latent,
 )
 
@@ -184,7 +188,6 @@ def test_fullres_sparse_batch_trains_above_init():
     assert stats["batch_pixels"] == (n * n) // 4
     assert stats["batch_mip"] == "flat"
     assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"] + NEAR_INIT_DB
-    assert stats["wide_lr_mult"] == 1.0
 
 
 def _checker(n: int) -> np.ndarray:
@@ -209,15 +212,31 @@ def test_wide_latent_is_eight_channels_or_more():
     assert wide_latent([(2048, 2048, 4, 4), (1024, 1024, 12, 4)])
     assert wide_latent([(2048, 2048, 8, 4), (1024, 1024, 8, 4)])
     assert not wide_latent([(2048, 2048, 4, 4), (1024, 1024, 4, 4)])
-    assert WIDE_LR_MULT == 0.5
 
 
-def test_wide_checker_half_lr_finishes_above_init():
-    """A 4+12 grid at the historical rate is under its init at the first eval.
+def test_cuda_compile_mode_is_reduce_overhead():
+    assert preferred_compile_mode("cuda") == "reduce-overhead"
+    assert preferred_compile_mode("cpu") == "default"
 
-    Half the learning rate is what ``configure_wide_step`` applies. On this
-    32 stand-in that schedule's file ends above the init. A 4+4 grid keeps
-    the historical rate.
+
+def test_static_indices_are_refilled_in_place():
+    uv = torch.zeros(8, 2)
+    mips = [{"uv": uv, "tgt": torch.zeros(1, 8, 1), "weight": 1.0}]
+    slots = static_sample_indices(mips, 4, "flat", torch.device("cpu"))
+    assert slots[0] is not None and slots[0].shape == (4,)
+    ptr = slots[0].data_ptr()
+    torch.manual_seed(1)
+    refill_sample_indices(slots, mips, 4, "flat")
+    assert slots[0].data_ptr() == ptr
+    assert int(slots[0].min()) >= 0
+    assert int(slots[0].max()) < 8
+
+
+def test_wide_checker_stays_above_init():
+    """A 4+12 grid's mip-1 term used to be 50x mip 0 and the file fell under the init.
+
+    The coarse terms are capped at the mip-0 term. On this 32 stand-in the
+    file then finishes above the init at the historical learning rate.
     """
     n = 32
     sems = list(range(9))
@@ -248,11 +267,56 @@ def test_wide_checker_half_lr_finishes_above_init():
     _blob, wide = encode_arrays_fast(
         img, sems, TrainConfig(grids=[(n, n, 4, 4), (n // 2, n // 2, 12, 4)], **common)
     )
-    assert wide["wide_lr_mult"] == WIDE_LR_MULT
     assert wide["psnr_u8_trained"] > wide["psnr_u8_init"]
     _blob, narrow = encode_arrays_fast(
         img,
         sems,
-        TrainConfig(grids=[(n, n, 4, 4), (n // 2, n // 2, 4, 4)], **{**common, "steps": 1, "warmup_steps": 0}),
+        TrainConfig(
+            grids=[(n, n, 4, 4), (n // 2, n // 2, 4, 4)],
+            **{**common, "steps": 1, "warmup_steps": 0},
+        ),
     )
-    assert narrow["wide_lr_mult"] == 1.0
+    assert narrow["fast"] is True
+
+
+def test_transplant_matches_the_smaller_grid(tmp_path: Path):
+    from ntc.train_steps import apply_warm_start
+
+    torch.manual_seed(0)
+    src = NtcNet(
+        image_channels=3,
+        grids=[(4, 4, 2, 4)],
+        hidden=[4],
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        weight_bits=8,
+        group_size=0,
+        quant_proxy="ste",
+        activation_requant=False,
+        qat_latents=True,
+        qat_weights=True,
+    )
+    with torch.no_grad():
+        src.latents[0].fill_(3.0)
+        src.linears[0].weight.normal_(0, 0.05)
+        src.linears[1].weight.normal_(0, 0.05)
+    dst = NtcNet(
+        image_channels=3,
+        grids=[(4, 4, 4, 4)],
+        hidden=[4],
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        weight_bits=8,
+        group_size=0,
+        quant_proxy="ste",
+        activation_requant=False,
+        qat_latents=True,
+        qat_weights=True,
+    )
+    path = tmp_path / "src.pt"
+    torch.save({"model": src.state_dict(), "step": 0}, path)
+    apply_warm_start(dst, str(path), False)
+    uv = torch.rand(6, 2)
+    assert torch.allclose(src(uv, mip=0, max_mip=1), dst(uv, mip=0, max_mip=1), atol=1e-5)

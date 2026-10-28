@@ -8,6 +8,11 @@ cannot ship a silent wrong gradient: the check rejects it first.
 
 from __future__ import annotations
 
+import os
+
+# Triton 3.9 warns when this is unset and then defaults to fusion on.
+os.environ.setdefault("TRITON_DEFAULT_FP_FUSION", "1")
+
 import torch
 
 _DISABLED = False

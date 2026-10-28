@@ -10,6 +10,7 @@ from bench.train_max_v2 import (
     _job_blocked,
     assign_shards,
     build_jobs,
+    cheaper_better,
     claim_job,
     claim_next,
     collapse_reason,
@@ -21,6 +22,7 @@ from bench.train_max_v2 import (
     planned_workers,
     release_job,
 )
+from ntc.grids import grow_grids
 from ntc.train_fast import mip_sample_count
 
 
@@ -240,3 +242,22 @@ def test_dense_pass_below_init_is_not_retried():
     assert dense_retry_batch(33.07, 12.0, 1_048_576, pixels, False) is None
     stayed = collapse_reason(12.0, 10.0, 1_048_576, pixels)
     assert "stayed within" in stayed
+
+
+def test_grow_grids_adds_channels_without_moving_the_lattice():
+    base = [(8, 8, 4, 4), (4, 4, 4, 4)]
+    grown = grow_grids(base, 16, 16, 30.0)
+    assert grown[0][0] == 8 and grown[0][1] == 8 and grown[0][3] == 4
+    assert grown[0][2] >= 8
+    assert grown[1][0] == 4
+
+
+def test_cheaper_bitrate_blocks_a_worse_higher_rate(tmp_path: Path):
+    (tmp_path / "sdk_Metal_b5.json").write_text(
+        json.dumps({"name": "sdk_Metal_b5", "done": True, "psnr_u8": 33.45, "grids": [[1024, 1024, 8, 4]], "checkpoint": "trained"})
+    )
+    job = {"name": "sdk_Metal_b10", "bpp": 10.0}
+    found = cheaper_better(tmp_path, job, 33.07)
+    assert found is not None
+    assert found["name"] == "sdk_Metal_b5"
+    assert cheaper_better(tmp_path, job, 34.0) is None
