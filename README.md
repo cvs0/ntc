@@ -159,7 +159,7 @@ Descriptor, 84 `uvec4`s, written by `ntc::make_gpu_upload`:
 | 16..19 | layer scale_offset, group_size, num_groups, weight_bits |
 | 20..83 | mip `g * 8 + k`: data_offset, row_stride, width, height |
 
-Required arithmetic is fp32 dots of the integer weights. The packed int8 intrinsic is `dotPacked4x8EXT` from `GL_EXT_integer_dot_product`. This tree's glslang 15.1 does not provide that extension, so the int8 shader keeps four multiplies unless the compiler defines it. `VK_KHR_cooperative_matrix` is queried and not used, because one texel's GEMV does not fill a tile. Subgroup size is read from the device. The shader does not assume 32 or 64.
+Required arithmetic is fp32 dots of the integer weights. The packed int8 intrinsic is `dotPacked4x8EXT` from `GL_EXT_integer_dot_product`. glslang 15.1 does not provide that extension, so the int8 shader keeps four multiplies there. glslang 16 does, and the signed overload is required: `dotPacked4x8EXT(uint, uint)` is the unsigned dot (see Decoder fast path). `VK_KHR_cooperative_matrix` is queried and not used, because one texel's GEMV does not fill a tile. Subgroup size is read from the device. The shader does not assume 32 or 64.
 
 Filter modes:
 
@@ -203,6 +203,122 @@ Shipped 16.084 bpp network, one feature-bilinear texel:
 Color bilinear multiplies the MLP term by 4 (1920 MACs, 4488 flops). Feature trilinear multiplies it by 2. The sample pass used by `run_all` is one thread per output pixel and does not stage the tile. `load_fp32_stage` and `load_fp16_stage` are the staged load dispatches. The RX 9070 report below is from c33648b, before those two rows existed.
 
 Baking the per-channel latent scale into the first int8 matrix is not exact: the scale is fp16 and the stored weights are integer. The dequant is 12 flops and 12 scale bytes on this network, next to 960 dot flops. It was not implemented.
+
+## Decoder fast path
+
+### Audit of `ntc_decode.glsl`
+
+Per feature-bilinear sample, counted by `ntc::legacy_sample_cost` and `ntc.cost.decode_ops` (same numbers in C++ and Python, pinned in `tests/test_cost.py`). Loads are 32-bit storage-buffer loads. ALU is non-MAC instructions (address math, shifts, masks, conversions, wrap, dequant, lerp, bias, activation).
+
+| file | shape | MACs | legacy loads (latent / weight / scale) | legacy bytes | legacy ALU | fast loads | fast bytes | fast uniform words | fast ALU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| metal_g16_s4000_foot | 6-32-9, 2 grids | 480 | 680 (24 / 644 / 12) | 2720 | ~2209 | 8 | 32 | 576 | ~243 |
+| synth_b15_2k | 16-32-9, 2 grids | 800 | 1060 (64 / 964 / 32) | 4240 | ~3699 | 12 | 48 | 906 | ~371 |
+| synth_wide_2k | 16-64-64-9, 2 grids | 5696 | 6340 (64 / 6244 / 32) | 25360 | ~23571 | 12 | 48 | 5994 | ~659 |
+
+Findings, legacy path:
+
+1. Every weight is its own `ntc_u8` call: one 32-bit SSBO load, shift, mask, `int` sign extend, convert. 644 loads on the shipped network for 480 MACs. Every fp16 scale is two byte loads plus `unpackHalf2x16`.
+2. Latents are channel-planar. A bilinear sample is 4 taps times C loads (24 shipped, 64 at 16 channels), each with its own bit extract.
+3. Wrap is integer `%` on signed coordinates, 4 per grid. Integer division is a multi-instruction sequence on both vendors.
+4. Shape, offsets and strides come from the descriptor SSBO inside the loops. Loop bounds are runtime, so nothing unrolls.
+5. `g_feat[160]`, `g_ha[64]`, `g_hb[64]` are dynamically indexed private arrays. Compilers place dynamically indexed private arrays in scratch (AMD) or local memory (NVIDIA). That is per-lane memory traffic on top of the loads above.
+6. Filter modes 2, 4, 5 run 4, 2 and N MLPs. Mode 1 and mode 3 run one. Only modes 1 and 3 are in the per-pixel bench.
+7. One decode produces all channels. That part is already right and is kept.
+
+Bugs found and fixed:
+
+| commit | bug | effect | fix |
+| --- | --- | --- | --- |
+| c99bb23 (introduced) | `ntc_dot` returned `acc * w + x` instead of `acc + w * x` | every fp32 shader decode wrong; tiny fixture max_abs 4.83e7 vs CPU | b268b25 restores `precise float prod = w * x; return acc + prod;` |
+| pre-existing | `dotPacked4x8EXT(uint, uint)` is the unsigned dot. `ntc_sample_i8.comp` passed packed signed bytes as `uint` | with glslang 16 (`NTC_HAVE_DOT4=1`) the int8 path computed unsigned dots: -34.7 dB, max_abs 187 on the fast i8 variant | `dotPacked4x8EXT(int(wp), int(xp))`, 55 dB after |
+
+The RX 9070 rows at c33648b predate c99bb23 and are unaffected. Anything built from c99bb23 up to b268b25 is wrong on the fp32 shader path.
+
+### Layout and shader
+
+`shaders/ntc_fast.glsl`, host side `cpp/include/ntc/fast.hpp` and `cpp/src/fast.cpp`.
+
+- Shape, activation, positional encoding, quant flags, grid channels and bits, group sizes and every parameter offset are specialization constants 0 to 59 (`ntc::FastSpec`). The bench mode is 60. `tests/test_fast_layout.py` checks that the GLSL ids and the C++ enum agree.
+- All loops are `[[unroll]]` over constants. Feature and activation arrays are indexed by constants after unroll, so they live in registers.
+- MLP parameters are dequantized once on the host to fp32 (weight times row scale, bias, act scales) and uploaded as a std140 UBO `uvec4 ntcf_p[4096]`, 64 KiB. Weight reads are uniform across the wave and hit the constant path. Parameter footprint must fit `min(65536, maxUniformBufferRange)`. `make_fast_upload` returns `ok = false` for a file that does not, and the bench skips the fast variants for it.
+- Latents are repacked per grid into channel-plane records of power-of-two width, at most 32 bits (`fast_planes`). Shipped 4 channels at 4 bits is one 16-bit record per texel, so a tap is one aligned load. 12 channels at 4 bits is a 32-bit plane plus a 16-bit plane.
+- Wrap is `u = uv - floor(uv)` then one conditional `+W` or `-W` on the integer tap. Same taps as the integer wrap for every texel center and every bilinear neighbor. `test_fast_layout` proves `decode_fast_mip == decode_mip` bit-exact for mips 0 to 3 on every fixture and every tracked trained file.
+- Resident size: fast latents 174820 B vs legacy blob 269184 B on metal_g16 (the legacy number is the full `make_gpu_upload` blob), 19573120 B vs 19574396 B on the 2K synthetic. No size cost.
+
+Variants, all from `shaders/ntc_fast_bench.comp`:
+
+| variant | define | arithmetic | requirement | output vs CPU `decode_mip` |
+| --- | --- | --- | --- | --- |
+| exact | `NTC_FAST_EXACT` | fp32, `precise` mul and add, no contraction | none | bit-exact, 0 diff on all files |
+| fma | default | fp32, contraction allowed | none | max_abs <= 2.4e-7, about 150 dB |
+| fp16 | `NTC_FAST_FP16` | `f16vec2` fma, fp32 bias and output | `shaderFloat16` | 75 to 81 dB, max_abs about 2e-3 |
+| i8 | `NTC_FAST_I8` | `dotPacked4x8EXT` with int operands, act_int8 scale if the file has it, else dynamic max_abs/127 | `shaderIntegerDotProduct` | 52 to 62 dB on non-QAT files; layers with group size not a multiple of 4 stay fp32 |
+
+An 8-bit unorm output has a quantization floor near 59 dB (half an LSB RMS). fp16 is above it on every file tested. i8 without QAT is close to it.
+
+### Measured on this VM (lavapipe, CPU, not a performance claim)
+
+`ntc_decbench --check-mips 0 --sizes 512x512 --iters 15 --warmup 2`, llvmpipe LLVM 23.1.4, run with pytest in parallel, so absolute times are noisy. Median ms:
+
+| file | legacy | exact | fma | fp16 | i8 |
+| --- | --- | --- | --- | --- | --- |
+| metal_g16_s4000_foot | 39.48 | 5.11 | 4.69 | 5.26 | 8.97 |
+| synth_b15_2k | 65.44 | 7.28 | 6.40 | 6.84 | 9.07 |
+| synth_wide_2k | 547.13 | 41.43 | 52.88 | 44.33 | 103.17 |
+
+Legacy over fast is 7.7x to 13x on this CPU device. lavapipe has no int-dot acceleration (`int_dot_accel 0`) so i8 is emulated and slower. GPU numbers need the commands below. The prediction from the cost model is that the legacy pass is load-issue bound (680 loads per sample, 2.7 KB requested, most of it L1 hits) and the fast pass is FMA bound (480 FMAs, about 243 other instructions, 32 B of latent traffic), so the fast path should move the ratio to BC7 by several times on both GPUs. That is a prediction, not a measurement.
+
+### Benchmark harness
+
+`examples/decbench/decbench.cpp`, target `ntc_decbench`. One compute dispatch per pixel of the target size, `uv_scale` chosen so the texture is magnified to the target, timestamps around each dispatch, device-local buffers, rgba8 storage output (4 B per pixel written by every variant, including BC).
+
+- Variants: `legacy` (`ntc_decode.glsl` via `ntc_legacy_bench.comp`), `exact`, `fma`, `fp16`, `i8`, `bc7` (one BC7 texture), `bc_mat` (BC7 albedo + BC5 normal + BC7 orm, the BC side of a 9-channel material). BC textures are random mode-6 and BC5 blocks at the NTC texture size, sampled with hardware bilinear at level 0.
+- Before timing, every variant is checked against `ntc::decode_mip` at texel centers for mips 0 to `--check-mips`. exact must be 0 diff. legacy and fma must be within 1e-4 times max(1, |ref|). fp16 and i8 report PSNR only. Any failure exits 1.
+- Columns: `median_ms`, `p95_ms`, `ns/sample` (median over pixels), `Gsample/s`, `model_GB/s` (cost-model load bytes plus 4 B written, BC counts 16 B per texture), `vs_bcmat` (median over bc_mat median; under 1 is faster than BC). `stats` prints register, spill and scratch statistics from `VK_KHR_pipeline_executable_properties` when the driver exposes it.
+- Exit 3 when there is no Vulkan 1.3 device; ctest `decbench_check` reports that as skipped.
+- `bench/make_bench_ntc.py` writes synthetic containers: `ship256`, `b10_2k`, `b15_2k`, `wide_2k`, `big_4k`.
+- `python -m ntc.cost FILE.ntc [--json]` prints the per-sample cost for any file without a GPU.
+
+Commands:
+
+```powershell
+# RTX 5070 Laptop or RX 9070, Windows. Needs the Vulkan SDK (glslangValidator) and CMake on PATH.
+powershell -ExecutionPolicy Bypass -File bench\decbench.ps1
+# results\decbench\<gpu>.json
+```
+
+```sh
+# RX 9070, Linux (RADV). Needs glslang, cmake, ninja.
+bench/decbench.sh
+# results/decbench/<gpu>.json
+```
+
+```sh
+# cost model, any machine
+PYTHONPATH=src python -m ntc.cost results/train_sweep/metal_g16_s4000_foot.ntc
+```
+
+Extra arguments pass through to `ntc_decbench`, for example `--sizes 3840x2160 --iters 200 --variants fma,fp16,i8,bc7,bc_mat`.
+
+### Comparison with RTXNTC, public material only
+
+From the RTXNTC SDK documentation and Vaidyanathan et al. 2023: inference on sample uses cooperative vectors on supported NVIDIA hardware with a DP4a and fp16 fallback, a single MLP evaluation per sample with stochastic texture filtering, and inference on load or on feedback that transcodes to BCn for GPUs where per-sample inference is too slow. The paper reports 1.15 to 1.92 ms at 4K on an RTX 4090 against 0.49 ms for BC7. This tree now has the fp16 and DP4a style paths and one evaluation per sample in modes 1 and 3. It does not have a cooperative vector path or BCn transcode on load.
+
+### Proposals, ranked by expected gain per effort
+
+Not implemented as defaults because they change output or the format. Gains are estimates from the cost model and instruction counts, to be confirmed with `ntc_decbench`.
+
+| rank | proposal | expected gain | quality / cost | status |
+| --- | --- | --- | --- | --- |
+| 1 | fp16 fast path as default when `shaderFloat16` is present and outputs are 8-bit | up to 2x MLP throughput (`v_pk_fma_f16` on RDNA, `HFMA2` on NVIDIA), half the register footprint | 75 to 81 dB vs fp32, above the 8-bit floor | shipped behind `NTC_FAST_FP16`, needs a per-file PSNR gate |
+| 2 | Train with `act_int8` (QAT) for files that target the i8 path | 4 MACs per `dot4` instruction on hardware with int-dot acceleration | -1.9 dB on the 64x64 test; the dynamic scale is the fallback | i8 variant ships; train flag exists |
+| 3 | Inference on load or feedback, transcode decoded tiles to BC7 | per-frame sampling cost equals BC7 by construction | one-time decode plus BC7 encode cost; BC7 error on top of NTC error | RGBA8 tile cache exists, needs a GPU BC7 encoder |
+| 4 | Cooperative vector (NVIDIA) or cooperative matrix (RDNA4 WMMA) over a wave of texels | 2x or more on the MLP term on tensor or matrix units | needs fp16 or int8 weights, bit-exactness lost | not started; glslang here has no `GL_NV_cooperative_vector` |
+| 5 | Feature-space trilinear: lerp latents across two mips, one MLP | 2x on mode 4 | not equal to color trilinear; needs retraining with the same filter | not started |
+| 6 | Latent fetch through the texture unit (`R16_UINT`/`R32_UINT` images, or UNORM latents with hardware bilinear) | moves 4 taps per grid off the load path; with hardware filter, 1 fetch per grid instead of 4 taps plus lerps | hardware filter fraction is 8 bits on NVIDIA, not bit-exact | not started |
+| 7 | Fold latent dequant (scale, offset) into the first layer in fp32 | about 2 instructions per latent channel (12 to 32 per sample) | within fma tolerance, not bit-exact | not started |
+| 8 | OpenGL fast path through `GL_ARB_gl_spirv` and `glSpecializeShader` | brings the fast path to the GL backend | none | not started; GL still runs `ntc_decode.glsl` |
 
 ## Filtering checks
 
