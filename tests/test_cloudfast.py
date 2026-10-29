@@ -245,12 +245,14 @@ def test_max_gpu_worker_env(tmp_path: Path):
     assert "NTC_MAX_GPU" not in worker_env(0, base={}, root=str(tmp_path))
 
 
-def test_max_gpu_dry_run_defaults_to_one_worker_per_chain(tmp_path: Path):
+def _dry_run(tmp_path: Path, *extra: str) -> subprocess.CompletedProcess:
     repo = Path(__file__).resolve().parents[1]
     env = os.environ.copy()
     env["PYTHONPATH"] = f"{repo / 'src'}{os.pathsep}{repo}"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
-    result = subprocess.run(
+    env.pop("NTC_BACKFILL", None)
+    env.pop("NTC_EXIT_WHEN_DONE", None)
+    return subprocess.run(
         [
             sys.executable,
             "bench/train_max_v2.py",
@@ -262,6 +264,7 @@ def test_max_gpu_dry_run_defaults_to_one_worker_per_chain(tmp_path: Path):
             str(tmp_path / "out"),
             "--materials",
             str(tmp_path / "materials"),
+            *extra,
         ],
         cwd=repo,
         env=env,
@@ -269,9 +272,61 @@ def test_max_gpu_dry_run_defaults_to_one_worker_per_chain(tmp_path: Path):
         capture_output=True,
         text=True,
     )
+
+
+def test_max_gpu_dry_run_defaults_to_one_worker_per_chain(tmp_path: Path):
+    result = _dry_run(tmp_path)
     assert result.returncode == 0, result.stderr
     assert "would spawn 4 chain workers" in result.stdout
+    # Backfill is opt-in: --max-gpu alone trains only the planned chains.
+    assert "plan backfill" not in result.stdout
+    result = _dry_run(tmp_path, "--backfill")
+    assert result.returncode == 0, result.stderr
     assert result.stdout.count("plan backfill") == len(CLOUD_TRAIN) - len(CLOUD_FAST_TRAIN)
+
+
+def test_spawn_passes_backfill(monkeypatch, tmp_path: Path):
+    calls = []
+
+    class _Proc:
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(v2.subprocess, "Popen", lambda cmd, **_k: calls.append(list(cmd)) or _Proc())
+    args = argparse.Namespace(
+        workers=2, out=tmp_path, materials=tmp_path, probe_steps=800, stale_lock_s=10,
+        batch_pixels=None, dry_run=False, pack=True, profile="cloudfast", chains=True,
+        stagger_s=0.0, max_gpu=True, backfill=False,
+    )
+    v2._spawn_workers(args)
+    assert all("--backfill" not in cmd for cmd in calls)
+    calls.clear()
+    args.backfill = True
+    v2._spawn_workers(args)
+    assert all("--backfill" in cmd for cmd in calls)
+
+
+def test_completion_marker(tmp_path: Path):
+    jobs = [{"name": "a_b1", "bpp": 1.0}, {"name": "a_b2", "bpp": 2.0}, {"name": "a_b3", "bpp": 3.0}]
+    (tmp_path / "a_b1.json").write_text(
+        '{"done": true, "psnr_u8": 30.0, "total_bpp": 0.99, "target_bpp": 1.0, "wall": 12.5}'
+    )
+    (tmp_path / "a_b2.json").write_text('{"done": false, "error": "boom"}')
+    assert not v2.write_completion(tmp_path, jobs)
+    assert (tmp_path / v2.INCOMPLETE_MARKER).is_file()
+    assert not (tmp_path / v2.DONE_MARKER).is_file()
+    (tmp_path / "a_b3.json").write_text(
+        '{"done": true, "psnr_u8": 33.0, "total_bpp": 3.1, "target_bpp": 3.0, "wall": 7.5}'
+    )
+    assert v2.write_completion(tmp_path, jobs)
+    assert not (tmp_path / v2.INCOMPLETE_MARKER).is_file()
+    import json
+
+    summary = json.loads((tmp_path / v2.DONE_MARKER).read_text())
+    assert summary["done"] == 2 and summary["planned"] == 3
+    assert [f["name"] for f in summary["failed"]] == ["a_b2"]
+    assert summary["over_label"] == ["a_b3"]
+    assert summary["wall_sum_s"] == 20.0
 
 
 def test_setup_pod_max_gpu():
@@ -280,3 +335,12 @@ def test_setup_pod_max_gpu():
     assert 'MAX_GPU="${NTC_MAX_GPU:-0}"' in script
     assert "EXTRA+=(--max-gpu)" in script
     assert 'WORKERS="${NTC_WORKERS:-4}"' in script
+
+
+def test_setup_pod_exit_when_done_and_backfill_opt_in():
+    repo = Path(__file__).resolve().parents[1]
+    script = (repo / "bench/cloud/setup_pod.sh").read_text()
+    assert 'EXIT_WHEN_DONE="${NTC_EXIT_WHEN_DONE:-1}"' in script
+    assert "EXTRA+=(--exit-when-done)" in script
+    assert '"${NTC_BACKFILL:-0}" == "1"' in script
+    assert "EXTRA+=(--backfill)" in script

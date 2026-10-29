@@ -3,6 +3,11 @@
 # NTC_PROFILE picks the job list (cloud5090 or cloudfast). NTC_WORKERS > 1
 # runs one trainer that starts that many chain workers on this GPU instead
 # of a shard; the shard argument is then optional.
+# NTC_EXIT_WHEN_DONE (default 1 with workers) makes the trainer write
+# $OUT/ALL_DONE with a per-label summary and exit once every planned label
+# has a result; a rerun with nothing left exits at once. The pod itself keeps
+# billing until it is stopped. NTC_BACKFILL=1 lets idle cloudfast workers
+# train the other cloud materials after the planned chains (default off).
 set -euo pipefail
 if ! curl -m 10 -sI https://github.com >/dev/null; then
   echo "no outbound internet: curl -m 10 -sI https://github.com failed" >&2
@@ -29,6 +34,7 @@ ROOT="${NTC_ROOT:-$HOME/ntc}"
 BRANCH="${NTC_BRANCH:-cursor/ntc-rd-gpu-2cb6}"
 REPO="${NTC_REPO:-https://github.com/cvs0/ntc.git}"
 OUT="${NTC_OUT:-$ROOT/results/$PROFILE}"
+EXIT_WHEN_DONE="${NTC_EXIT_WHEN_DONE:-1}"
 export NTC_ROOT="$ROOT"
 
 # One lock for clone, pull, and the material download. Two shards pulling
@@ -86,6 +92,14 @@ if (( WORKERS > 1 )); then
   EXTRA=()
   if [[ "$MAX_GPU" == "1" ]]; then
     EXTRA+=(--max-gpu)
+  fi
+  if [[ "${NTC_BACKFILL:-0}" == "1" ]]; then
+    EXTRA+=(--backfill)
+  fi
+  if [[ "$EXIT_WHEN_DONE" == "1" ]]; then
+    # The trainer rechecks every planned label itself, so a stale ALL_DONE
+    # from an older job list does not block new labels.
+    EXTRA+=(--exit-when-done)
   fi
   LOG="$OUT/logs/workers.log"
   PID="$OUT/logs/workers.pid"

@@ -409,3 +409,36 @@ def test_neighbor_warm_start_grows_the_lower_grid(tmp_path: Path):
     assert got["grids"][0][2] > 4
     assert got["grids"][0][:2] == [32, 32]
     assert got.get("warm_start") in (None, "")
+
+
+def test_result_json_records_wall_and_bpp(tmp_path: Path, monkeypatch):
+    mat = tmp_path / "mat"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+
+    def _encode(*_args, **_kwargs):
+        return b"ntc", {
+            "metrics": {"psnr_u8": 31.0},
+            "total_bpp": 0.995,
+            "psnr_u8_init": 25.0,
+            "psnr_u8_trained": 31.0,
+            "psnr_u8_loop": 31.0,
+            "best_val_psnr": 31.0,
+            "grids": [[4, 4, 2, 4]],
+            "checkpoint": "trained",
+        }
+
+    monkeypatch.setattr(v2, "load_material", lambda *_a, **_k: (None, [0, 1, 2], {}))
+    monkeypatch.setattr(v2, "encode_arrays_fast", _encode)
+    job = {"name": "tiny_ok", "material": str(mat), "size": 8, "steps": 1, "bpp": 1.0, "seed": 1,
+           "grids": [[4, 4, 2, 4]]}
+    dest = out / "tiny_ok.json"
+    row = v2._run_claimed(job, out, "fp32", "t", dest, out / "tiny_ok.ntc", out / "tiny_ok.pt")
+    saved = json.loads(dest.read_text())
+    for got in (row, saved):
+        assert got["done"]
+        assert isinstance(got["wall"], float) and got["wall"] >= got["wall_s"] >= 0
+        assert got["bpp"] == 0.995
+        assert got["target_bpp"] == 1.0

@@ -850,6 +850,9 @@ def _run_claimed(
     ckpt: Path,
     stale_s: float = 86400.0,
 ) -> dict:
+    # Retries copy the job dict, so the clock survives them and ``wall``
+    # covers the latent fit, the lock wait and every retry.
+    job.setdefault("_started", time.perf_counter())
     if dest.is_file():
         prev = json.loads(dest.read_text())
         if prev.get("done"):
@@ -958,8 +961,14 @@ def _run_claimed(
         "done": True,
         "fast": True,
         "wall_s": wall,
+        # End to end for this label, the latent fit and any retry included.
+        "wall": time.perf_counter() - float(job["_started"]),
         "psnr_u8": stats["metrics"]["psnr_u8"],
+        # Achieved file rate, the block_baseline meaning. The label is target_bpp.
+        "bpp": stats["total_bpp"],
         "total_bpp": stats["total_bpp"],
+        "rate_trim": stats.get("rate_trim"),
+        "rate_overhead_bpp": stats.get("rate_overhead_bpp"),
         "latent_bpp_mip0": stats.get("latent_bpp_mip0"),
         "file_bpp_chain": stats.get("file_bpp_chain"),
         "bppc": stats.get("bppc"),
@@ -1425,6 +1434,82 @@ def _chain_loop(
             release_job(out, lock)
 
 
+DONE_MARKER = "ALL_DONE"
+INCOMPLETE_MARKER = "INCOMPLETE"
+
+
+def planned_jobs(args: argparse.Namespace) -> list[dict]:
+    """Every label this run means to train: the profile, plus backfill if on."""
+    jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
+    if getattr(args, "backfill", False) and args.profile == "cloudfast":
+        jobs = jobs + cloud_backfill_jobs(args.materials)
+    return jobs
+
+
+def completion_summary(out: Path, jobs: list[dict]) -> dict:
+    """Per-label outcome from the result jsons in ``out``.
+
+    A label is settled when its json is done, collapsed, or records an
+    error. Missing or unreadable jsons are pending.
+    """
+    rows, failed, pending = [], [], []
+    for job in jobs:
+        name = str(job["name"])
+        path = out / f"{name}.json"
+        try:
+            row = json.loads(path.read_text())
+        except (OSError, ValueError):
+            pending.append(name)
+            continue
+        if row.get("done"):
+            rows.append({
+                "name": name,
+                "psnr_u8": row.get("psnr_u8"),
+                "total_bpp": row.get("total_bpp"),
+                "target_bpp": row.get("target_bpp", job.get("bpp")),
+                "wall": row.get("wall", row.get("wall_s")),
+                "checkpoint": row.get("checkpoint"),
+            })
+        elif row.get("error") or row.get("collapsed"):
+            failed.append({"name": name, "error": row.get("error"), "collapsed": bool(row.get("collapsed"))})
+        else:
+            pending.append(name)
+    walls = [float(r["wall"]) for r in rows if isinstance(r.get("wall"), (int, float))]
+    over = [r["name"] for r in rows if isinstance(r.get("total_bpp"), (int, float))
+            and isinstance(r.get("target_bpp"), (int, float)) and r["total_bpp"] > r["target_bpp"]]
+    return {
+        "planned": len(jobs),
+        "done": len(rows),
+        "failed": failed,
+        "pending": pending,
+        "over_label": over,
+        "wall_sum_s": sum(walls),
+        "rows": rows,
+        "written": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+    }
+
+
+def write_completion(out: Path, jobs: list[dict]) -> bool:
+    """Write ``ALL_DONE`` when every planned label is settled, else ``INCOMPLETE``.
+
+    Returns True for ``ALL_DONE``. The other marker is removed so a reader
+    sees one state.
+    """
+    summary = completion_summary(out, jobs)
+    finished = not summary["pending"]
+    name, other = (DONE_MARKER, INCOMPLETE_MARKER) if finished else (INCOMPLETE_MARKER, DONE_MARKER)
+    (out / name).write_text(json.dumps(summary, indent=2))
+    stale = out / other
+    if stale.is_file():
+        stale.unlink()
+    print(
+        f"{name} {summary['done']}/{summary['planned']} done, {len(summary['failed'])} failed, "
+        f"{len(summary['pending'])} pending -> {out / name}",
+        flush=True,
+    )
+    return finished
+
+
 def _gpu_total_gb() -> float:
     try:
         import torch
@@ -1460,6 +1545,8 @@ def _spawn_workers(args: argparse.Namespace) -> int:
         ]
         if chains and getattr(args, "max_gpu", False):
             cmd.append("--max-gpu")
+        if getattr(args, "backfill", False):
+            cmd.append("--backfill")
         if args.batch_pixels is not None:
             cmd.extend(["--batch-pixels", str(args.batch_pixels)])
         if not args.pack:
@@ -1794,9 +1881,23 @@ def main() -> None:
         "--max-gpu",
         action="store_true",
         default=os.environ.get("NTC_MAX_GPU") == "1",
-        help="Cards >= 80 GB (or with --dense-workers): one chain worker per material by default, "
-        "a max-autotune fallback if CUDA graphs fail, and idle workers backfill the other "
-        "cloud train materials on the cloudfast ladder. Also NTC_MAX_GPU=1.",
+        help="Cards >= 80 GB (or with --dense-workers): one chain worker per material by default "
+        "and a max-autotune fallback if CUDA graphs fail. Also NTC_MAX_GPU=1.",
+    )
+    p.add_argument(
+        "--backfill",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("NTC_BACKFILL") == "1",
+        help="cloudfast chain workers that run out of main chains train the other cloud "
+        "materials on the same ladder. Off by default. Also NTC_BACKFILL=1.",
+    )
+    p.add_argument(
+        "--exit-when-done",
+        action=argparse.BooleanOptionalAction,
+        default=os.environ.get("NTC_EXIT_WHEN_DONE") == "1",
+        help=f"With --workers or --dense-workers: once every planned label has a result, write "
+        f"OUT/{DONE_MARKER} with a summary and exit 0 (and exit at once if it is already "
+        f"done). Also NTC_EXIT_WHEN_DONE=1.",
     )
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
@@ -1858,7 +1959,7 @@ def main() -> None:
                         + " ".join(job["name"] for job in chain),
                         flush=True,
                     )
-            if args.max_gpu and args.profile == "cloudfast":
+            if args.backfill and args.profile == "cloudfast":
                 for chain in material_chains(cloud_backfill_jobs(args.materials)):
                     print(f"plan backfill {_chain_lock(chain)}", flush=True)
             print(f"would spawn {args.workers} chain workers", flush=True)
@@ -1872,6 +1973,9 @@ def main() -> None:
                 )
             print(f"would spawn {args.workers} queue workers", flush=True)
             return
+        if args.exit_when_done and write_completion(args.out, planned_jobs(args)):
+            print("every planned label is done; nothing to train", flush=True)
+            raise SystemExit(0)
         # Download before the probe so a missing 2K set stops the parent.
         if is_cloud_profile(args.profile):
             from bench.download_materials import cloud_materials
@@ -1882,7 +1986,11 @@ def main() -> None:
         device = pick_device("auto")
         (args.out / "device.json").write_text(json.dumps(device_report(device), indent=2))
         _ensure_precision(args)
-        raise SystemExit(_spawn_workers(args))
+        rc = _spawn_workers(args)
+        if args.exit_when_done:
+            if write_completion(args.out, planned_jobs(args)):
+                raise SystemExit(0)
+        raise SystemExit(rc)
     shard_i, shard_n = (None, None)
     shard_label = "queue" if args.queue else ("chain" if args.chain_queue else "")
     if args.shard:
@@ -1926,7 +2034,7 @@ def main() -> None:
     precision = _ensure_precision(args)
     if args.chain_queue:
         backfill = None
-        if args.max_gpu and args.profile == "cloudfast":
+        if args.backfill and args.profile == "cloudfast":
             backfill = cloud_backfill_jobs(args.materials)
         _chain_loop(
             jobs,
