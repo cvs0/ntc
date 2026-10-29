@@ -42,7 +42,7 @@ from bench.train_max import G16  # noqa: E402
 from ntc.device import device_report, pick_device  # noqa: E402
 from ntc.encode import TrainConfig  # noqa: E402
 from ntc.materials import load_material  # noqa: E402
-from ntc.train_fast import choose_precision, encode_arrays_fast  # noqa: E402
+from ntc.train_fast import RATE_OVERSHOOT, choose_precision, encode_arrays_fast  # noqa: E402
 
 
 def parse_shard(text: str) -> tuple[int, int]:
@@ -318,6 +318,213 @@ def grown_reaches(grids, size: int, target_raw_bpp: float) -> bool:
     pixels = float(max(int(size) * int(size), 1))
     have = latent_payload_bits([tuple(g) for g in grids]) / pixels
     return have >= 0.95 * float(target_raw_bpp)
+
+
+# First train plus one tighter grid. A miss after that is the result.
+MAX_RATE_ATTEMPTS = 2
+
+
+def _missing_material_error(row: dict) -> bool:
+    err = row.get("error")
+    return isinstance(err, str) and (err == "missing" or err.startswith("missing "))
+
+
+def _result_terminal(row: dict, material: Path | None = None) -> bool:
+    """True when this json must not be trained again.
+
+    A missing-directory error is retried once that directory has a manifest.
+    ``done``, a collapse, a rate miss, or any other error is finished. A
+    ``done`` false json with none of those was claimed again, so a high-rate
+    miss retrained until the process was killed.
+    """
+    if not isinstance(row, dict):
+        return False
+    if row.get("done") or row.get("collapsed") or row.get("rate_miss"):
+        return True
+    if row.get("error"):
+        if _missing_material_error(row):
+            if material is None:
+                return True
+            return not (Path(material) / "manifest.json").is_file()
+        return True
+    return False
+
+
+def _bpp_ratio(row: dict) -> float | None:
+    bpp = row.get("total_bpp")
+    target = row.get("target_bpp")
+    if not isinstance(bpp, (int, float)) or not isinstance(target, (int, float)):
+        return None
+    if not math.isfinite(float(bpp)) or not math.isfinite(float(target)) or float(target) <= 0:
+        return None
+    return float(bpp) / float(target)
+
+
+def rate_over_label(row: dict, band: float = RATE_OVERSHOOT) -> bool:
+    """True when the file is past the grid-selection band over its label."""
+    ratio = _bpp_ratio(row)
+    return ratio is not None and ratio > float(band)
+
+
+def _attempt_rank(row: dict) -> tuple:
+    """Lower is better: a real on-target file, then the closest miss, then a broken file.
+
+    A score-gap or collapsed file is not a rate point. Keeping it ahead of a
+    healthy miss is how a trim that fell under the init used to replace the fit.
+    """
+    ratio = _bpp_ratio(row)
+    psnr = row.get("psnr_u8")
+    psnr_v = float(psnr) if isinstance(psnr, (int, float)) and math.isfinite(float(psnr)) else -1e9
+    if row.get("collapsed") or row.get("score_gap"):
+        return (3, 0.0, -psnr_v)
+    if ratio is None:
+        return (2, 0.0, -psnr_v)
+    if ratio <= RATE_OVERSHOOT:
+        return (0, abs(ratio - 1.0), -psnr_v)
+    return (1, ratio, -psnr_v)
+
+
+def prefer_rate_attempt(prev: dict | None, new: dict) -> dict:
+    if prev is None:
+        return new
+    if _attempt_rank(new) < _attempt_rank(prev):
+        return new
+    return prev
+
+
+def settle_rate_attempt(
+    prev: dict | None, new: dict, max_attempts: int = MAX_RATE_ATTEMPTS
+) -> tuple[dict, bool]:
+    """Keep the closer file. One retry while it is over the label, then stop.
+
+    The row is always terminal. ``retry`` is true only when another train
+    is still allowed to replace it. A killed process leaves ``done`` set,
+    so the queue does not start that train over.
+    """
+    chosen = dict(prefer_rate_attempt(prev, new))
+    attempts = int(new.get("rate_attempts") or 0)
+    if isinstance(prev, dict):
+        attempts = max(attempts, int(prev.get("rate_attempts") or 0))
+    if attempts < 1:
+        attempts = 1
+    chosen["rate_attempts"] = attempts
+    over = rate_over_label(chosen)
+    chosen["done"] = True
+    chosen["rate_miss"] = bool(over)
+    if over:
+        chosen["bpp_ratio"] = _bpp_ratio(chosen)
+    else:
+        chosen.pop("bpp_ratio", None)
+    return chosen, bool(over and attempts < int(max_attempts))
+
+
+def tighter_latent_grids(grids, size: int, label_bpp: float, file_bpp: float) -> list | None:
+    """A smaller latent whose raw size matches ``label * raw / file``.
+
+    The 1.15 headroom is not applied again. None when nothing smaller exists,
+    which ends the retry instead of training the same grid.
+    """
+    from ntc.grids import latent_payload_bits, select_grids
+
+    if not grids or float(label_bpp) <= 0 or float(file_bpp) <= float(label_bpp) * RATE_OVERSHOOT:
+        return None
+    current = [tuple(g) for g in grids]
+    pixels = float(max(int(size) * int(size), 1))
+    raw = latent_payload_bits(current) / pixels
+    if raw <= 0:
+        return None
+    want = float(label_bpp) * raw / float(file_bpp)
+    picked = select_grids(
+        int(size),
+        int(size),
+        float(want),
+        [32],
+        9,
+        0,
+        0,
+        8,
+        0,
+        adaptive_pool=1,
+        rate="latent",
+        min_bits=4,
+    )[0]
+    if latent_payload_bits(picked) >= latent_payload_bits(current):
+        return None
+    return [list(g) for g in picked]
+
+
+def _ckpt_bytes(ckpt: Path) -> bytes | None:
+    if not ckpt.is_file():
+        return None
+    try:
+        return ckpt.read_bytes()
+    except OSError:
+        return None
+
+
+def _write_attempt(bundle: dict, dest: Path, ntc_path: Path, ckpt: Path) -> None:
+    dest.write_text(json.dumps(bundle["row"], indent=2))
+    if bundle.get("blob") is not None:
+        ntc_path.write_bytes(bundle["blob"])
+    data = bundle.get("ckpt")
+    if data is not None:
+        ckpt.write_bytes(data)
+    elif ckpt.is_file():
+        ckpt.unlink()
+
+
+def _restore_if_better(job: dict, row: dict, blob: bytes, dest: Path, ntc_path: Path, ckpt: Path) -> dict:
+    """Write ``row`` unless a saved attempt is closer to the label."""
+    prev = job.get("_best_bundle")
+    prev_row = prev.get("row") if isinstance(prev, dict) else None
+    if not isinstance(prev_row, dict) or _attempt_rank(row) < _attempt_rank(prev_row):
+        row = dict(row)
+        if rate_over_label(row):
+            row["rate_miss"] = True
+            row["bpp_ratio"] = _bpp_ratio(row)
+        _write_attempt({"row": row, "blob": blob, "ckpt": _ckpt_bytes(ckpt)}, dest, ntc_path, ckpt)
+        return row
+    restored = dict(prev_row)
+    restored["rate_attempts"] = max(
+        int(restored.get("rate_attempts") or 0), int(row.get("rate_attempts") or 0)
+    )
+    restored["done"] = True
+    if rate_over_label(restored):
+        restored["rate_miss"] = True
+        restored["bpp_ratio"] = _bpp_ratio(restored)
+    _write_attempt(
+        {"row": restored, "blob": prev.get("blob"), "ckpt": prev.get("ckpt")},
+        dest,
+        ntc_path,
+        ckpt,
+    )
+    return restored
+
+
+def _force_terminal(out: Path, job: dict) -> None:
+    """Mark a finished-but-unsettled json done so the queue cannot claim it.
+
+    Missing-material errors stay retryable. Everything else that is still
+    ``done`` false becomes a recorded miss. The bytes already on disk stay.
+    """
+    dest = out / f"{job['name']}.json"
+    if not dest.is_file():
+        return
+    try:
+        row = json.loads(dest.read_text())
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    if _result_terminal(row, Path(job["material"])) or _missing_material_error(row):
+        return
+    row = dict(row)
+    row["done"] = True
+    row["rate_miss"] = True
+    ratio = _bpp_ratio(row)
+    if ratio is not None:
+        row["bpp_ratio"] = ratio
+    row["rate_attempts"] = max(int(row.get("rate_attempts") or 0), MAX_RATE_ATTEMPTS)
+    dest.write_text(json.dumps(row, indent=2))
+    print(f"settle {job['name']} attempts exhausted", flush=True)
 
 
 def upper_hull(points: list[tuple[float, float, str]]) -> set[str]:
@@ -701,8 +908,9 @@ def _job_blocked(out: Path, job: dict) -> bool:
     """Skip a finished json. Skip an error json only while its material is still absent.
 
     A previous run records ``error`` for a missing directory. Once that
-    directory has a manifest, the next process trains it. Inside one process
-    the caller also passes a skip set so a crash is not claimed again.
+    directory has a manifest, the next process trains it. Any other error,
+    a collapse, or a rate miss is finished. Inside one process the caller
+    also passes a skip set so a crash is not claimed again.
     """
     dest = out / f"{job['name']}.json"
     if not dest.is_file():
@@ -711,14 +919,7 @@ def _job_blocked(out: Path, job: dict) -> bool:
         prev = json.loads(dest.read_text())
     except (OSError, ValueError, json.JSONDecodeError):
         return False
-    if prev.get("done"):
-        return True
-    if prev.get("collapsed"):
-        return True
-    if prev.get("error"):
-        mat = Path(job["material"])
-        return not (mat / "manifest.json").is_file()
-    return False
+    return _result_terminal(prev, Path(job["material"]))
 
 
 def _pid_alive(pid: int) -> bool:
@@ -849,9 +1050,9 @@ def _unfinished_jobs(jobs: list[dict], out: Path) -> list[dict]:
         dest = out / f"{job['name']}.json"
         if dest.is_file():
             try:
-                if json.loads(dest.read_text()).get("done"):
+                if _result_terminal(json.loads(dest.read_text()), Path(job["material"])):
                     continue
-            except (OSError, json.JSONDecodeError):
+            except (OSError, ValueError, json.JSONDecodeError):
                 pass
         pending.append(job)
     return pending
@@ -885,7 +1086,7 @@ def _run(job: dict, out: Path, precision: str, shard_label: str, stale_s: float)
     ckpt = out / f"{job['name']}.pt"
     if dest.is_file():
         prev = json.loads(dest.read_text())
-        if prev.get("done"):
+        if _result_terminal(prev, Path(job["material"])):
             print("skip", job["name"], flush=True)
             return prev
     if not claim_job(out, job["name"], stale_s):
@@ -910,9 +1111,9 @@ def _run_claimed(
     # Retries copy the job dict, so the clock survives them and ``wall``
     # covers the latent fit, the lock wait and every retry.
     job.setdefault("_started", time.perf_counter())
-    if dest.is_file():
+    if dest.is_file() and not job.get("_replace_done"):
         prev = json.loads(dest.read_text())
-        if prev.get("done"):
+        if _result_terminal(prev, Path(job["material"])):
             print("skip", job["name"], flush=True)
             return prev
     mat = Path(job["material"])
@@ -1071,14 +1272,18 @@ def _run_claimed(
     pixels = int(job["size"]) * int(job["size"])
     effective = int(row.get("batch_pixels") or 0)
     if score_gap_blocks_collapse(loop, trained, init):
-        row["done"] = False
+        # The checkpoint stays. Marking this not done made the queue train
+        # the same job again, and a finished checkpoint was then deleted.
+        row["done"] = True
         row["collapsed"] = False
+        row["score_gap"] = True
+        row["rate_attempts"] = int(job.get("_rate_attempts") or 0) + 1
         row["error"] = (
             f"loop PSNR {float(loop):.2f} and file PSNR {float(trained):.2f} disagree; "
             f"init {float(init):.2f}; checkpoint kept"
         )
         print("score gap", job["name"], row["error"], flush=True)
-        dest.write_text(json.dumps(row, indent=2))
+        row = _restore_if_better(job, row, blob, dest, ntc_path, ckpt)
         return row
     retry_batch = dense_retry_batch(trained, init, effective, pixels, bool(job.get("_fallback")))
     if retry_batch is not None:
@@ -1107,6 +1312,9 @@ def _run_claimed(
         if ckpt.is_file():
             ckpt.unlink()
         print("collapsed", job["name"], row["error"], flush=True)
+        row = _restore_if_better(job, row, blob, dest, ntc_path, ckpt)
+        _print_finish(job, row, wall, shard_label)
+        return row
     if row.get("done") and not job.get("_rd_retry"):
         lower = cheaper_better(out, job, float(row["psnr_u8"]))
         if lower is not None:
@@ -1133,35 +1341,111 @@ def _run_claimed(
                     f"{lower['psnr']:.2f}, retry grown {grown}",
                     flush=True,
                 )
-                if ckpt.is_file():
-                    ckpt.unlink()
-                if ntc_path.is_file():
-                    ntc_path.unlink()
-                if dest.is_file():
-                    dest.unlink()
+                kept = dict(row)
+                kept["done"] = True
+                kept["rate_attempts"] = int(job.get("_rate_attempts") or 0) + 1
+                if rate_over_label(kept):
+                    kept["rate_miss"] = True
+                    kept["bpp_ratio"] = _bpp_ratio(kept)
+                bundle = {"row": kept, "blob": blob, "ckpt": _ckpt_bytes(ckpt)}
+                _write_attempt(bundle, dest, ntc_path, ckpt)
                 fallback = dict(job)
                 fallback["grids"] = [list(g) for g in grown]
                 fallback["_rd_retry"] = True
+                fallback["_replace_done"] = True
+                fallback["_neighbor_applied"] = True
+                fallback["_best_bundle"] = bundle
+                fallback["_suppress_finish"] = True
+                fallback["_rate_attempts"] = int(kept["rate_attempts"])
                 prior = out / f"{lower['name']}.pt"
                 if prior.is_file() and lower.get("checkpoint") == "trained":
                     fallback["warm_start"] = str(prior)
                 return _run_claimed(
                     fallback, out, precision, shard_label, dest, ntc_path, ckpt, stale_s
                 )
-    dest.write_text(json.dumps(row, indent=2))
     if row.get("done"):
+        row = _finish_rate(
+            job, row, blob, out, precision, shard_label, dest, ntc_path, ckpt, stale_s
+        )
+    else:
+        dest.write_text(json.dumps(row, indent=2))
+    if not job.get("_suppress_finish"):
+        _print_finish(job, row, wall, shard_label)
+    return row
+
+
+def _finish_rate(
+    job: dict,
+    row: dict,
+    blob: bytes,
+    out: Path,
+    precision: str,
+    shard_label: str,
+    dest: Path,
+    ntc_path: Path,
+    ckpt: Path,
+    stale_s: float,
+) -> dict:
+    """Keep the closer file. Retrain once on a smaller grid, then stop."""
+    prev = job.get("_best_bundle")
+    prev_row = prev.get("row") if isinstance(prev, dict) else None
+    row = dict(row)
+    row["rate_attempts"] = max(int(job.get("_rate_attempts") or 0) + 1, int(row.get("rate_attempts") or 0))
+    chosen, retry = settle_rate_attempt(prev_row, row)
+    if isinstance(prev_row, dict) and _attempt_rank(row) >= _attempt_rank(prev_row):
+        bundle = {"row": chosen, "blob": prev.get("blob"), "ckpt": prev.get("ckpt")}
+    else:
+        bundle = {"row": chosen, "blob": blob, "ckpt": _ckpt_bytes(ckpt)}
+    _write_attempt(bundle, dest, ntc_path, ckpt)
+    if chosen.get("done"):
         refresh_rate_hull(out, str(job["name"]))
-    sps = row["steps_per_s"]
-    sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
+    if not retry or job.get("_rate_retry_done"):
+        return chosen
+    tighter = tighter_latent_grids(
+        chosen.get("grids") or row.get("grids"),
+        int(job["size"]),
+        float(job["bpp"]),
+        float(chosen.get("total_bpp") or 0),
+    )
+    if not tighter:
+        return chosen
     print(
-        f"{time.strftime('%Y-%m-%d %H:%M:%S')} finish {job['name']} wall {wall:.1f}s "
-        f"worker {shard_label or '0/1'} pid {os.getpid()} "
-        f"steps/s {sps_txt} steps_ran {row.get('steps_ran')} ckpt {row.get('checkpoint')} "
-        f"psnr {row['psnr_u8']:.4f} init {row.get('psnr_u8_init')} trained {row.get('psnr_u8_trained')} "
-        f"total_bpp {row['total_bpp']:.4f} stopped {row.get('stopped_early')} wall {wall:.1f}",
+        f"rate miss {job['name']} {float(chosen.get('total_bpp')):.2f} bpp "
+        f"over label {float(job['bpp']):g}, retry {tighter}",
         flush=True,
     )
-    return row
+    nxt = dict(job)
+    nxt["grids"] = tighter
+    nxt["_rate_attempts"] = int(chosen["rate_attempts"])
+    nxt["_rate_retry_done"] = True
+    nxt["_replace_done"] = True
+    nxt["_neighbor_applied"] = True
+    nxt["_rd_retry"] = True
+    nxt["_best_bundle"] = bundle
+    nxt["_suppress_finish"] = True
+    nxt.pop("warm_start", None)
+    return _run_claimed(nxt, out, precision, shard_label, dest, ntc_path, ckpt, stale_s)
+
+
+def _print_finish(job: dict, row: dict, wall: float, shard_label: str) -> None:
+    shown = row.get("wall_s")
+    if not isinstance(shown, (int, float)):
+        shown = wall
+    sps = row.get("steps_per_s")
+    sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
+    psnr = row.get("psnr_u8")
+    psnr_txt = f"{float(psnr):.4f}" if isinstance(psnr, (int, float)) else "na"
+    bpp = row.get("total_bpp")
+    bpp_txt = f"{float(bpp):.4f}" if isinstance(bpp, (int, float)) else "na"
+    print(
+        f"{time.strftime('%Y-%m-%d %H:%M:%S')} finish {job['name']} wall {float(shown):.1f}s "
+        f"worker {shard_label or '0/1'} pid {os.getpid()} "
+        f"steps/s {sps_txt} steps_ran {row.get('steps_ran')} ckpt {row.get('checkpoint')} "
+        f"psnr {psnr_txt} init {row.get('psnr_u8_init')} trained {row.get('psnr_u8_trained')} "
+        f"total_bpp {bpp_txt} stopped {row.get('stopped_early')} "
+        f"rate_miss {row.get('rate_miss')} attempts {row.get('rate_attempts')}",
+        flush=True,
+    )
 
 
 def build_cloud_jobs(root: Path, profile: str = "cloud5090") -> list[dict]:
@@ -1488,10 +1772,18 @@ def _chain_loop(
             for job in chain:
                 try:
                     _run(job, out, precision, label, stale_s)
+                    _force_terminal(out, job)
                 except Exception as exc:
                     traceback.print_exc()
                     dest = out / f"{job['name']}.json"
-                    dest.write_text(json.dumps({"name": job["name"], "done": False, "error": str(exc)}, indent=2))
+                    keep = False
+                    if dest.is_file():
+                        try:
+                            keep = bool(json.loads(dest.read_text()).get("done"))
+                        except (OSError, ValueError, json.JSONDecodeError):
+                            keep = False
+                    if not keep:
+                        dest.write_text(json.dumps({"name": job["name"], "done": False, "error": str(exc)}, indent=2))
                     print("fail", job["name"], exc, flush=True)
         finally:
             release_job(out, lock)
@@ -1714,6 +2006,19 @@ def _queue_loop(jobs: list[dict], out: Path, precision: str, stale_s: float, pac
                 )
             else:
                 _train_claimed_pack(claimed, out, precision, label)
+            for job in claimed:
+                _force_terminal(out, job)
+                dest = out / f"{job['name']}.json"
+                settled = False
+                if dest.is_file():
+                    try:
+                        settled = _result_terminal(
+                            json.loads(dest.read_text()), Path(job["material"])
+                        )
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        settled = False
+                if not settled:
+                    failed.add(job["name"])
         except Exception as exc:
             traceback.print_exc()
             for job in claimed:

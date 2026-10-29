@@ -516,3 +516,138 @@ def test_cloudfast_jobs_carry_the_full_budget():
 
     jobs = build_cloud_jobs(Path("/nonexistent"), "cloudfast")
     assert jobs and all(job["full_steps"] == CLOUD_FULL_STEPS for job in jobs)
+
+
+def test_score_gap_json_is_not_claimed_again(tmp_path: Path):
+    mat = tmp_path / "mat"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+    job = _tiny("cloud_Bark001_2K_b10", 8000, str(mat))
+    job["bpp"] = 10.0
+    (out / "cloud_Bark001_2K_b10.json").write_text(json.dumps({
+        "name": job["name"],
+        "done": False,
+        "error": "loop PSNR 30.00 and file PSNR 10.00 disagree; init 23.00; checkpoint kept",
+        "total_bpp": 14.0,
+        "target_bpp": 10.0,
+    }))
+    assert _job_blocked(out, job)
+    assert claim_next([job], out, 3600, pack=False) == []
+
+
+def test_settle_rate_attempt_stops_and_keeps_the_closest():
+    prev = None
+    flags = []
+    for i in range(10):
+        new = {
+            "total_bpp": 14.0 + i,
+            "target_bpp": 10.0,
+            "psnr_u8": 30.0 - i,
+            "rate_attempts": i + 1,
+            "grids": [[64, 64, 8, 4]],
+        }
+        chosen, retry = v2.settle_rate_attempt(prev, new)
+        flags.append(retry)
+        prev = chosen
+    assert flags == [True] + [False] * 9
+    assert chosen["done"] is True
+    assert chosen["rate_miss"] is True
+    assert chosen["total_bpp"] == 14.0
+    assert chosen["rate_attempts"] == 10
+
+
+def test_unsettled_miss_is_forced_done_and_the_marker_clears(tmp_path: Path):
+    mat = tmp_path / "Bark001_2K"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+    job = {
+        "name": "cloud_Bark001_2K_b10",
+        "bpp": 10.0,
+        "material": str(mat),
+        "size": 64,
+        "steps": 8000,
+    }
+    (out / f"{job['name']}.json").write_text(json.dumps({
+        "name": job["name"],
+        "done": False,
+        "total_bpp": 14.0,
+        "target_bpp": 10.0,
+        "psnr_u8": 31.0,
+    }))
+    (out / v2.INCOMPLETE_MARKER).write_text("{}")
+    assert not _job_blocked(out, job)
+    v2._force_terminal(out, job)
+    saved = json.loads((out / f"{job['name']}.json").read_text())
+    assert saved["done"] is True
+    assert saved["rate_miss"] is True
+    assert saved["total_bpp"] == 14.0
+    assert _job_blocked(out, job)
+    assert claim_next([job], out, 3600, pack=False) == []
+    assert v2.write_completion(out, [job])
+    assert not (out / v2.INCOMPLETE_MARKER).is_file()
+    assert (out / v2.DONE_MARKER).is_file()
+
+
+def test_rate_retry_stops_after_one_and_keeps_the_best_bytes(tmp_path: Path, monkeypatch):
+    mat = tmp_path / "mat"
+    mat.mkdir()
+    (mat / "manifest.json").write_text("{}")
+    out = tmp_path / "out"
+    out.mkdir()
+    calls = {"n": 0}
+
+    def _encode(*_args, **_kwargs):
+        calls["n"] += 1
+        bpp = 14.0 if calls["n"] == 1 else 28.0
+        return bytes([calls["n"]]), {
+            "metrics": {"psnr_u8": 30.0 if calls["n"] == 1 else 33.0},
+            "total_bpp": bpp,
+            "psnr_u8_init": 20.0,
+            "psnr_u8_trained": 30.0 if calls["n"] == 1 else 33.0,
+            "psnr_u8_loop": 30.0 if calls["n"] == 1 else 33.0,
+            "best_val_psnr": 30.0,
+            "grids": [[32, 32, 8, 4]] if calls["n"] == 1 else [[16, 16, 4, 4]],
+            "checkpoint": "trained",
+            "steps_per_s": 8.0,
+            "steps_ran": 8000,
+        }
+
+    monkeypatch.setattr(v2, "load_material", lambda *_a, **_k: (None, [0, 1, 2], {}))
+    monkeypatch.setattr(v2, "encode_arrays_fast", _encode)
+    monkeypatch.setattr(v2, "tighter_latent_grids", lambda *_a, **_k: [[16, 16, 4, 4]] if calls["n"] == 1 else None)
+    monkeypatch.setattr(v2, "watch_first_step", lambda *_a, **_k: type("E", (), {"set": lambda self: None})())
+    job = {
+        "name": "cloud_Bark001_2K_b10",
+        "material": str(mat),
+        "size": 64,
+        "steps": 8,
+        "bpp": 10.0,
+        "seed": 0,
+        "grids": [[32, 32, 8, 4]],
+        "latent_rate_scale": 0.5,
+        "rate": "latent",
+        "batch_pixels": 0,
+    }
+    (out / v2.INCOMPLETE_MARKER).write_text("{}")
+    row = v2._run_claimed(
+        job, out, "fp32", "t",
+        out / f"{job['name']}.json",
+        out / f"{job['name']}.ntc",
+        out / f"{job['name']}.pt",
+    )
+    assert calls["n"] == 2
+    assert row["done"] is True
+    assert row["rate_miss"] is True
+    assert row["total_bpp"] == 14.0
+    assert (out / f"{job['name']}.ntc").read_bytes() == bytes([1])
+    assert _job_blocked(out, job)
+    assert claim_next([job], out, 3600, pack=False) == []
+    assert v2.write_completion(out, [job])
+    assert not (out / v2.INCOMPLETE_MARKER).is_file()
+    summary = json.loads((out / v2.DONE_MARKER).read_text())
+    assert summary["pending"] == []
+    assert summary["over_label"] == [job["name"]]

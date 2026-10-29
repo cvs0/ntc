@@ -108,8 +108,11 @@ RATE_MULT_MAX = 64.0
 RATE_GOAL_FLOOR = 0.5
 # The hinge goal is in the loss's model units. When the measured file stays
 # under the budget the goal may climb past it, since the model overstated
-# the file: Bark b10 at 256 went 9.16 bpp / 34.44 dB to 9.70 / 34.91. The
-# export trim still holds the file under the label.
+# the file: Bark b10 at 256 went 9.16 bpp / 34.44 dB to 9.70 / 34.91.
+# Capping the climb at the budget left those files 3 to 9 percent under the
+# label. The export trim still holds a file under the label when the trim
+# does not fall under the init. A trim that does is rejected, and the queue
+# records the overshoot instead of training that grid again.
 RATE_GOAL_CEIL = 1.3
 
 
@@ -1495,6 +1498,32 @@ def rate_overhead_bpp(
     return 8.0 * max(0, extra) / float(max(1, int(width) * int(height)))
 
 
+def trim_keeps_file(
+    psnr_before: float,
+    psnr_after: float,
+    init_psnr: float | None,
+    loop_psnr: float | None,
+) -> bool:
+    """False when the trimmed file is the score-gap case the queue used to retrain.
+
+    A trim that stays above the init is the rate guard doing its job. A trim
+    that falls under the init while the live score is still above it is the
+    PavingStones failure: the file and the loop disagree, and retraining the
+    same grid does not make them agree.
+    """
+    if not math.isfinite(float(psnr_after)) or not math.isfinite(float(psnr_before)):
+        return False
+    if init_psnr is None or loop_psnr is None:
+        return True
+    if not math.isfinite(float(init_psnr)) or not math.isfinite(float(loop_psnr)):
+        return True
+    if float(psnr_after) >= float(init_psnr):
+        return True
+    if float(loop_psnr) < float(init_psnr):
+        return True
+    return abs(float(loop_psnr) - float(psnr_after)) <= 1.0
+
+
 def trim_latents_to_rate(
     net: NtcNet, export_fn, limit_bpp: float, window: float = RATE_MARGIN, iters: int = 24
 ):
@@ -2802,24 +2831,35 @@ def encode_arrays_fast(
         blob_t, bpp_t, snapped = trim_latents_to_rate(src_net, _export_bpp, rate_limit)
         recon_t = _decode(parse_texture_set(blob_t), 0)
         psnr_t = float(psnr_u8(recon_t, ref))
-        blob, recon = blob_t, recon_t
-        ts = parse_texture_set(blob)
-        if kept == "init":
-            init_psnr = psnr_t
-        else:
-            trained_psnr = psnr_t
         rate_trim = {
             "before_bpp": before_bpp,
             "after_bpp": bpp_t,
             "snapped_codes": snapped,
             "psnr_before": psnr_before,
             "psnr_after": psnr_t,
+            "kept": "trimmed",
         }
-        print(
-            f"rate trim {before_bpp:.4f} -> {bpp_t:.4f} bpp (label {rate_limit:g}) "
-            f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
-            flush=True,
-        )
+        if trim_keeps_file(psnr_before, psnr_t, None if kept == "init" else init_psnr, loop_score):
+            blob, recon = blob_t, recon_t
+            ts = parse_texture_set(blob)
+            if kept == "init":
+                init_psnr = psnr_t
+            else:
+                trained_psnr = psnr_t
+            print(
+                f"rate trim {before_bpp:.4f} -> {bpp_t:.4f} bpp (label {rate_limit:g}) "
+                f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
+                flush=True,
+            )
+        else:
+            # The untrimmed file is over the label. The caller records that
+            # miss and does not retrain it forever.
+            rate_trim["kept"] = "untrimmed"
+            print(
+                f"rate trim rejected {before_bpp:.4f} -> {bpp_t:.4f} bpp (label {rate_limit:g}) "
+                f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
+                flush=True,
+            )
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
         "psnr_u8": psnr_u8(recon, ref),
     }

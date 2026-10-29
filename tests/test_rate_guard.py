@@ -16,6 +16,7 @@ from ntc.train_fast import (
     encode_arrays_fast,
     rate_overhead_bpp,
     steer_rate_values,
+    trim_keeps_file,
     trim_latents_to_rate,
 )
 
@@ -61,6 +62,13 @@ def test_overhead_matches_real_export():
     got = rate_overhead_bpp(net, [0, 1, 2], 64, 64, 7, True, "best")
     assert got == pytest.approx(want)
     assert got > 0
+
+
+def test_trim_that_falls_under_the_init_is_rejected():
+    # The live score is still the fit. The trimmed file is the 10 dB gap.
+    assert trim_keeps_file(32.0, 31.2, 20.0, 32.0)
+    assert not trim_keeps_file(32.0, 10.3, 23.0, 25.3)
+    assert trim_keeps_file(24.0, 23.5, None, None)
 
 
 def test_trim_fits_the_limit():
