@@ -11,8 +11,10 @@ decode in scratch on RDNA. Unused literal slots are behind guards such as
 `if (17 < inn)` that fold at pipeline creation.
 
 The one dynamic index left is the output row. Each layer runs a real loop of
-4 rows per step and writes its outputs to workgroup memory, one slice per
-invocation; the next layer reads them back with literal indices. Fully
+4 rows per step with a uniform counter and writes its outputs to two private
+arrays of at most 32 words (registers on AMD, see COMMON), or to workgroup
+memory with NTC_FAST_LDS; the next layer reads them back with literal
+indices. Fully
 unrolling the rows as well removes that round trip, but 64 inlined copies of
 a 160-slot row made pipeline creation take seconds on the AMD compiler and
 minutes and gigabytes on Mesa.
@@ -45,10 +47,10 @@ HEADER = """\
 // Every shape, width, and parameter offset is a specialization constant.
 // Private arrays are indexed only by literals, so after specialization every
 // element is a register and no variant needs scratch memory. Layer outputs go
-// to a per-invocation slice of workgroup memory (the row loop is the only
-// dynamic index). MLP parameters live in a uniform buffer at offsets known at
-// pipeline creation: constant-bank operands on NVIDIA, scalar (SGPR) loads on
-// AMD. Latents are channel planes whose record is a power of two of at most
+// to private arrays of at most 32 words (the row loop is the only dynamic
+// index), or to workgroup memory with NTC_FAST_LDS. MLP parameters live in a
+// uniform buffer at offsets known at pipeline creation: constant-bank
+// operands on NVIDIA, scalar (SGPR) loads on AMD. Latents are channel planes whose record is a power of two of at most
 // 32 bits, one aligned load per tap.
 //
 // Variants (pick one define before the include):
@@ -120,14 +122,20 @@ const bool NTCF_I16 = false;
 #endif
 #endif
 
-// Layer outputs: row o of this invocation is ntcf_s[o * NTCF_WG + lane].
-// Workgroup memory takes the one dynamic index of the decode (the output
-// row of the row loop). Slices are per invocation, so no barrier is needed.
-// Sized for the widest layer, rounded up to the 4 rows of a loop step.
+// Layer outputs. The output row of the row loop is the one dynamic index of
+// the decode. By default the rows are private and split into two arrays of
+// at most 32: the AMD compiler keeps a private array of up to 32 words in
+// registers under a dynamic index (v_movrel), and with uniform row counters
+// it usually unrolls the loop and drops the index altogether. A 64-word array
+// under a dynamic index would go to scratch. Sized for the widest layer,
+// rounded up to the 4 rows of a loop step.
 // fp16 and i8 store the outputs of packed hidden layers as two halves per
 // word: fp16 rounds the next layer's input to fp16 anyway, i8 to 8-bit codes.
-// Half the workgroup memory doubles the waves that fit next to it.
-#define NTCF_WG int(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z)
+// That keeps the dynamically indexed part of fp16 and i8 within 32 words.
+// NTC_FAST_LDS puts the rows in workgroup memory instead, one slice per
+// invocation (no barrier). It needs no private dynamic index, for a driver
+// that would spill one to scratch, but on RDNA4 the 8 to 16 KiB per
+// workgroup caps occupancy at 4 to 8 waves per SIMD.
 // Written with ?: rather than &&: glslang emits && on specialization
 // constants as a branch, which is not a valid constant.
 #if defined(NTC_FAST_FP16)
@@ -150,11 +158,21 @@ const int NTCF_R4 = (NTCF_W4 + 3) & ~3;
 const int NTCF_R12 = NTCF_R1 > NTCF_R2 ? NTCF_R1 : NTCF_R2;
 const int NTCF_R34 = NTCF_R3 > NTCF_R4 ? NTCF_R3 : NTCF_R4;
 const int NTCF_ROWS = NTCF_R12 > NTCF_R34 ? NTCF_R12 : NTCF_R34;
+#ifdef NTC_FAST_LDS
+#define NTCF_WG int(gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z)
 shared uint ntcf_s[NTCF_ROWS * NTCF_WG];
 void ntcf_st(int o, float v) {{ ntcf_s[o * NTCF_WG + int(gl_LocalInvocationIndex)] = floatBitsToUint(v); }}
 float ntcf_ld(int o) {{ return uintBitsToFloat(ntcf_s[o * NTCF_WG + int(gl_LocalInvocationIndex)]); }}
 void ntcf_st2(int o, uint v) {{ ntcf_s[o * NTCF_WG + int(gl_LocalInvocationIndex)] = v; }}
 uint ntcf_ld2(int o) {{ return ntcf_s[o * NTCF_WG + int(gl_LocalInvocationIndex)]; }}
+#else
+float ntcf_oa[NTCF_ROWS < 32 ? NTCF_ROWS : 32];
+float ntcf_ob[NTCF_ROWS > 32 ? NTCF_ROWS - 32 : 1];
+void ntcf_st(int o, float v) {{ if (o < 32) ntcf_oa[o] = v; else ntcf_ob[o - 32] = v; }}
+float ntcf_ld(int o) {{ return o < 32 ? ntcf_oa[o] : ntcf_ob[o - 32]; }}
+void ntcf_st2(int o, uint v) {{ ntcf_st(o, uintBitsToFloat(v)); }}
+uint ntcf_ld2(int o) {{ return floatBitsToUint(ntcf_ld(o)); }}
+#endif
 
 uint ntcf_pu(int i) {{ return ntcf_p[i >> 2][i & 3]; }}
 float ntcf_pf(int i) {{ return uintBitsToFloat(ntcf_pu(i)); }}
@@ -329,8 +347,9 @@ R = 4  # output rows per loop iteration; the host pads every layer to a multiple
 
 def gen_layer(l: int) -> list[str]:
     """Layer l: the input is in ntcf_x (literal indices), each output row is
-    written to this invocation's slice of ntcf_s. The row loop is a real loop
-    with a uniform counter; every array index inside it is a literal."""
+    written with ntcf_st (private rows, or ntcf_s with NTC_FAST_LDS). The
+    row loop is a real loop with a uniform counter; every array index inside
+    it is a literal."""
     n = max_in(l)
     rr = range(R)
     o: list[str] = []
@@ -518,7 +537,7 @@ def gen_layer(l: int) -> list[str]:
 
 
 def STORE4(full: str, v: str) -> list[str]:
-    # Rows o..o+3 to workgroup memory: fp32 if `full`, else two halves per
+    # Rows o..o+3 to the layer outputs: fp32 if `full`, else two halves per
     # word (read back by the next layer when its NTCF_H flag is set).
     return [f"        if ({full}) {{",
             *[f"            ntcf_st(o + {r}, {v}{r});" for r in range(4)],

@@ -5,7 +5,7 @@
 //              rgba8 word folded from every channel (4 B per sample, same as
 //              bc_bench.comp).
 // Every channel index below is a literal (see ntc_fast.glsl). The 8x8
-// workgroup size sets the shared-memory slices of ntc_fast.glsl.
+// workgroup size also sets the shared-memory slices of NTC_FAST_LDS.
 #extension GL_GOOGLE_include_directive : require
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 layout(constant_id = 60) const int NTCF_MODE = 1;
