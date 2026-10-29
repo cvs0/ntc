@@ -1,0 +1,18 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(binding = 0) uniform sampler2D u_tex;
+layout(std430, binding = 1) writeonly buffer Outf { float g_px[]; };
+layout(std140, binding = 3) uniform Pc { uvec4 g_pc; };
+
+void main() {
+    uint W = g_pc.x;
+    uint H = g_pc.y;
+    if (gl_GlobalInvocationID.x >= W || gl_GlobalInvocationID.y >= H) return;
+    vec2 uv = (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) / vec2(float(W), float(H));
+    vec4 c = texture(u_tex, uv);
+    uint idx = (gl_GlobalInvocationID.y * W + gl_GlobalInvocationID.x) * 4u;
+    g_px[idx + 0u] = c.r;
+    g_px[idx + 1u] = c.g;
+    g_px[idx + 2u] = c.b;
+    g_px[idx + 3u] = c.a;
+}

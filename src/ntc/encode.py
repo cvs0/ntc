@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -21,8 +22,7 @@ from ntc.container import (
     ChannelRec,
     build_texture_set,
     parse_texture_set,
-    payload_bytes,
-    total_bpp,
+    rate_report,
 )
 from ntc.decode_ref import decode_mip
 from ntc.device import device_report, pick_device
@@ -64,11 +64,13 @@ class TrainConfig:
     qat_latents: bool = True
     qat_weights: bool = True
     quant_proxy: str = "ste"
-    mip_levels: int = 1
+    mip_levels: int = 4
     channel_weighting: bool = False
     normal_cosine: float = 0.0
     pca_init: bool = True
     activation_requant: bool = False
+    # Off by default. A mid-run train_max checkpoint has no act_log_s.
+    act_int8: bool = False
     seed: int = 0
     batch_pixels: int = 0
     device: str = "auto"
@@ -78,6 +80,85 @@ class TrainConfig:
     adaptive_pool: int = 8
     seed_pool: int = 4
     with_ssim: bool = True
+    latent_deflate: bool = True
+    # "deflate", "range", "best" (smaller of deflate and order-1 range),
+    # "context" (256-context range), "best_all" (smallest of the three), or "raw".
+    # "best" does not emit the context coder. train_max sets "best".
+    latent_coder: str = "best"
+    tile_size: int = 0
+    layer_bits: tuple = ()
+    mip_loss: str = "footprint"
+    # ``payload`` matches historical total_bpp. ``latent`` matches ntc-cli
+    # --bitsPerPixel (codes + latent scales, mip 0, no MLP weights).
+    rate: str = "payload"
+    mip_curriculum: bool = False
+    warmup_steps: int = 0
+    schedule: str = "cosine"
+    precision: str = "fp32"
+    eval_every: int = 0
+    early_stop: int = 0
+    resume: str = ""
+    ckpt: str = ""
+    # 0 leaves the loss unchanged. Above 0, each step adds
+    # rd_lambda * (latent code rate in bits per image texel).
+    rd_lambda: float = 0.0
+    # When set, encode_arrays probes the grid family at several rates and
+    # trains the smallest file whose 8-bit PSNR meets this value.
+    target_psnr: float | None = None
+    # 0 selects min(20, steps) for those probes.
+    search_steps: int = 0
+    # Off by default. train_max does not set it. The fast path is
+    # encode_arrays_fast in src/ntc/train_fast.py.
+    fast: bool = False
+    # 0 means 250 when fast is on and seed_pool > 1, otherwise no halving.
+    halve_steps: int = 0
+    # "auto" compiles on CUDA and stays eager on CPU. "on" and "off" force it.
+    compile_step: str = "auto"
+    # "auto" tries a CUDA graph on CUDA. Failures fall back to eager steps.
+    cuda_graph: str = "auto"
+    # Linear LR scale batch_pixels / lr_batch_ref when both are positive.
+    lr_batch_ref: int = 0
+    # 0 keeps the historical grid order. The fast path can set 4 so a raw-bpp
+    # tie does not pick a 2-bit code. encode_arrays does not read this.
+    min_latent_bits: int = 0
+    # "flat" draws batch_pixels at every mip larger than that. "area" divides
+    # the budget by 4 per mip. encode_arrays does not read this.
+    batch_mip: str = "flat"
+    # 1 keeps the raw packed size as the selection target. Below 1, a latent
+    # target is divided by this factor before the grid search, because the
+    # file stores the deflate or range-coded bytes, not the packed size.
+    # 0 tells the fast path to measure that factor from the PCA codes.
+    # encode_arrays does not read this.
+    latent_rate_scale: float = 1.0
+    # The fields below are read only by the fast path. encode_arrays ignores them.
+    warm_start: str = ""
+    freeze_decoder: bool = False
+    # "pca" is the historical initializer. "analytic" projects the image
+    # through the linearized MLP after that PCA.
+    latent_init: str = "pca"
+    coarse_to_fine: bool = False
+    optimizer: str = "adam"
+    qat_late: bool = False
+    importance: bool = False
+    # 0 disables the check. Above 0, the fast path stops once mip-0 8-bit
+    # PSNR reaches this value.
+    stop_psnr: float = 0.0
+    check_every: int = 0
+    plateau_stop: bool = False
+    # Used when schedule == "onecycle". Peak learning rate is lr * onecycle_peak.
+    onecycle_peak: float = 5.0
+    # Printed on the fast-path progress line. encode_arrays does not read it.
+    job_name: str = ""
+    # Fast path only. When set, a Laplace rate above ``target_bpp`` is added
+    # to the loss. encode_arrays does not read it.
+    entropy_rate: bool = False
+    # Fast path only. Uniform noise for 70 percent of the steps, hard
+    # rounding until 95 percent, then the latents are frozen and the MLP
+    # trains on the rounded codes. encode_arrays does not read it.
+    quant_schedule: bool = False
+    # Fraction of steps after which latents freeze. 0.95 is the historical
+    # 5 percent MLP tail. The cloud profile uses 0.90.
+    quant_freeze_at: float = 0.95
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
@@ -88,6 +169,114 @@ def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
             break
         t = nxt
     return t
+
+
+# One hot texel used to set the whole channel's scale, so the rest of a
+# 2048 grid sat near the bin center and init PSNR stayed around 11 to 14 dB.
+# Per bit depth, chosen on CPU from three 32x32 sets and three seeds,
+# steps 0, grid (16, 16, 4, bits). Score is mean PSNR minus 0.4 dB per bpp,
+# the slope measured for this clip. 4-bit: 0.99 scored 23.195 against
+# 23.051 at 0.995 and 23.106 at 0.999. 8-bit: 0.999 scored 23.257 against
+# 23.254 at 0.995 and 23.245 at 0.99.
+PCA_CLIP_QUANTILE = 0.995
+CLIP_QUANTILE_BY_BITS = {4: 0.99, 8: 0.999}
+
+
+def clip_quantile(bits: int) -> float:
+    """Percentile used to set the latent scale at this code depth."""
+    if int(bits) >= 8:
+        return float(CLIP_QUANTILE_BY_BITS[8])
+    return float(CLIP_QUANTILE_BY_BITS[4])
+
+
+def choose_clip_quantile(rows: list[tuple[int, float, float, float]]) -> dict[int, float]:
+    """Pick a quantile per bit depth.
+
+    Each row is ``(bits, quantile, mean_psnr, mean_bpp)``. The score is
+    PSNR minus 0.4 dB for each bpp, so a point that only slides along the
+    measured slope does not win.
+    """
+    best: dict[int, tuple[float, float]] = {}
+    for bits, quantile, psnr, bpp in rows:
+        score = float(psnr) - 0.4 * float(bpp)
+        current = best.get(int(bits))
+        if current is None or score > current[0]:
+            best[int(bits)] = (score, float(quantile))
+    return {bits: pair[1] for bits, pair in best.items()}
+# The last-layer fit is unregularized lstsq on a random hidden layer. A weak
+# column becomes a huge weight. This ridge is in feature units.
+READOUT_RIDGE = 1e-2
+
+
+def checkpoint_is_finite(ckpt: object) -> bool:
+    """True when every tensor in a resume file is finite.
+
+    The model and the Adam moments are both checked. A missing model is
+    not a checkpoint this trainer can resume.
+    """
+    if not isinstance(ckpt, dict):
+        return False
+    model = ckpt.get("model")
+    if not isinstance(model, dict) or not model:
+        return False
+
+    def walk(obj: object) -> bool:
+        if torch.is_tensor(obj):
+            return bool(torch.isfinite(obj).all())
+        if isinstance(obj, dict):
+            return all(walk(value) for value in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return all(walk(value) for value in obj)
+        return True
+
+    if not walk(model):
+        return False
+    opt = ckpt.get("opt")
+    if opt is not None and not walk(opt):
+        return False
+    return True
+
+
+def discard_nonfinite_checkpoint(path: str) -> bool:
+    """Delete a resume file that contains NaN or inf. Return True if it did.
+
+    ``sdk_MetalPlates013_2K_b15`` and ``sdk_PavingStones070_2K_b2.5`` finished
+    in seconds because the queue loaded a ``trained`` checkpoint left by the
+    earlier NaN run and exported it again. The file is removed so the next
+    process cannot load it.
+    """
+    if not path:
+        return False
+    try:
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception:
+        return False
+    if checkpoint_is_finite(ckpt):
+        return False
+    print("non-finite checkpoint, not resuming", path, flush=True)
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+    return True
+
+
+def _code_scale(values: torch.Tensor, bits: int) -> torch.Tensor:
+    """Per-channel scale from a high percentile of ``|values|``."""
+    mid = ((1 << int(bits)) - 1) / 2.0
+    flat = values.detach().abs().reshape(values.shape[0], -1).float()
+    level = torch.quantile(flat, clip_quantile(int(bits)), dim=1).clamp(min=1e-3)
+    return (level / mid).clamp(1e-4, 5.0).to(dtype=values.dtype)
+
+
+def _ridge_lstsq(features: torch.Tensor, target: torch.Tensor, ridge: float) -> torch.Tensor:
+    """Solve ``features @ A ≈ target`` with ``ridge`` on the columns of ``A``."""
+    width = int(features.shape[1])
+    eye = torch.eye(width, device=features.device, dtype=features.dtype)
+    aug_h = torch.cat([features, (float(ridge) ** 0.5) * eye], dim=0)
+    zeros = torch.zeros(width, int(target.shape[1]), device=target.device, dtype=target.dtype)
+    aug_t = torch.cat([target, zeros], dim=0)
+    return torch.linalg.lstsq(aug_h, aug_t).solution
 
 
 def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
@@ -111,20 +300,31 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
             except RuntimeError:
                 lat.normal_(0, 0.1)
                 continue
+            if not (torch.isfinite(u).all() and torch.isfinite(s).all() and torch.isfinite(vh).all()):
+                raise RuntimeError("non-finite PCA")
             k = min(ch, int(s.shape[0]))
             coeff = vh[:k] * s[:k].unsqueeze(1)
             if k < ch:
                 coeff = torch.cat([coeff, torch.zeros(ch - k, coeff.shape[1], device=coeff.device)], 0)
             values = coeff.reshape(ch, gh, gw)
-            amax = values.abs().amax(dim=(1, 2)).clamp(min=1e-3)
             bits = net.grid_bits[i]
             mid = ((1 << bits) - 1) / 2.0
-            scale = (amax / mid).clamp(1e-4, 5.0)
+            scale = _code_scale(values, bits)
             net.log_scales[i].copy_(torch.log(scale))
+            ti = net._tile_param_of[i]
+            if ti >= 0:
+                net.tile_log_scales[ti].copy_(torch.log(scale).view(-1, 1, 1))
+                net.tile_offsets[ti].zero_()
             # Store the latent in code units so the optimizer steps in bins.
-            lat.copy_(values / scale.view(-1, 1, 1) + mid)
+            # Codes outside the bins are the percentile spikes. The residual
+            # below uses those clipped codes, not the raw coefficient.
+            qmax = float((1 << bits) - 1)
+            stored = (values / scale.view(-1, 1, 1) + mid).clamp(0, qmax)
+            lat.copy_(stored)
+            clipped = (stored - mid) * scale.view(-1, 1, 1)
             basis = u[:, :k]
-            rec_ds = (basis @ coeff[:k]).reshape(channels, gh, gw)
+            coeff_c = clipped.reshape(ch, -1)
+            rec_ds = (basis @ coeff_c[:k]).reshape(channels, gh, gw)
             rec = F.interpolate(
                 rec_ds.unsqueeze(0), size=target.shape[-2:], mode="bilinear", align_corners=False
             )[0]
@@ -136,9 +336,9 @@ def _pca_init(net: NtcNet, target: torch.Tensor) -> None:
 def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
     """Least-squares fit of the last layer to the current features.
 
-    Hidden layers stay at their initializer. The fit is unregularized and
-    runs with quantization on, so the exported integer weights start near
-    a solution of the linear readout.
+    Hidden layers stay at their initializer. The fit is ridged and runs
+    with quantization on, so the exported integer weights start near a
+    solution of the linear readout without a huge column on a weak feature.
     """
     was = net.training
     net.eval()
@@ -152,18 +352,22 @@ def _fit_readout(net: NtcNet, target: torch.Tensor) -> None:
     feat = net.features(uv, 0, 1).detach()
     h = feat
     with torch.no_grad():
-        for lin in list(net.linears)[:-1]:
-            w, b = net._weight(lin)
+        for i, lin in enumerate(list(net.linears)[:-1]):
+            w, b = net._weight(lin, i)
             h = F.linear(h, w, b)
             h = _activate(h, net.activation, net.activation_requant)
     tgt = target[:, yg.reshape(-1), xg.reshape(-1)].T.detach()
     # Solve h @ A ≈ tgt. A is [hidden, C], and the last weight is A.T.
     try:
-        sol = torch.linalg.lstsq(h, tgt).solution
+        sol = _ridge_lstsq(h, tgt, READOUT_RIDGE)
     except RuntimeError:
         if was:
             net.train()
         return
+    if not torch.isfinite(sol).all():
+        if was:
+            net.train()
+        raise RuntimeError("non-finite readout")
     with torch.no_grad():
         out_f, in_f = net.linears[-1].weight.shape
         net.linears[-1].weight.copy_(sol.T[:out_f, :in_f])
@@ -190,6 +394,46 @@ def _loss(pred, tgt, sems, cfg: TrainConfig) -> torch.Tensor:
     return loss
 
 
+def _code_rate_per_texel(net: NtcNet, texels: int) -> torch.Tensor:
+    """Bits per image texel of a code-unit rate proxy.
+
+    Each latent channel pays ``log2(1 + mean neighbor residual)`` times its
+    grid texel count. The residual is the absolute step to the left texel
+    and to the upper texel. Those neighbors are detached, so the penalty
+    pulls each code toward the code beside it. That is the dependence the
+    256-context range coder models (previous byte, plus a position band that
+    needs no side info). The learned per-channel scale (``exp(log_scales)``)
+    is outside this term. A constant channel costs 0.
+    """
+    bits = net.latents[0].new_zeros(())
+    for lat in net.latents:
+        gh, gw = int(lat.shape[1]), int(lat.shape[2])
+        parts = []
+        if gw > 1:
+            parts.append((lat[:, :, 1:] - lat[:, :, :-1].detach()).abs().mean(dim=(1, 2)))
+        if gh > 1:
+            parts.append((lat[:, 1:, :] - lat[:, :-1, :].detach()).abs().mean(dim=(1, 2)))
+        if not parts:
+            dev = (lat - lat.detach()).abs().mean(dim=(1, 2))
+        elif len(parts) == 1:
+            dev = parts[0]
+        else:
+            dev = 0.5 * (parts[0] + parts[1])
+        bits = bits + (torch.log2(1.0 + dev) * float(gh * gw)).sum()
+    return bits / float(max(int(texels), 1))
+
+
+_SEARCH_BPPS = (2.0, 4.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0)
+
+
+def _search_bpps(target_bpp: float) -> list[float]:
+    vals = [float(v) for v in _SEARCH_BPPS]
+    if all(abs(float(target_bpp) - v) > 1e-6 for v in vals):
+        vals.append(float(target_bpp))
+    vals.sort()
+    return vals
+
+
 def _subset_psnr(pred: torch.Tensor, tgt: torch.Tensor) -> float:
     d = (pred.detach() - tgt).float()
     mse = torch.mean(d * d).clamp(min=1e-20)
@@ -197,7 +441,25 @@ def _subset_psnr(pred: torch.Tensor, tgt: torch.Tensor) -> float:
 
 
 @torch.no_grad()
-def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mips: int) -> bytes:
+def _mip_weight(cfg: TrainConfig, level: int) -> float:
+    if cfg.mip_loss == "footprint":
+        return float(0.25**level)
+    if cfg.mip_loss == "uniform":
+        return 1.0
+    if cfg.mip_loss != "geom":
+        raise ValueError(cfg.mip_loss)
+    return float(0.5**level)
+
+
+def export_network(
+    net: NtcNet,
+    sems: list[int],
+    width: int,
+    height: int,
+    num_mips: int,
+    latent_deflate: bool = False,
+    latent_coder: str | None = None,
+) -> bytes:
     net.eval()
     grids = []
     for i in range(len(net.latents)):
@@ -205,19 +467,33 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
         bits = net.grid_bits[i]
         z = net.latents[i].detach().float().cpu()
         code = torch.round(z).clamp(0, (1 << bits) - 1)
-        grids.append(
-            {
-                "codes": code.to(torch.uint8).numpy(),
-                "bits": bits,
-                "scale": scale.numpy(),
-            }
-        )
+        if not torch.isfinite(scale).all() or not torch.isfinite(code).all():
+            raise RuntimeError("non-finite latent")
+        item = {
+            "codes": code.to(torch.uint8).numpy(),
+            "bits": bits,
+            "scale": scale.numpy(),
+        }
+        ti = net._tile_param_of[i]
+        if ti >= 0:
+            ts_ = torch.exp(net.tile_log_scales[ti]).clamp(1e-4, 5.0)
+            item["tile_scale"] = ts_.detach().float().cpu().half().float().numpy()
+            off = net.tile_offsets[ti].detach().float().cpu().clamp(-2, 2)
+            item["tile_offset"] = off.half().float().numpy()
+        grids.append(item)
     layers = []
-    for lin in net.linears:
+    for li, lin in enumerate(net.linears):
+        bits_l = net.layer_weight_bits(li)
         _ste, codes, scales = quantize_weight(
-            lin.weight.detach().float().cpu(), net.weight_bits, net.group_size
+            lin.weight.detach().float().cpu(), bits_l, net.group_size
         )
         bias = lin.bias.detach().float().cpu()
+        if (
+            not torch.isfinite(codes).all()
+            or not torch.isfinite(scales).all()
+            or not torch.isfinite(bias).all()
+        ):
+            raise RuntimeError("non-finite weight")
         gs = net.group_size
         inn = codes.shape[1]
         if gs <= 0 or gs >= inn:
@@ -230,9 +506,13 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
                 "bias": bias.numpy(),
                 "scale": scales.numpy(),
                 "group_size": gs_store,
+                "weight_bits": bits_l,
             }
         )
     flags = FLAG_ACTIVATION_REQUANT if net.activation_requant else 0
+    act_scales = None
+    if getattr(net, "act_int8", False):
+        act_scales = [float(net.act_scale(i).detach().cpu()) for i in range(len(net.linears))]
     return build_texture_set(
         width=width,
         height=height,
@@ -246,7 +526,76 @@ def export_network(net: NtcNet, sems: list[int], width: int, height: int, num_mi
         channels=[ChannelRec(int(s), 0) for s in sems],
         grids=grids,
         layers=layers,
+        latent_deflate=latent_deflate,
+        latent_coder=latent_coder if latent_deflate or latent_coder else "raw",
+        tile_size=net.tile_size,
+        act_scales=act_scales,
     )
+
+
+def _encode_for_psnr(
+    images: np.ndarray,
+    semantics: list[int],
+    cfg: TrainConfig,
+) -> tuple[bytes, dict]:
+    """Probe rates, then train the smallest file that meets ``target_psnr``.
+
+    Probes call ``encode_arrays`` with ``target_psnr`` cleared, so this does
+    not recurse. Each probe uses one grid from ``select_grids`` (size, latent
+    bits, channel count) at that rate. The full train keeps the caller's
+    step count, adaptive pool, and seed pool, at the picked rate.
+    """
+    steps = cfg.search_steps if cfg.search_steps > 0 else min(20, cfg.steps)
+    rows = []
+    for bpp in _search_bpps(cfg.target_bpp):
+        probe = replace(
+            cfg,
+            target_bpp=float(bpp),
+            target_psnr=None,
+            grids=None,
+            steps=int(steps),
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            eval_every=0,
+            early_stop=0,
+            resume="",
+            ckpt="",
+        )
+        _blob, stats = encode_arrays(images, semantics, probe)
+        rows.append(
+            {
+                "target_bpp": float(bpp),
+                "psnr_u8": float(stats["metrics"]["psnr_u8"]),
+                "file_bytes": int(stats["file_bytes"]),
+                "total_bpp": float(stats["total_bpp"]),
+                "latent_bpp_mip0": float(stats["latent_bpp_mip0"]),
+                "file_bpp_chain": float(stats["file_bpp_chain"]),
+                "bppc": float(stats["bppc"]),
+                "network_bytes": int(stats["network_bytes"]),
+                "grids": stats["grids"],
+            }
+        )
+    meeting = [r for r in rows if r["psnr_u8"] >= float(cfg.target_psnr)]
+    if meeting:
+        meeting.sort(key=lambda r: (r["file_bytes"], r["target_bpp"]))
+        picked = meeting[0]
+    else:
+        picked = sorted(rows, key=lambda r: (-r["psnr_u8"], r["file_bytes"]))[0]
+    full = replace(
+        cfg,
+        target_bpp=float(picked["target_bpp"]),
+        target_psnr=None,
+        grids=None,
+    )
+    blob, stats = encode_arrays(images, semantics, full)
+    stats = dict(stats)
+    stats["rate_search"] = rows
+    stats["rate_search_picked_bpp"] = float(picked["target_bpp"])
+    stats["target_psnr"] = float(cfg.target_psnr)
+    stats["search_steps"] = int(steps)
+    return blob, stats
 
 
 def encode_arrays(
@@ -255,13 +604,30 @@ def encode_arrays(
     cfg: TrainConfig,
 ) -> tuple[bytes, dict]:
     """``images`` is float32 ``[C,H,W]`` in ``[0,1]``."""
+    images = np.asarray(images)
+    if images.size == 0 or not np.isfinite(images).all():
+        raise ValueError("image has a non-finite value")
+    if cfg.target_psnr is not None:
+        return _encode_for_psnr(images, semantics, cfg)
+    if cfg.fast:
+        from ntc.train_fast import encode_arrays_fast
+
+        return encode_arrays_fast(images, semantics, cfg)
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
     device = pick_device(cfg.device)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
+        # ROCm and CUDA fp32 GEMMs are not the CPU wheel. TF32-style
+        # reductions are off so the next GPU run is not that path.
+        torch.backends.cuda.matmul.allow_tf32 = False
+        torch.backends.cudnn.allow_tf32 = False
     c, h, w = images.shape
     hidden = list(cfg.hidden)
     if any(v > 64 for v in hidden) or len(hidden) > 3:
         raise ValueError("hidden width must be <= 64 and depth <= 3")
+    if cfg.layer_bits and len(cfg.layer_bits) != len(hidden) + 1:
+        raise ValueError("layer_bits must have one entry per MLP matrix")
     pe_mode = _PE[cfg.pe]
     probe_table = []
     if cfg.grids is None:
@@ -276,6 +642,7 @@ def encode_arrays(
             cfg.weight_bits,
             cfg.group_size,
             adaptive_pool=max(1, cfg.adaptive_pool),
+            rate=cfg.rate,
         )
         if cfg.adaptive_pool > 1 and cfg.steps > 0 and len(choices) > 1:
             for candidate in choices:
@@ -333,6 +700,8 @@ def encode_arrays(
     # network built below does not depend on how many probes ran.
     torch.manual_seed(cfg.seed)
     np.random.seed(cfg.seed)
+    if device.type == "cuda":
+        torch.cuda.manual_seed_all(cfg.seed)
     nominal = shape_bpp(
         w,
         h,
@@ -357,9 +726,20 @@ def encode_arrays(
         activation_requant=cfg.activation_requant,
         qat_latents=cfg.qat_latents,
         qat_weights=cfg.qat_weights,
+        tile_size=cfg.tile_size,
+        layer_bits=cfg.layer_bits,
+        act_int8=cfg.act_int8,
     ).to(device)
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
-    if cfg.pca_init:
+    start_step = 0
+    resume_ckpt = None
+    if cfg.resume and discard_nonfinite_checkpoint(cfg.resume):
+        cfg = replace(cfg, resume="")
+    if cfg.resume:
+        resume_ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
+        net.load_state_dict(resume_ckpt["model"])
+        start_step = int(resume_ckpt.get("step", -1)) + 1
+    elif cfg.pca_init:
         _pca_init(net, target)
     else:
         for i, lat in enumerate(net.latents):
@@ -368,32 +748,97 @@ def encode_arrays(
         _fit_readout(net, target)
     # Adam on a linear map, and on some hidden widths, finishes below the
     # PCA initialization. The export keeps whichever of the two has the
-    # higher 8-bit PSNR.
+    # higher 8-bit PSNR. A resumed run keeps the checkpoint instead of the
+    # initialization from this process.
     init_state = None
-    if cfg.steps > 0:
+    if cfg.steps > 0 and resume_ckpt is None:
         init_state = {k: v.detach().clone() for k, v in net.state_dict().items()}
+    latent_params = list(net.latents.parameters()) + list(net.log_scales.parameters())
+    latent_params += list(net.tile_log_scales.parameters()) + list(net.tile_offsets.parameters())
     opt = torch.optim.Adam(
         [
-            {
-                "params": list(net.latents.parameters()) + list(net.log_scales.parameters()),
-                "lr": cfg.lr * cfg.latent_lr_mult,
-            },
+            {"params": latent_params, "lr": cfg.lr * cfg.latent_lr_mult},
             {"params": net.linears.parameters(), "lr": cfg.lr},
         ]
     )
+    if resume_ckpt is not None and resume_ckpt.get("opt") is not None:
+        opt.load_state_dict(resume_ckpt["opt"])
     curve = []
     t0 = time.perf_counter()
     net.train()
     max_mip = max(cfg.mip_levels - 1, 1)
-    for step in range(cfg.steps):
-        cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
-        lr = max(cfg.lr * cos, cfg.lr * 0.05)
+    amp = cfg.precision in ("bf16", "fp16") and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if cfg.precision == "bf16" else torch.float16
+    scaler = torch.amp.GradScaler("cuda") if cfg.precision == "fp16" and device.type == "cuda" else None
+    best_state = None
+    best_val = -1e9
+    stall = 0
+    stopped_early = False
+
+    def _step_lr(step: int) -> float:
+        # warmup_steps == 0 and cosine is the historical schedule.
+        if cfg.warmup_steps <= 0 and cfg.schedule == "cosine":
+            cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
+            return max(cfg.lr * cos, cfg.lr * 0.05)
+        warm = max(cfg.warmup_steps, 0)
+        if step < warm:
+            return cfg.lr * float(step + 1) / float(max(warm, 1))
+        span = max(cfg.steps - warm, 1)
+        t = min(1.0, float(step - warm) / float(span))
+        if cfg.schedule == "step":
+            lr = cfg.lr
+            if t >= 0.5:
+                lr *= 0.5
+            if t >= 0.75:
+                lr *= 0.5
+            return lr
+        cos = 0.5 * (1.0 + math.cos(math.pi * t))
+        return max(cfg.lr * cos, cfg.lr * 0.05)
+
+    def _val_psnr() -> float:
+        net.eval()
+        hm, wm = target.shape[-2], target.shape[-1]
+        sse = 0.0
+        count = 0
+        with torch.no_grad():
+            for y0 in range(0, hm, 256):
+                y1 = min(hm, y0 + 256)
+                ys = torch.arange(y0, y1, device=device)
+                xs = torch.arange(wm, device=device)
+                yg, xg = torch.meshgrid(ys, xs, indexing="ij")
+                uv = torch.stack(
+                    ((xg.reshape(-1).float() + 0.5) / wm, (yg.reshape(-1).float() + 0.5) / hm),
+                    dim=1,
+                )
+                tgt = target[:, yg.reshape(-1), xg.reshape(-1)].T
+                if amp:
+                    with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                        pred = net(uv, mip=0, max_mip=max_mip)
+                else:
+                    pred = net(uv, mip=0, max_mip=max_mip)
+                pred = pred.float()
+                q = torch.round(pred.clamp(0, 1) * 255.0) / 255.0
+                tq = torch.round(tgt.clamp(0, 1) * 255.0) / 255.0
+                sse += float((q - tq).pow(2).sum())
+                count += int(q.numel())
+        net.train()
+        mse = sse / max(count, 1)
+        if not math.isfinite(mse):
+            raise RuntimeError("non-finite PSNR")
+        if mse <= 0.0:
+            return 100.0
+        return 10.0 * math.log10(1.0 / mse)
+
+    for step in range(start_step, cfg.steps):
+        lr = _step_lr(step)
         opt.param_groups[0]["lr"] = lr * cfg.latent_lr_mult
         opt.param_groups[1]["lr"] = lr
         opt.zero_grad(set_to_none=True)
         loss = target.new_zeros(())
         monitor_psnr = None
         for m in range(cfg.mip_levels):
+            if cfg.mip_curriculum and m > 0 and step < cfg.steps // 2:
+                continue
             tm = _color_mip(target, m)
             hm, wm = tm.shape[-2], tm.shape[-1]
             n = hm * wm
@@ -412,15 +857,47 @@ def encode_arrays(
                 xs = idx % wm
             uv = torch.stack(((xs.float() + 0.5) / wm, (ys.float() + 0.5) / hm), dim=1)
             tgt = tm[:, ys, xs].T
-            pred = net(uv, mip=m, max_mip=max_mip)
-            loss = loss + (0.5 ** m) * _loss(pred, tgt, semantics, cfg)
+            if amp:
+                with torch.autocast(device_type="cuda", dtype=amp_dtype):
+                    pred = net(uv, mip=m, max_mip=max_mip)
+            else:
+                pred = net(uv, mip=m, max_mip=max_mip)
+            loss = loss + _mip_weight(cfg, m) * _loss(pred.float(), tgt, semantics, cfg)
             if m == 0 and (step % cfg.log_every == 0 or step == cfg.steps - 1):
-                monitor_psnr = _subset_psnr(pred, tgt)
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-        opt.step()
+                monitor_psnr = _subset_psnr(pred.float(), tgt)
+        if cfg.rd_lambda > 0.0:
+            loss = loss + float(cfg.rd_lambda) * _code_rate_per_texel(net, h * w)
+        if scaler is not None:
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            opt.step()
         if monitor_psnr is not None:
             curve.append({"step": step, "psnr_train": monitor_psnr, "loss": float(loss.detach())})
+        if cfg.eval_every and ((step + 1) % cfg.eval_every == 0 or step + 1 == cfg.steps):
+            vp = _val_psnr()
+            curve.append({"step": step, "psnr_val": vp})
+            if math.isfinite(vp) and vp > best_val + 0.01:
+                best_val = vp
+                best_state = {k: v.detach().cpu().clone() for k, v in net.state_dict().items()}
+                stall = 0
+                if cfg.ckpt:
+                    torch.save(
+                        {"model": best_state, "opt": opt.state_dict(), "step": step, "psnr_val": vp},
+                        cfg.ckpt,
+                    )
+            else:
+                stall += 1
+                if cfg.early_stop and stall >= cfg.early_stop:
+                    stopped_early = True
+                    break
+    if best_state is not None:
+        net.load_state_dict(best_state)
     train_s = time.perf_counter() - t0
     num_mips = min(8, int(math.floor(math.log2(max(w, h)))) + 1)
     ref = np.transpose(images, (1, 2, 0))
@@ -428,7 +905,10 @@ def encode_arrays(
 
     def _export_current():
         t_export = time.perf_counter()
-        blob_i = export_network(net, semantics, w, h, num_mips)
+        coder = cfg.latent_coder if cfg.latent_deflate else "raw"
+        blob_i = export_network(
+            net, semantics, w, h, num_mips, latent_deflate=cfg.latent_deflate, latent_coder=coder
+        )
         export_dt = time.perf_counter() - t_export
         t_dec = time.perf_counter()
         ts_i = parse_texture_set(blob_i)
@@ -448,7 +928,13 @@ def encode_arrays(
         psnr_init = psnr_u8(recon_i, ref)
         export_s += export_i
         decode_s += decode_i
-        if psnr_init > psnr_trained:
+        if (
+            psnr_init is not None
+            and psnr_trained is not None
+            and math.isfinite(psnr_init)
+            and math.isfinite(psnr_trained)
+            and psnr_init > psnr_trained
+        ):
             blob, ts, recon = blob_i, ts_i, recon_i
             kept = "init"
         else:
@@ -476,9 +962,8 @@ def encode_arrays(
         "seconds_decode_ref": decode_s,
         "steps": cfg.steps,
         "nominal_bpp": nominal,
-        "total_bpp": total_bpp(ts),
-        "payload_bytes": payload_bytes(ts),
-        "file_bytes": len(blob),
+        "rate": cfg.rate,
+        **rate_report(ts),
         "grids": [list(g) for g in grids],
         "hidden": hidden,
         "activation": cfg.activation,
@@ -505,11 +990,31 @@ def encode_arrays(
             {"psnr_u8": p, "grids": [list(g) for g in grids_i]} for p, grids_i in probe_table
         ],
         "activation_requant": cfg.activation_requant,
+        "latent_deflate": cfg.latent_deflate,
+        "latent_coder": cfg.latent_coder if cfg.latent_deflate else "raw",
+        "rd_lambda": cfg.rd_lambda,
+        "precision": cfg.precision,
+        "warmup_steps": cfg.warmup_steps,
+        "schedule": cfg.schedule,
+        "stopped_early": stopped_early,
+        "best_val_psnr": best_val if math.isfinite(best_val) and best_val > -1e8 else None,
+        "tile_size": cfg.tile_size,
+        "layer_bits": list(cfg.layer_bits),
+        "mip_loss": cfg.mip_loss,
+        "mip_curriculum": cfg.mip_curriculum,
+        "latent_stored_bytes": ts.latent_stored_bytes,
+        "latent_plain_bytes": ts.latent_plain_bytes,
         "curve": curve,
         "metrics": metrics,
         "mip_metrics": mip_metrics,
         "code_entropy": _entropies(ts),
     }
+    for key in ("psnr_u8_init", "psnr_u8_trained", "best_val_psnr"):
+        value = stats.get(key)
+        if value is not None and not math.isfinite(float(value)):
+            raise RuntimeError(f"non-finite {key}")
+    if not math.isfinite(float(stats["metrics"]["psnr_u8"])):
+        raise RuntimeError("non-finite PSNR")
     return blob, stats
 
 

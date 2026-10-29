@@ -1,0 +1,247 @@
+{
+  "measured_on_this_process": true,
+  "device": "cpu",
+  "image": "24x24 procedural, not in the prior set",
+  "architecture": {
+    "hidden": [
+      16
+    ],
+    "grids": [
+      [
+        12,
+        12,
+        4,
+        4
+      ]
+    ],
+    "channels": 3
+  },
+  "max_steps": 24,
+  "check_every": 4,
+  "target_psnr_u8": 24.43462169957527,
+  "keep_rule": "reached the target and train seconds under 90% of the baseline",
+  "winners": [
+    "halving_pool4"
+  ],
+  "rows": {
+    "baseline_fixed_budget": {
+      "wall_s": 0.6839088920023642,
+      "seconds_train": 0.04805147299703094,
+      "steps_ran": 24,
+      "psnr_u8": 24.73462169957527,
+      "train_psnr_u8": 24.73462169957527,
+      "hit_target": false,
+      "checkpoint": "trained"
+    },
+    "baseline_stop_at_target": {
+      "wall_s": 0.037735185000201454,
+      "seconds_train": 0.02881420600169804,
+      "steps_ran": 16,
+      "psnr_u8": 24.77540048535881,
+      "train_psnr_u8": 24.77540048535881,
+      "hit_target": true,
+      "checkpoint": "trained"
+    },
+    "warm_finetune": {
+      "wall_s": 0.04768057699766359,
+      "seconds_train": 0.03659700100251939,
+      "steps_ran": 20,
+      "psnr_u8": 24.497731303584533,
+      "train_psnr_u8": 24.497731303584533,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "warm_freeze": {
+      "wall_s": 0.049164928001118824,
+      "seconds_train": 0.03666214700206183,
+      "steps_ran": 24,
+      "psnr_u8": 20.49587796790865,
+      "train_psnr_u8": 20.49587796790865,
+      "hit_target": false,
+      "checkpoint": "trained",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "analytic": {
+      "wall_s": 0.06361678199755261,
+      "seconds_train": 0.04273340099825873,
+      "steps_ran": 24,
+      "psnr_u8": 15.703519071021283,
+      "train_psnr_u8": 15.703519071021283,
+      "hit_target": false,
+      "checkpoint": "trained",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "coarse_to_fine": {
+      "wall_s": 0.04763385900150752,
+      "seconds_train": 0.03783855300207506,
+      "steps_ran": 24,
+      "psnr_u8": 24.362257711295776,
+      "train_psnr_u8": 23.087164914579624,
+      "hit_target": false,
+      "checkpoint": "init",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "onecycle": {
+      "wall_s": 0.05224400599763612,
+      "seconds_train": 0.042206495003483724,
+      "steps_ran": 24,
+      "psnr_u8": 24.362257711295776,
+      "train_psnr_u8": 24.044645468040507,
+      "hit_target": false,
+      "checkpoint": "init",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "warmup_cosine_3x": {
+      "wall_s": 0.05278094800087274,
+      "seconds_train": 0.04329413199593546,
+      "steps_ran": 24,
+      "psnr_u8": 24.588451646852896,
+      "train_psnr_u8": 24.588451646852896,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "latent_lr_8": {
+      "wall_s": 0.03741841599912732,
+      "seconds_train": 0.028888466003991198,
+      "steps_ran": 16,
+      "psnr_u8": 24.844554013696644,
+      "train_psnr_u8": 24.844554013696644,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "lion": {
+      "wall_s": 0.01422097500108066,
+      "seconds_train": 0.007057081002130872,
+      "steps_ran": 4,
+      "psnr_u8": 24.511209329483123,
+      "train_psnr_u8": 24.511209329483123,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": true,
+      "kept_after_repeat": false
+    },
+    "shampoo": {
+      "wall_s": 0.05905861599967466,
+      "seconds_train": 0.04694685499271145,
+      "steps_ran": 24,
+      "psnr_u8": 24.362257711295776,
+      "train_psnr_u8": 18.287090853896814,
+      "hit_target": false,
+      "checkpoint": "init",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "qat_late": {
+      "wall_s": 0.03771140900062164,
+      "seconds_train": 0.028309357003308833,
+      "steps_ran": 20,
+      "psnr_u8": 24.44854837066068,
+      "train_psnr_u8": 24.44854837066068,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "importance": {
+      "wall_s": 0.05237268999917433,
+      "seconds_train": 0.043146966003405396,
+      "steps_ran": 24,
+      "psnr_u8": 24.427424963303448,
+      "train_psnr_u8": 24.427424963303448,
+      "hit_target": false,
+      "checkpoint": "trained",
+      "reached": false,
+      "faster_than_baseline": false
+    },
+    "uniform_batch_128": {
+      "wall_s": 0.03649042399774771,
+      "seconds_train": 0.02783303599790088,
+      "steps_ran": 16,
+      "psnr_u8": 24.705628756842675,
+      "train_psnr_u8": 24.705628756842675,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "plateau": {
+      "wall_s": 0.03744225400077994,
+      "seconds_train": 0.028909920001751743,
+      "steps_ran": 16,
+      "psnr_u8": 24.77540048535881,
+      "train_psnr_u8": 24.77540048535881,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "pool4_no_halve": {
+      "wall_s": 0.06641072799902759,
+      "seconds_train": 0.05434144299943,
+      "steps_ran": 24,
+      "psnr_u8": 24.991216508581626,
+      "train_psnr_u8": 24.991216508581626,
+      "hit_target": false,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": false
+    },
+    "halving_pool4": {
+      "wall_s": 0.038948520999838365,
+      "seconds_train": 0.02562159299850464,
+      "steps_ran": 12,
+      "psnr_u8": 24.83568312781418,
+      "train_psnr_u8": 24.83568312781418,
+      "hit_target": true,
+      "checkpoint": "trained",
+      "reached": true,
+      "faster_than_baseline": true
+    }
+  },
+  "prior": "src/ntc/priors/decoder_small.pt",
+  "lion_repeat": {
+    "note": "Three other 24x24 images. Target is 0.15 dB under a 24-step Adam budget. Lion lr 1e-4.",
+    "images": [
+      {
+        "seed": 3,
+        "target": 25.94,
+        "adam_hit": true,
+        "adam_steps": 20,
+        "lion_hit": false,
+        "lion_steps": 36,
+        "lion_psnr": 25.78
+      },
+      {
+        "seed": 11,
+        "target": 22.54,
+        "adam_hit": true,
+        "adam_steps": 20,
+        "lion_hit": true,
+        "lion_steps": 4,
+        "lion_psnr": 23.02
+      },
+      {
+        "seed": 19,
+        "target": 20.61,
+        "adam_hit": true,
+        "adam_steps": 24,
+        "lion_hit": true,
+        "lion_steps": 4,
+        "lion_psnr": 22.07
+      }
+    ],
+    "default": "off"
+  },
+  "decision": "Only successive halving is kept. It was already on for seed_pool > 1. Lion is off by default."
+}

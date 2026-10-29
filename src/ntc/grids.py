@@ -1,8 +1,14 @@
-"""Latent shape selection at a target total bits per material pixel.
+"""Latent shape selection.
 
-``bpp`` counts latent codes, fp16 latent scales, and quantized MLP
-weights, bias, and scales. It does not count the 96-byte header or the
-descriptor tables. Those are reported separately as file bpp.
+``rate="payload"`` (the default, and the historical ``target_bpp``) counts
+latent codes, fp16 latent scales, and quantized MLP weights, bias, and
+scales, per mip 0 texel. It does not count the header or the descriptor
+tables.
+
+``rate="latent"`` counts only latent codes and fp16 latent scales, per
+mip 0 texel. That is the rate to line up with ``ntc-cli --bitsPerPixel``.
+Weights are still stored. They show up in ``file_bpp_chain`` and ``bppc``,
+not in the selection target.
 """
 
 from __future__ import annotations
@@ -30,6 +36,39 @@ def latent_payload_bits(grids: list[tuple[int, int, int, int]]) -> int:
         bits += stride * gh * ch * 8
         bits += ch * 16  # fp16 scale
     return bits
+
+
+def grow_grids(
+    base: list[tuple[int, int, int, int]],
+    width: int,
+    height: int,
+    target_bpp: float,
+) -> list[tuple[int, int, int, int]]:
+    """Add channels on ``base`` until the packed latent rate meets ``target_bpp``.
+
+    Spatial sizes and bit depth stay put, and new channels are appended on
+    each grid. A checkpoint of ``base`` can be copied into the prefix of
+    those channels. Channels stop at 16.
+    """
+    grids = [list(g) for g in base]
+    pixels = float(max(width * height, 1))
+
+    def bpp() -> float:
+        return latent_payload_bits([tuple(g) for g in grids]) / pixels
+
+    guard = 0
+    while bpp() < float(target_bpp) * 0.95 and guard < 8:
+        guard += 1
+        order = sorted(range(len(grids)), key=lambda i: grids[i][0] * grids[i][1], reverse=True)
+        grew = False
+        for index in order:
+            if int(grids[index][2]) + 4 <= 16:
+                grids[index][2] = int(grids[index][2]) + 4
+                grew = True
+                break
+        if not grew:
+            break
+    return [tuple(g) for g in grids]
 
 
 def weight_payload_bits(
@@ -105,6 +144,54 @@ def _family(width: int, height: int) -> list[list[tuple[int, int, int, int]]]:
     return out
 
 
+def _bit_band(grids: list[tuple[int, int, int, int]]) -> int:
+    """0 for an all-4-bit grid, 1 for any other grid that avoids 2-bit, 2 otherwise.
+
+    4-bit codes are the ones that trained on the 2048 materials. 2-bit has
+    four levels. 8-bit on a 12-channel 1024 grid fell under its PCA init.
+    """
+    bits = [g[3] for g in grids]
+    if bits and all(b == 4 for b in bits):
+        return 0
+    if bits and min(bits) >= 4:
+        return 1
+    return 2
+
+
+def _grid_quality(grids: list[tuple[int, int, int, int]], width: int) -> float:
+    """Higher means more usable features at a matched raw rate.
+
+    The finest grid dominates. A 2-channel full-resolution grid scored
+    29.33 dB at 2.69 bpp and lost to a 4-channel half-resolution grid at
+    31.80 dB and 1.42 bpp, so a finest grid under 4 channels is discounted
+    and a full-resolution channel counts less than a half-resolution one.
+    A quarter-resolution grid counts less than its channel count can
+    recover: PavingStones at raw 3.89 tied a 12-channel 512 grid with a
+    4-channel 1024 grid, and the 512 grid plateaued near 25 dB.
+    """
+    ordered = sorted(grids, key=lambda g: (g[0] * g[1], g[2]), reverse=True)
+    score = 0.0
+    for i, (gw, gh, ch, bits) in enumerate(ordered):
+        if bits <= 2:
+            quant = 0.2
+        elif bits >= 8:
+            quant = 0.35
+        else:
+            quant = 1.0
+        if i == 0 and ch < 4:
+            quant *= 0.25
+        side = max(gw, gh)
+        if side >= width:
+            res = 0.5
+        elif side * 2 >= width:
+            res = 1.0
+        else:
+            res = 0.25
+        level = 1.0 if i == 0 else 0.15
+        score += ch * quant * res * level
+    return score
+
+
 def select_grids(
     width: int,
     height: int,
@@ -116,12 +203,23 @@ def select_grids(
     weight_bits: int,
     group_size: int,
     adaptive_pool: int = 1,
+    rate: str = "payload",
+    min_bits: int = 0,
 ) -> list[list[tuple[int, int, int, int]]]:
     """Return up to ``adaptive_pool`` shapes closest to ``target_bpp``.
 
     The first entry is the default (closest). ``adaptive_pool > 1`` is the
-    short list a rate search trains.
+    short list a rate search trains. ``rate`` is ``payload`` or ``latent``.
+    The bpp here is the packed latent (and, for ``payload``, the MLP), not
+    the deflate or range-coded size written into the file.
+
+    ``min_bits`` of 0 keeps the historical order. Above 0, 2-bit grids sort
+    last, then every 4-bit grid sorts ahead of 8-bit, then raw-bpp error,
+    then ``_grid_quality``. That puts 4-bit half-resolution features ahead of
+    a 2-channel full-resolution grid at the same packed size.
     """
+    if rate not in ("payload", "latent"):
+        raise ValueError(rate)
     scored = []
     for grids in _family(width, height):
         in_f = sum(g[2] for g in grids) + pe_feature_count(pe_mode, pe_octaves)
@@ -129,27 +227,43 @@ def select_grids(
             continue
         if any(g[2] > 16 for g in grids):
             continue
-        bpp = shape_bpp(
-            width,
-            height,
-            grids,
-            hidden,
-            out_features,
-            pe_mode,
-            pe_octaves,
-            weight_bits,
-            group_size,
-        )
+        if rate == "latent":
+            bpp = latent_payload_bits(grids) / float(width * height)
+        else:
+            bpp = shape_bpp(
+                width,
+                height,
+                grids,
+                hidden,
+                out_features,
+                pe_mode,
+                pe_octaves,
+                weight_bits,
+                group_size,
+            )
         # prefer shapes that are not far above the target: extra bits are
         # not a free win when the comparison is at matched rate
         err = abs(bpp - target_bpp)
         over = max(0.0, bpp - target_bpp)
-        scored.append((err + 0.25 * over, bpp, grids))
-    scored.sort(key=lambda t: (t[0], -t[1], len(t[2])))
+        if min_bits > 0:
+            depth = min(g[3] for g in grids)
+            # Scale bytes move the raw bpp by about 1e-5. Quantize so grids
+            # at the same packed size are ordered by quality, not by that.
+            rate_pen = round(err + 0.25 * over, 2)
+            below = 0 if depth >= min_bits else 1
+            band = _bit_band(grids) if below == 0 else 2
+            scored.append((below, band, rate_pen, -_grid_quality(grids, width), grids))
+        else:
+            scored.append((err + 0.25 * over, -bpp, len(grids), grids))
+    if min_bits > 0:
+        scored.sort(key=lambda t: (t[0], t[1], t[2], t[3]))
+    else:
+        scored.sort(key=lambda t: (t[0], t[1], t[2]))
     # unique by grid tuple
     seen = set()
     picked = []
-    for _err, _bpp, grids in scored:
+    for item in scored:
+        grids = item[-1]
         key = tuple(tuple(g) for g in grids)
         if key in seen:
             continue

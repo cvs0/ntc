@@ -165,3 +165,138 @@ def workgroup_latent_bytes(ts: TextureSet, group: int = 8, mip: int = 0) -> dict
         "bytes_per_texel_unique": len(addrs) / float(texels),
         "bytes_per_texel_upper": tap_bytes / float(texels),
     }
+
+
+# Instruction and load model of the two GPU decoders, one feature-bilinear
+# sample. Mirrors ntc::legacy_sample_cost and ntc::fast_sample_cost in
+# cpp/src/fast.cpp; tests/test_cost.py pins both to the same numbers.
+#
+# legacy  shaders/ntc_decode.glsl. Every latent code, weight byte, and fp16
+#         half is its own 32-bit storage load plus shift and mask.
+# fast    shaders/ntc_fast.glsl. One 32-bit load per tap per channel plane;
+#         weights, bias, scales, and latent scales are uniform-buffer words
+#         at constant offsets (constant-bank operands on NVIDIA, scalar loads
+#         on AMD, shared by the whole wave).
+
+
+def fast_planes(channels: int, bits: int) -> list[tuple[int, int, int]]:
+    """``(first_channel, channels, record_bits)`` per plane, as ntc::fast_planes."""
+    out = []
+    cap = 32 // bits
+    c = 0
+    while c < channels:
+        rem = channels - c
+        n = 1
+        while n * 2 <= rem:
+            n *= 2
+        n = min(n, cap)
+        out.append((c, n, n * bits))
+        c += n
+    return out
+
+
+def _groups(layer) -> int:
+    one = layer.group_size <= 0 or layer.group_size >= layer.in_features
+    return 1 if one else max(1, layer.num_groups)
+
+
+def _mlp_alu(ts: TextureSet) -> int:
+    alu = 0
+    for layer in ts.layers:
+        alu += layer.out_features * (_groups(layer) + 2)
+        if ts.act_int8:
+            alu += layer.in_features * 4
+    return alu
+
+
+def decode_ops(ts: TextureSet) -> dict:
+    """Per-sample ops and bytes for the legacy and fast decoders."""
+    pe = pe_feature_count(ts.pe_mode, ts.pe_octaves)
+    m = macs(ts)
+    leg = {"macs": m, "latent_loads": 0, "weight_loads": 0, "scale_loads": 0, "uniform_words": 0}
+    alu = 0
+    for g in ts.grids:
+        leg["latent_loads"] += 4 * g.channels
+        leg["scale_loads"] += 2 * g.channels
+        alu += g.channels * (4 * 3 + 6 + 3) + 20
+    alu += pe * 4 + _mlp_alu(ts)
+    for layer in ts.layers:
+        leg["weight_loads"] += layer.in_features * layer.out_features
+        leg["weight_loads"] += layer.out_features * (2 + 2 * _groups(layer))
+        alu += layer.in_features * layer.out_features * 4
+    leg["alu"] = alu
+    leg["loads"] = leg["latent_loads"] + leg["weight_loads"] + leg["scale_loads"]
+    leg["load_bytes"] = 4 * leg["loads"]
+
+    fast = {"macs": m, "latent_loads": 0, "weight_loads": 0, "scale_loads": 0, "uniform_words": 0}
+    alu = 0
+    for g in ts.grids:
+        planes = fast_planes(g.channels, g.bits)
+        fast["latent_loads"] += 4 * len(planes)
+        fast["uniform_words"] += g.channels + 4
+        alu += g.channels * (4 + 6 + 2) + len(planes) * 8 + 16
+    alu += pe * 4 + _mlp_alu(ts)
+    for layer in ts.layers:
+        fast["uniform_words"] += layer.in_features * layer.out_features
+        fast["uniform_words"] += layer.out_features * (1 + _groups(layer))
+    fast["alu"] = alu
+    fast["loads"] = fast["latent_loads"]
+    fast["load_bytes"] = 4 * fast["loads"]
+    return {"legacy": leg, "fast": fast}
+
+
+def fast_latent_bytes(ts: TextureSet) -> int:
+    """Resident bytes of the fast latent layout: each grid's chain of up to 8
+    box-filtered levels, down to 1x1, as ntc::build_mips."""
+    n = 0
+    for g in ts.grids:
+        w, h = g.width, g.height
+        for _ in range(8):
+            for _, _, rbits in fast_planes(g.channels, g.bits):
+                n += ((w * rbits + 31) // 32) * 4 * h
+            if w == 1 and h == 1:
+                break
+            w, h = max(1, w // 2), max(1, h // 2)
+    return n
+
+
+def main(argv: list[str] | None = None) -> int:
+    """``python -m ntc.cost FILE.ntc ...``: print the per-sample cost model."""
+    import argparse
+    import json
+    from pathlib import Path
+
+    from ntc.container import parse_texture_set
+
+    ap = argparse.ArgumentParser(description=main.__doc__)
+    ap.add_argument("files", nargs="+")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args(argv)
+    rows = []
+    for f in args.files:
+        ts = parse_texture_set(Path(f).read_bytes())
+        ops = decode_ops(ts)
+        sc = sample_cost(ts)
+        row = {"file": f, "width": ts.width, "height": ts.height, "channels": ts.num_channels,
+               "grids": [(g.width, g.height, g.channels, g.bits) for g in ts.grids],
+               "layers": [(lay.in_features, lay.out_features) for lay in ts.layers],
+               "flops": sc["flops"], "weight_bytes": weight_bytes(ts),
+               "fast_latent_bytes": fast_latent_bytes(ts), **{k: v for k, v in ops.items()}}
+        rows.append(row)
+        if not args.json:
+            leg, fast = ops["legacy"], ops["fast"]
+            print(f"{f}: {ts.width}x{ts.height} ch {ts.num_channels} grids {row['grids']} layers {row['layers']}")
+            print(f"  macs {leg['macs']} flops {sc['flops']} weight_bytes {row['weight_bytes']}")
+            print(f"  legacy loads {leg['loads']} (latent {leg['latent_loads']} weight {leg['weight_loads']} "
+                  f"scale {leg['scale_loads']}) bytes {leg['load_bytes']} alu~{leg['alu']}")
+            print(f"  fast   loads {fast['loads']} bytes {fast['load_bytes']} uniform_words "
+                  f"{fast['uniform_words']} alu~{fast['alu']} latent_resident {row['fast_latent_bytes']}")
+            print(f"  loads x{leg['loads'] / max(1, fast['loads']):.1f} fewer, "
+                  f"non-MAC alu x{leg['alu'] / max(1, fast['alu']):.1f} fewer")
+    if args.json:
+        print(json.dumps(rows, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

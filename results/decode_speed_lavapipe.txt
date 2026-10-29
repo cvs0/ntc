@@ -1,0 +1,60 @@
+device_count 1
+device_list 0 name llvmpipe (LLVM 20.1.2, 256 bits) vendor 0x10005 device 0x0 type 4
+device_index 0
+device_name llvmpipe (LLVM 20.1.2, 256 bits)
+vendor_id 0x10005
+device_id 0x0
+driver_raw 104865800
+api_version 1.4.318
+subgroup_size 8
+timestamp_period_ns 1
+device llvmpipe (LLVM 20.1.2, 256 bits) vendor 0x10005 type 4 api 1.4 driver 104865800 subgroup 8 float16 1 int8 1 coopmat 0 coopvec 0 cpu 1
+compute_max_abs 0
+timestamp_ms_lavapipe 1.54442 not_a_performance_claim
+stage_max_abs 0
+fp16_max_abs 0.0945721
+fp16_stage_max_abs 0.0945721
+note load_pass one_dispatch_per_mip 8x8 point_ntc_eval ssbo_f32
+bench load_fp32 median_ms 1.10057 p95_ms 1.10057 texels_s 4.96197e+06 gb_s 0.0595436 not_a_performance_claim
+bench load_fp16 median_ms 2.33651 p95_ms 2.33651 texels_s 2.33725e+06 gb_s 0.028047 not_a_performance_claim
+bench load_fp32_stage median_ms 1.9705 p95_ms 1.9705 texels_s 2.77137e+06 gb_s 0.0332564 not_a_performance_claim
+bench load_fp16_stage median_ms 2.86743 p95_ms 2.86743 texels_s 1.90449e+06 gb_s 0.0228539 not_a_performance_claim
+note sample_pass one_dispatch 8x8 point_ntc_eval mip0 ssbo_f32 no_filter
+bench sample_native_fp32 median_ms 0.809441 p95_ms 0.809441 texels_s 5.06028e+06 gb_s 0.0607234 not_a_performance_claim
+bench sample_1920x1080_fp32 skipped cpu_device
+bench sample_2560x1440_fp32 skipped cpu_device
+bench sample_3840x2160_fp32 skipped cpu_device
+wrote /tmp/sp64/vk_ntc_fp32.f32 64 64 3
+bench lit skipped channels
+note bc_pass one_dispatch 8x8 linear_sample ssbo_rgba32f magnify
+note bc_compute_pass storage_buffer_rgba32f not_a_color_attachment
+bench bc7_1920x1080 skipped cpu_device
+bench bc7_2560x1440 skipped cpu_device
+bench bc7_3840x2160 skipped cpu_device
+wrote /tmp/sp64/bc7.f32 64 64
+bench bc1 skipped no_file
+bench bc5 skipped no_file
+note i8_path i8vec4_dot4 exact_qat
+note i8_dot glslang_15_has_no_GL_EXT_shader_integer_dot_product
+bench sample_i8_native median_ms 1.23822 p95_ms 1.23822 texels_s 3.30797e+06 gb_s 0 not_a_performance_claim
+i8_exact_psnr 100
+bench sample_i8_1920x1080 skipped cpu_device
+bench sample_i8_2560x1440 skipped cpu_device
+bench sample_i8_3840x2160 skipped cpu_device
+bench sample_coopmat skipped no_cooperative_matrix
+bench sample_coopvec skipped no_extension
+note fs_pass one_triangle color_attachment timestamp_color_output
+bench sample_fs_1920x1080 skipped cpu_device
+bench sample_fs_2560x1440 skipped cpu_device
+bench sample_fs_3840x2160 skipped cpu_device
+note bc7_fs one_triangle linear_sample color_attachment upload_outside_timestamp
+bench bc7_fs_native median_ms 2.13881 p95_ms 2.13881 texels_s 1.91508e+06 gb_s 0 not_a_performance_claim
+bench bc7_fs_1920x1080 skipped cpu_device
+bench bc7_fs_2560x1440 skipped cpu_device
+bench bc7_fs_3840x2160 skipped cpu_device
+tile_cache_bytes 16512
+note tile_cache rgba8_atlas tile_16 window_half feedback_then_fill_then_hw_filter
+bench tile_cache_cold median_ms 0.407557 p95_ms 0.407557 texels_s 4.02005e+07 gb_s 0 not_a_performance_claim
+bench tile_cache_steady median_ms 0.353005 p95_ms 0.390589 texels_s 4.64129e+07 gb_s 0 not_a_performance_claim
+tile_cache_shade 128 128 window 32 32
+ok

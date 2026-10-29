@@ -1,0 +1,40 @@
+#version 460
+// Bench and check entry for ntc_fast.glsl.
+// NTCF_MODE 0: decode texel centers of mip pc.mip, write NTCF_OUTCH fp32.
+// NTCF_MODE 1: decode mip 0 at (pixel + 0.5) / size * uv_scale, write one
+//              rgba8 word folded from every channel (4 B per sample, same as
+//              bc_bench.comp).
+// Every channel index below is a literal (see ntc_fast.glsl). The 8x8
+// workgroup size also sets the shared-memory slices of NTC_FAST_LDS.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(constant_id = 60) const int NTCF_MODE = 1;
+#include "ntc_fast.glsl"
+
+layout(std430, set = 0, binding = 2) writeonly buffer NtcfOut { uint ntcf_out[]; };
+layout(push_constant) uniform Pc { uint w, h, mip, pad; vec2 uv_scale, uv_offset; } pc;
+
+// Channel c (a literal) of the last decode, 0 past the output count.
+#define NTCF_YZ(c) ((c) < NTCF_OUTCH ? ntcf_y(c) : 0.0)
+#define NTCF_STORE(c) if ((c) < NTCF_OUTCH) ntcf_out[idx * uint(NTCF_OUTCH) + uint(c)] = floatBitsToUint(ntcf_y(c))
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.w || id.y >= pc.h) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(float(pc.w), float(pc.h));
+    uint idx = id.y * pc.w + id.x;
+    if (NTCF_MODE == 0) {
+        ntcf_eval(uv, int(pc.mip));
+        NTCF_STORE(0); NTCF_STORE(1); NTCF_STORE(2); NTCF_STORE(3);
+        NTCF_STORE(4); NTCF_STORE(5); NTCF_STORE(6); NTCF_STORE(7);
+        NTCF_STORE(8); NTCF_STORE(9); NTCF_STORE(10); NTCF_STORE(11);
+        NTCF_STORE(12); NTCF_STORE(13); NTCF_STORE(14); NTCF_STORE(15);
+    } else {
+        ntcf_eval(uv * pc.uv_scale + pc.uv_offset, 0);
+        vec4 v = vec4(NTCF_YZ(0), NTCF_YZ(1), NTCF_YZ(2), NTCF_YZ(3));
+        v += vec4(NTCF_YZ(4), NTCF_YZ(5), NTCF_YZ(6), NTCF_YZ(7));
+        v += vec4(NTCF_YZ(8), NTCF_YZ(9), NTCF_YZ(10), NTCF_YZ(11));
+        v += vec4(NTCF_YZ(12), NTCF_YZ(13), NTCF_YZ(14), NTCF_YZ(15));
+        ntcf_out[idx] = packUnorm4x8(v * 0.25);
+    }
+}

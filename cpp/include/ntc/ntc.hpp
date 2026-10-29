@@ -23,6 +23,16 @@ constexpr int kMaxMips = 8;
 
 constexpr uint32_t kFlagDerivedMips = 1u << 0;
 constexpr uint32_t kFlagActivationRequant = 1u << 1;
+constexpr uint32_t kFlagActInt8 = 1u << 4;
+// Raw deflate (window -15) of the latent region. data_offset is then
+// relative to the inflated bytes. Header u32 at offset 84 is that length.
+constexpr uint32_t kFlagLatentDeflate = 1u << 2;
+// Order-1 nibble range coder. Same plain bytes as deflate. Offset 84 is the length.
+constexpr uint32_t kFlagLatentRange = 1u << 3;
+// 256-context nibble range coder (previous nibble, left-byte high bits, position band).
+// Not written by latent_coder "best". Offset 84 is the plain length.
+constexpr uint32_t kFlagLatentCtx = 1u << 5;
+constexpr uint32_t kFlagLatentCompressed = kFlagLatentDeflate | kFlagLatentRange | kFlagLatentCtx;
 
 constexpr int kActIdentity = 0;
 constexpr int kActRelu = 1;
@@ -65,6 +75,7 @@ struct Layer {
     std::vector<float> weight;  // [out, in] integer codes as float
     std::vector<float> bias;    // [out]
     std::vector<float> scale;   // [out, groups] row-major
+    uint32_t weight_bits = 0;   // 0 means the header value
 };
 
 struct TextureSet {
@@ -81,9 +92,16 @@ struct TextureSet {
     std::vector<Grid> grids;
     std::vector<Layer> layers;
     std::vector<uint8_t> raw;
+    uint32_t tile_size = 0;
+    uint32_t latent_stored_bytes = 0;
+    uint32_t latent_plain_bytes = 0;
+    uint32_t scale_stored_bytes = 0;
+    // One scale per layer input. Empty unless kFlagActInt8.
+    std::vector<float> act_scales;
 
     int num_channels() const { return static_cast<int>(channels.size()); }
     bool activation_requant() const { return (flags & kFlagActivationRequant) != 0; }
+    bool act_int8() const { return (flags & kFlagActInt8) != 0; }
 };
 
 TextureSet load_file(const std::string& path);
@@ -98,6 +116,16 @@ void decode_uv(const TextureSet& ts, float u, float v, int mip, float* out);
 int pe_feature_count(int pe_mode, int pe_octaves);
 uint32_t payload_bytes(const TextureSet& ts);
 float total_bpp(const TextureSet& ts);
+// SDK latent rate: compressed latent codes + fp16 latent scales, per mip 0
+// texel. Excludes MLP weights, the header, and the descriptor tables.
+float latent_bpp_mip0(const TextureSet& ts);
+// Whole file, per texel of every mip declared in the header.
+float file_bpp_chain(const TextureSet& ts);
+// Paper rate: payload bits / (mip-chain texels * channel count).
+float bppc(const TextureSet& ts);
+int mip_chain_texels(const TextureSet& ts);
+// Integer MLP weights plus fp16 bias and fp16 weight scales. Not the 96-byte header.
+uint32_t network_bytes(const TextureSet& ts);
 
 // GPU descriptor. 84 uvec4s, matching the layout in shaders/ntc_decode.glsl.
 // `blob` is the file bytes followed by packed derived-mip payloads.

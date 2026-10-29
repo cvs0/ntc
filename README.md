@@ -25,7 +25,7 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 32 | u16 | pe_octaves |
 | 34 | u16 | weight_bits |
 | 36 | u16 | group_size |
-| 38 | u16 | reserved |
+| 38 | u16 | tile_size. 0 is one fp16 scale per latent channel. Nonzero is a Python-only per-tile endpoint map. The C++ reader throws if it is not 0. |
 | 40 | u32 | channel_off |
 | 44 | u32 | grid_off |
 | 48 | u32 | layer_off |
@@ -37,10 +37,10 @@ Little-endian. Magic `0x3143544E` (`NTC1`). Version 1. Header 96 bytes. `crc32` 
 | 72 | u32 | scale_bytes |
 | 76 | u32 | crc32 |
 | 80 | u32 | file_bytes |
-| 84 | u32 | reserved |
+| 84 | u32 | plain latent bytes when flag bit 2, 3, or 5 is set, otherwise 0 |
 | 88 | u64 | reserved |
 
-Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files.
+Flag bit 0: derived mips (set on every file this encoder writes). Flag bit 1: activation requant. It is off in shipped files. Flag bit 2: the latent region is a raw deflate stream (`wbits = -15`, no zlib wrapper). Flag bit 3: the same plain bytes coded with an order-1 adaptive range coder over nibbles (low nibble first, 16 contexts, counts start at 1, rescale at 4096). Flag bit 5: the same plain bytes coded with a 256-context range coder. The context is the previous nibble, the top two bits of the previous byte, and one of four bands along the concatenated latent (`min(3, index * 4 / length)`). At most one of bits 2, 3, and 5 is set. Grid `data_off` values are then relative to the inflated bytes. `total_bpp` counts the compressed length. The GPU upload inflates first and appends derived mips, so the shader never reads the compressed stream. The inflated size is the inference working set. `latent_coder = best` writes whichever of deflate and the order-1 range coder is smaller. It does not set bit 5, so a `train_max` file stays on those two coders. `latent_coder = context` sets bit 5. `latent_coder = best_all` writes the smallest of the three streams.
 
 Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserved`.
 
@@ -57,11 +57,19 @@ Channel record, 8 bytes: `u8 semantic, u8 color_space, u16 reserved, u32 reserve
 
 Grid record, 24 bytes: `u16 width, u16 height, u8 channels, u8 bits, u16 row_stride, u32 data_off, u32 data_bytes, u32 scale_off, u32 plane_bytes`.
 
-Layer record, 32 bytes: `u16 in, u16 out, u32 weight_off, u32 weight_bytes, u32 bias_off, u32 scale_off, u16 group_size, u16 num_groups, u32 reserved, u32 reserved`.
+Layer record, 32 bytes: `u16 in, u16 out, u32 weight_off, u32 weight_bytes, u32 bias_off, u32 scale_off, u16 group_size, u16 num_groups, u32 weight_bits, u32 reserved`. `weight_bits == 0` means the header value. A mixed int8/int4 file stores 8 or 4 per matrix. Old files have 0 there and still decode.
 
 Limits: 8 grids, 4 layers, 16 channels, hidden width 64, 160 input features, 8 mips.
 
-`total_bpp = 8 * (packed latent codes + fp16 latent scales + integer weights + fp16 bias + fp16 weight scales) / (width * height)`. The 96-byte header and the descriptor tables are not in `total_bpp`. They are in `file_bytes`.
+Four rates are reported on every encode. `total_bpp` is the historical one and is unchanged: `8 * payload / (width * height)`, where payload is packed latent codes + fp16 latent scales + integer weights + fp16 bias + fp16 weight scales. The header and the descriptor tables are not in it. The denominator is mip 0 only, and the count is not divided by the channel count. Do not put `total_bpp` next to an RTXNTC `--bitsPerPixel` number or a paper bppc number.
+
+`latent_bpp_mip0` is the SDK rate. It is `8 * (stored latent codes + fp16 latent scales) / (width * height)`. Weights, bias, weight scales, the header, and the descriptor tables are excluded. `ntc-cli --bitsPerPixel` selects a latent grid at this kind of rate. `rate="latent"` in `TrainConfig` selects our grids against this number. The default `rate="payload"` still selects against `total_bpp`.
+
+`file_bpp_chain` is `8 * file_bytes / mip_chain_texels`. The numerator is the whole file. The denominator is every mip the header declares (`num_mips`, a full chain is `floor(log2(max(width, height))) + 1` levels down to 1x1). Derived color mips are not stored a second time.
+
+`bppc` is the paper rate: `8 * payload / (mip_chain_texels * channels)`. Payload is the same numerator as `total_bpp`. Vaidyanathan et al. 2023 Table 3 reports bits/pixel/channel including mips and weights, as a 20-material average: 0.23 -> 32.71 dB, 0.56 -> 36.12, 1.13 -> 39.92, 2.51 -> 45.30. Those points are a different material set, not a matched comparison.
+
+`header_bytes` is 96. One header covers the material and every mip in the chain. `network_bytes` is the integer MLP weights plus the fp16 bias and the fp16 weight scales. It is inside `total_bpp` and `bppc`, and it is outside `latent_bpp_mip0`. The header layout is unchanged.
 
 ## Network
 
@@ -151,7 +159,7 @@ Descriptor, 84 `uvec4`s, written by `ntc::make_gpu_upload`:
 | 16..19 | layer scale_offset, group_size, num_groups, weight_bits |
 | 20..83 | mip `g * 8 + k`: data_offset, row_stride, width, height |
 
-Required arithmetic is fp32 dots of the integer weights. `GL_EXT_shader_integer_dot_product` is not used: this tree's glslang does not compile it. `VK_KHR_cooperative_matrix` is queried and not used, because one texel's GEMV does not fill a tile. Subgroup size is read from the device. The shader does not assume 32 or 64.
+Required arithmetic is fp32 dots of the integer weights. The packed int8 intrinsic is `dotPacked4x8EXT` from `GL_EXT_integer_dot_product`. glslang 15.1 does not provide that extension, so the int8 shader keeps four multiplies there. glslang 16 does, and the signed overload is required: `dotPacked4x8EXT(uint, uint)` is the unsigned dot (see Decoder fast path). `VK_KHR_cooperative_matrix` is queried and not used, because one texel's GEMV does not fill a tile. Subgroup size is read from the device. The shader does not assume 32 or 64.
 
 Filter modes:
 
@@ -192,9 +200,146 @@ Shipped 16.084 bpp network, one feature-bilinear texel:
 | unique latent bytes in an 8x8 tile | 2.9375 per texel |
 | same tile, no reuse | 24 per texel |
 
-Color bilinear multiplies the MLP term by 4 (1920 MACs, 4488 flops). Feature trilinear multiplies it by 2. The shipped compute shader is one thread per texel and does not stage the 8x8 tile. The 2.9375 byte figure is the fetch count if a workgroup did. No GPU timing of that optimization exists.
+Color bilinear multiplies the MLP term by 4 (1920 MACs, 4488 flops). Feature trilinear multiplies it by 2. The sample pass used by `run_all` is one thread per output pixel and does not stage the tile. `load_fp32_stage` and `load_fp16_stage` are the staged load dispatches. The RX 9070 report below is from c33648b, before those two rows existed.
 
 Baking the per-channel latent scale into the first int8 matrix is not exact: the scale is fp16 and the stored weights are integer. The dequant is 12 flops and 12 scale bytes on this network, next to 960 dot flops. It was not implemented.
+
+## Decoder fast path
+
+### Audit of `ntc_decode.glsl`
+
+Per feature-bilinear sample, counted by `ntc::legacy_sample_cost` and `ntc.cost.decode_ops` (same numbers in C++ and Python, pinned in `tests/test_cost.py`). Loads are 32-bit storage-buffer loads. ALU is non-MAC instructions (address math, shifts, masks, conversions, wrap, dequant, lerp, bias, activation).
+
+| file | shape | MACs | legacy loads (latent / weight / scale) | legacy bytes | legacy ALU | fast loads | fast bytes | fast uniform words | fast ALU |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| metal_g16_s4000_foot | 6-32-9, 2 grids | 480 | 680 (24 / 644 / 12) | 2720 | ~2209 | 8 | 32 | 576 | ~243 |
+| synth_b15_2k | 16-32-9, 2 grids | 800 | 1060 (64 / 964 / 32) | 4240 | ~3699 | 12 | 48 | 906 | ~371 |
+| synth_wide_2k | 16-64-64-9, 2 grids | 5696 | 6340 (64 / 6244 / 32) | 25360 | ~23571 | 12 | 48 | 5994 | ~659 |
+
+Findings, legacy path:
+
+1. Every weight is its own `ntc_u8` call: one 32-bit SSBO load, shift, mask, `int` sign extend, convert. 644 loads on the shipped network for 480 MACs. Every fp16 scale is two byte loads plus `unpackHalf2x16`.
+2. Latents are channel-planar. A bilinear sample is 4 taps times C loads (24 shipped, 64 at 16 channels), each with its own bit extract.
+3. Wrap is integer `%` on signed coordinates, 4 per grid. Integer division is a multi-instruction sequence on both vendors.
+4. Shape, offsets and strides come from the descriptor SSBO inside the loops. Loop bounds are runtime, so nothing unrolls.
+5. `g_feat[160]`, `g_ha[64]`, `g_hb[64]` are dynamically indexed private arrays. Compilers place dynamically indexed private arrays in scratch (AMD) or local memory (NVIDIA). That is per-lane memory traffic on top of the loads above.
+6. Filter modes 2, 4, 5 run 4, 2 and N MLPs. Mode 1 and mode 3 run one. Only modes 1 and 3 are in the per-pixel bench.
+7. One decode produces all channels. That part is already right and is kept.
+
+Bugs found and fixed:
+
+| commit | bug | effect | fix |
+| --- | --- | --- | --- |
+| c99bb23 (introduced) | `ntc_dot` returned `acc * w + x` instead of `acc + w * x` | every fp32 shader decode wrong; tiny fixture max_abs 4.83e7 vs CPU | b268b25 restores `precise float prod = w * x; return acc + prod;` |
+| pre-existing | `dotPacked4x8EXT(uint, uint)` is the unsigned dot. `ntc_sample_i8.comp` passed packed signed bytes as `uint` | with glslang 16 (`NTC_HAVE_DOT4=1`) the int8 path computed unsigned dots: -34.7 dB, max_abs 187 on the fast i8 variant | `dotPacked4x8EXT(int(wp), int(xp))`, 55 dB after |
+
+The RX 9070 rows at c33648b predate c99bb23 and are unaffected. Anything built from c99bb23 up to b268b25 is wrong on the fp32 shader path.
+
+### Layout and shader
+
+`shaders/ntc_fast.glsl`, host side `cpp/include/ntc/fast.hpp` and `cpp/src/fast.cpp`.
+
+- Shape, activation, positional encoding, quant flags, grid channels and bits, group sizes and every parameter offset are specialization constants 0 to 59 (`ntc::FastSpec`). The bench mode is 60. `tests/test_fast_layout.py` checks that the GLSL ids and the C++ enum agree.
+- `shaders/ntc_fast.glsl` is generated by `shaders/gen_ntc_fast.py` (`--check` fails if it is stale). Feature and layer-input arrays are indexed only by literals, so they are registers on every driver. Each layer is one uniform loop over 4 output rows. The outputs go to two private arrays of at most 32 words (`ntcf_oa`, `ntcf_ob`), read back with literal indices by the next layer. LLPC keeps a private array of up to 32 words in VGPRs under a dynamic index (`v_movrel`) and unrolls the row loop where it can; a 64-word array under a dynamic index goes to scratch. fp16 and i8 store hidden outputs as two halves per word, since the next layer rounds them to fp16 or 8-bit codes anyway, which keeps their 64-wide layers within 32 words. `NTC_FAST_LDS` puts the rows in workgroup memory instead (one slice per invocation), for a driver that would spill the private rows. It is not the default: 8 to 16 KiB per 64 invocations caps RDNA4 (128 KiB per WGP, 4 SIMDs) at 4 to 8 waves per SIMD, which made wide fma and exact slower on an RX 9070.
+- Why: the earlier `[[unroll]]` loops are a size-bounded hint on the AMD compiler (LLPC turns it into `amdgpu.loop.unroll.threshold`), so the nested layer loops stayed loops and every private array was dynamically indexed and lived in scratch: 656 to 1872 B per invocation on gfx1201 for every variant, fp16 worst (its inout `f16vec2` array copies). Unrolling every row in the source instead makes pipeline creation take seconds on LLPC and over 10 minutes on Mesa for the 64-wide model.
+- MLP parameters are dequantized once on the host to fp32 (weight times row scale, bias, act scales) and uploaded as a std140 UBO `uvec4 ntcf_p[4096]`, 64 KiB. Weight reads are uniform across the wave and hit the constant path. Parameter footprint must fit `min(65536, maxUniformBufferRange)`. `make_fast_upload` returns `ok = false` for a file that does not, and the bench skips the fast variants for it.
+- Latents are repacked per grid into channel-plane records of power-of-two width, at most 32 bits (`fast_planes`). Shipped 4 channels at 4 bits is one 16-bit record per texel, so a tap is one aligned load. 12 channels at 4 bits is a 32-bit plane plus a 16-bit plane.
+- Wrap is `u = uv - floor(uv)` then one conditional `+W` or `-W` on the integer tap. Same taps as the integer wrap for every texel center and every bilinear neighbor. `test_fast_layout` proves `decode_fast_mip == decode_mip` bit-exact for mips 0 to 3 on every fixture and every tracked trained file.
+- Resident size: fast latents 174820 B vs legacy blob 269184 B on metal_g16 (the legacy number is the full `make_gpu_upload` blob), 19573120 B vs 19574396 B on the 2K synthetic. No size cost.
+
+Variants, all from `shaders/ntc_fast_bench.comp`:
+
+| variant | define | arithmetic | requirement | output vs CPU `decode_mip` |
+| --- | --- | --- | --- | --- |
+| exact | `NTC_FAST_EXACT` | fp32, `precise` mul and add, no contraction | none | bit-exact, 0 diff on all files |
+| fma | default | fp32, contraction allowed | none | max_abs <= 2.4e-7, about 150 dB |
+| fp16 | `NTC_FAST_FP16` | `f16vec2` fma with fp16 sums, fp32 bias, scale and output | `shaderFloat16` | 75.5 to 80.7 dB at mip 0 |
+| i8 | `NTC_FAST_I8` | `dotPacked4x8EXT`, int32 sums. act_int8 files: file scale, signed codes. Otherwise per-vector max-abs scale: layer 0 16-bit codes (two dots), inputs after ReLU unsigned 8-bit, others signed 8-bit | `shaderIntegerDotProduct` | 61.8 to 69.4 dB at mip 0 on non-QAT files; layers with group size not a multiple of 4 stay fp32 |
+| i16 | `NTC_FAST_I8` + `NTC_FAST_I16` | as i8 with 16-bit codes on every layer: two dots per 4 weights, the instruction count of packed fp16 | `shaderIntegerDotProduct` | 103.4 to 110.5 dB at mip 0 |
+
+PSNR is against `ntc::decode_mip` on lavapipe for metal_g16_s4000_foot, paving_g16_s4000_foot and synth_wide_2k. The fp16 limit is the fp16 sum, not the fp16 activations: emulated with fp16 activations and fp32 sums it is 83.7 dB (small) and 91.5 dB (wide). LLPC turns fp16 products with fp32 sums into `v_fma_mix_f32`, one MAC per instruction, so that is no faster than fma and is not shipped. Before this change i8 used signed 8-bit codes everywhere: 55.1 dB on metal_g16.
+
+Register and scratch use on gfx1201 (AMD LLPC from RGA 2.15 offline, the compiler of the Windows driver; mode 1, metal_g16 / synth_wide_2k shapes):
+
+| model | variant | scratch B, loops | VGPR, loops | VGPR, LDS rows | LDS B, LDS rows | waves, LDS rows | scratch B | VGPR | LDS B | waves (estimate) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| metal_g16 | exact | 656 | 43 | 109 | 8192 | 8 | 0 | 45 | 0 | 16 |
+| metal_g16 | fma | 656 | 44 | 47 | 8192 | 8 | 0 | 48 | 0 | 16 |
+| metal_g16 | fp16 | 1872 | 54 | 38 | 4096 | 16 | 0 | 36 | 0 | 16 |
+| metal_g16 | i8 | 656 | 43 | 85 | 4096 | 16 | 0 | 45 | 0 | 16 |
+| metal_g16 | i16 | | | 128 | 8192 | 8 | 0 | 46 | 0 | 16 |
+| synth_wide_2k | exact | 912 | 83 | 255 | 16384 | 4 | 0 | 133 | 0 | 11 |
+| synth_wide_2k | fma | 912 | 71 | 79 | 16384 | 4 | 0 | 130 | 0 | 11 |
+| synth_wide_2k | fp16 | 1872 | 96 | 73 | 8192 | 8 | 0 | 71 | 0 | 16 |
+| synth_wide_2k | i8 | 1712 | 47 | 88 | 8192 | 8 | 0 | 113 | 0 | 12 |
+| synth_wide_2k | i16 | | | 169 | 16384 | 4 | 0 | 104 | 0 | 14 |
+
+"loops" is the old `[[unroll]]` shader, "LDS rows" is `NTC_FAST_LDS` (the default of the previous commit), the last four columns are the default. Waves per SIMD is an estimate: the smaller of the VGPR limit (1536 per lane per SIMD, 16 at most) and, with LDS, the LDS limit (128 KiB per WGP, 2 waves per workgroup, 4 SIMDs). Mode 0 (the check entry) of fp16 on the wide model reports a 48 B frame with no scratch instruction. `ntc_decbench --stats-only` prints register and scratch statistics from the installed driver when it exposes them.
+
+An 8-bit unorm output has a quantization floor near 59 dB (half an LSB RMS). fp16, i8 and i16 are above it on every file tested.
+
+### Measured on this VM (lavapipe, CPU, not a performance claim)
+
+`ntc_decbench --check-mips 0 --sizes 512x512 --iters 15 --warmup 2`, llvmpipe LLVM 23.1.4, run with pytest and other jobs in parallel, so absolute times are noisy. Median ms:
+
+| file | legacy | exact | fma | fp16 | i8 | i16 |
+| --- | --- | --- | --- | --- | --- | --- |
+| metal_g16_s4000_foot | 106.78 | 19.19 | 14.58 | 17.44 | 22.88 | 27.95 |
+| synth_b15_2k | 214.44 | 25.41 | 26.68 | 27.75 | 30.46 | 32.01 |
+| synth_wide_2k | 971.66 | 90.45 | 100.86 | 88.57 | 102.95 | 135.70 |
+
+Legacy over fast is 5.6x to 11x on this CPU device. lavapipe has no int-dot acceleration (`int_dot_accel 0`) so i8 and i16 are emulated and slower. GPU numbers need the commands below. The prediction from the cost model is that the legacy pass is load-issue bound (680 loads per sample, 2.7 KB requested, most of it L1 hits) and the fast pass is FMA bound (480 FMAs, about 243 other instructions, 32 B of latent traffic), so the fast path should move the ratio to BC7 by several times on both GPUs. That is a prediction, not a measurement.
+
+### Benchmark harness
+
+`examples/decbench/decbench.cpp`, target `ntc_decbench`. One compute dispatch per pixel of the target size, `uv_scale` chosen so the texture is magnified to the target, timestamps around each dispatch, device-local buffers, rgba8 storage output (4 B per pixel written by every variant, including BC).
+
+- Variants: `legacy` (`ntc_decode.glsl` via `ntc_legacy_bench.comp`), `exact`, `fma`, `fp16`, `i8`, `i16`, `bc7` (one BC7 texture), `bc_mat` (BC7 albedo + BC5 normal + BC7 orm, the BC side of a 9-channel material). BC textures are random mode-6 and BC5 blocks at the NTC texture size, sampled with hardware bilinear at level 0.
+- Before timing, every variant is checked against `ntc::decode_mip` at texel centers for mips 0 to `--check-mips`. exact must be 0 diff. legacy and fma must be within 1e-4 times max(1, |ref|). fp16, i8 and i16 report PSNR only. Any failure exits 1.
+- Columns: `median_ms`, `p95_ms`, `ns/sample` (median over pixels), `Gsample/s`, `model_GB/s` (cost-model load bytes plus 4 B written, BC counts 16 B per texture), `vs_bcmat` (median over bc_mat median; under 1 is faster than BC). `stats` prints register, spill and scratch statistics from `VK_KHR_pipeline_executable_properties` when the driver exposes it.
+- Exit 3 when there is no Vulkan 1.3 device; ctest `decbench_check` reports that as skipped.
+- `bench/make_bench_ntc.py` writes synthetic containers: `ship256`, `b10_2k`, `b15_2k`, `wide_2k`, `big_4k`.
+- `python -m ntc.cost FILE.ntc [--json]` prints the per-sample cost for any file without a GPU.
+
+Commands:
+
+```powershell
+# RTX 5070 Laptop or RX 9070, Windows. Needs the Vulkan SDK (glslangValidator) and CMake on PATH.
+powershell -ExecutionPolicy Bypass -File bench\decbench.ps1
+# results\decbench\<gpu>.json
+```
+
+```sh
+# RX 9070, Linux (RADV). Needs glslang, cmake, ninja.
+bench/decbench.sh
+# results/decbench/<gpu>.json
+```
+
+```sh
+# cost model, any machine
+PYTHONPATH=src python -m ntc.cost results/train_sweep/metal_g16_s4000_foot.ntc
+```
+
+Extra arguments pass through to `ntc_decbench`, for example `--sizes 3840x2160 --iters 200 --variants fma,fp16,i8,bc7,bc_mat`.
+
+### Comparison with RTXNTC, public material only
+
+From the RTXNTC SDK documentation and Vaidyanathan et al. 2023: inference on sample uses cooperative vectors on supported NVIDIA hardware with a DP4a and fp16 fallback, a single MLP evaluation per sample with stochastic texture filtering, and inference on load or on feedback that transcodes to BCn for GPUs where per-sample inference is too slow. The paper reports 1.15 to 1.92 ms at 4K on an RTX 4090 against 0.49 ms for BC7. This tree now has the fp16 and DP4a style paths and one evaluation per sample in modes 1 and 3. It does not have a cooperative vector path or BCn transcode on load.
+
+### Proposals, ranked by expected gain per effort
+
+Not implemented as defaults because they change output or the format. Gains are estimates from the cost model and instruction counts, to be confirmed with `ntc_decbench`.
+
+| rank | proposal | expected gain | quality / cost | status |
+| --- | --- | --- | --- | --- |
+| 1 | fp16 or i16 fast path as default when the device has it and outputs are 8-bit | up to 2x MLP throughput (`v_pk_fma_f16` or two `v_dot4_i32_iu8` per 4 MACs on RDNA, `HFMA2` or DP4A on NVIDIA) | fp16 75 to 81 dB, i16 over 100 dB | shipped behind `NTC_FAST_FP16` and `NTC_FAST_I16`, pick from `ntc_decbench` timings |
+| 2 | Train with `act_int8` (QAT) for files that target the i8 path | 4 MACs per `dot4` instruction on hardware with int-dot acceleration | -1.9 dB on the 64x64 test; the dynamic scale is the fallback | i8 variant ships; train flag exists |
+| 3 | Inference on load or feedback, transcode decoded tiles to BC7 | per-frame sampling cost equals BC7 by construction | one-time decode plus BC7 encode cost; BC7 error on top of NTC error | RGBA8 tile cache exists, needs a GPU BC7 encoder |
+| 4 | Cooperative vector (NVIDIA) or cooperative matrix (RDNA4 WMMA, fp16 in, fp32 sums) over a wave of texels | 2x or more on the MLP term on tensor or matrix units, and fp32 sums lift fp16 above 83 dB | bit-exactness lost; texels of a wave share the layer, which this layout already has | not started; glslang here has no `GL_NV_cooperative_vector`, `VK_KHR_cooperative_matrix` is on RADV and the AMD driver for RDNA4 |
+| 5 | Feature-space trilinear: lerp latents across two mips, one MLP | 2x on mode 4 | not equal to color trilinear; needs retraining with the same filter | not started |
+| 6 | Latent fetch through the texture unit (`R16_UINT`/`R32_UINT` images, or UNORM latents with hardware bilinear) | moves 4 taps per grid off the load path; with hardware filter, 1 fetch per grid instead of 4 taps plus lerps | hardware filter fraction is 8 bits on NVIDIA, not bit-exact | not started |
+| 7 | Fold latent dequant (scale, offset) into the first layer in fp32 | about 2 instructions per latent channel (12 to 32 per sample) | within fma tolerance, not bit-exact | not started |
+| 8 | OpenGL fast path through `GL_ARB_gl_spirv` and `glSpecializeShader` | brings the fast path to the GL backend | none | not started; GL still runs `ntc_decode.glsl` |
 
 ## Filtering checks
 
@@ -229,9 +374,9 @@ Filtered sampling:
 ntc_eval_filtered(uv, dudx, dudy, lod, frame, /*filt*/ 1u, /*maxAniso*/ 8u);
 ```
 
-`examples/vulkan/main.cpp`: `ntc_vk file.ntc spv_dir`. Prefers a discrete GPU, then integrated, then CPU. Runs the fp32 compute shader and compares to `ntc::decode_mip` with tolerance `1e-3`. If `shaderFloat16` is set, it also runs `ntc_decompress_fp16.comp`. Cooperative matrix is queried and ignored.
+`examples/vulkan/main.cpp`: `ntc_vk file.ntc spv_dir [--device index|name] [--bench outdir] [--warmup N] [--iters N] [--bc7 file] [--bc1 file] [--bc5 file]`. Prints `device_count`, one `device_list` line per physical device (index, name, vendor, device id, type), then the selected device's name, vendor id, device id, raw driver version, API version, and subgroup size. Selection is the integer index or a case-insensitive name substring when `--device` is set, otherwise discrete, then integrated, then CPU. The fp32 compute shader is compared to `ntc::decode_mip` with tolerance `1e-3`. If `shaderFloat16` is set, it also runs `ntc_decompress_fp16.comp`. Cooperative matrix is queried and ignored. `--bench` times inference-on-load (every mip) and inference-on-sample at the texture size, 1920x1080, and 3840x2160 with `vkCmdWriteTimestamp`, after warmup submits. Median and p95 are printed with texels/s and GB/s of the written output. A CPU device skips resolutions above 512 and tags every row `not_a_performance_claim`. Optional `--bc7`, `--bc1`, and `--bc5` are NTCB files (`bench/bc_pack.py`): sampled at the same resolutions. The host writes `vk_ntc_fp32.f32` and, when the file has at least six channels, `vk_lit_fp32.f32`.
 
-`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir`. Surfaceless EGL. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. Context 4.6, then 4.5. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`.
+`examples/opengl/main.cpp`: `ntc_gl file.ntc shader_src_dir` with the same `--bench`, `--warmup`, `--iters`, and block-file flags. Linux uses a surfaceless EGL context. Windows creates a hidden window and a core-profile WGL context (`wglCreateContextAttribsARB`, 4.6 then 4.5) and loads GL entry points with `wglGetProcAddress`. The host splices `ntc_decode.glsl` in, because the driver is not asked for `GL_GOOGLE_include_directive`. The GL vertex shader uses `gl_VertexID`. Fragment `uv` is `gl_FragCoord.xy / size` with no Y flip: GL and `glReadPixels` are both lower-left, and mip 0 row 0 is `v = 0.5 / H`. `--bench` uses `GL_TIME_ELAPSED`. The fp16 load path is compiled when the context advertises `GL_EXT_shader_explicit_arithmetic_types_float16`, `GL_EXT_shader_explicit_arithmetic_types`, `GL_AMD_gpu_shader_half_float`, or `GL_NV_gpu_shader5`, in that order. The extension that linked is printed as `fp16_ext`. If none is present, or the compile fails, the row is `load_fp16 skipped no_gl_fp16` or `skipped compile`. A renderer string containing llvmpipe, softpipe, or swiftshader is tagged `not_a_performance_claim` and skips resolutions above 512. Readbacks are `gl_ntc_fp32.f32` and `gl_lit_fp32.f32`.
 
 CPU reference: `ntc_decode file.ntc out.f32 [--mip N]`.
 
@@ -249,7 +394,9 @@ Required path: Vulkan 1.3 or OpenGL 4.5, storage buffers, fp32. No `GL_NV_*`, no
 
 Subgroup size is whatever the device reports. This tree does not branch on 32 vs 64. A wave64 device runs the same fp32 dot.
 
-Encoder device: `torch.cuda.is_available()` covers CUDA and ROCm. A ROCm build sets `torch.version.hip` and still uses the `cuda` device API. `device_report` labels that backend `rocm`. There is no CUDA-only op. CPU is the fallback. ROCm is a PyTorch ROCm wheel from pytorch.org. This VM has the CPU wheel `2.14.1+cpu`.
+Encoder device order for `auto`: CUDA, then ROCm, then DirectML, then CPU. CUDA and ROCm both report `torch.cuda`. A ROCm build sets `torch.version.hip` and still uses the `cuda` device API, including AMD's Windows ROCm wheels. `device_report` labels that backend `rocm` or `cuda`. DirectML is the `torch_directml` package (`privateuseone`); pass `--device directml` to force it. There is no CUDA-only op. This VM has the CPU wheel `2.14.1+cpu`.
+
+RX 9070 is gfx1201. The Windows wheel that lists it is ROCm 7.2.1, torch 2.9.1, Python 3.12. AMD's install page names Adrenalin 26.2.2 as the driver for those wheels. A WDDM driver version such as `32.0.32015.7029` is a different numbering scheme; this tree does not claim they match. If `torch.cuda.is_available()` is false after the install, use the DirectML fallback. The commands are in `bench/train_sweep.ps1`. Do not install a separate torch into the DirectML venv first: current `torch-directml` 0.2.5.dev240914 pins `torch==2.4.1`.
 
 ## Encoder
 
@@ -259,7 +406,11 @@ Initialization is coarse-to-fine PCA of the residual into each grid, then a leas
 
 Loss is mean squared error. Channel weights and a normal-cosine term exist and are off by default.
 
-Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`.
+Defaults: hidden `(32,)`, ReLU, no positional encoding, int8 weights, one scale per row, straight-through latent and weight quantization, `adaptive_pool = 8`, `seed_pool = 4`, 40 steps, `channel_weighting = false`, `latent_coder = best`, `rd_lambda = 0`, `target_psnr` unset, `mip_levels = 4`, `mip_loss = footprint` (weight `0.25**mip`). `geom` is `0.5**mip`. A curriculum that trains mip 0 for the first half of the steps was measured and not adopted. Per-tile latent endpoints (`tile_size > 0`) stay off: the C++ reader throws, and at a matched rate more Adam steps beat them. On the locked seed-3 metal network after 40 Adam steps (mip 0 loss, PSNR 35.7492), the plain latent is 131104 bytes. Deflate stores 79269 bytes (9.7565 bpp). The range coder stores 71365 bytes (8.7916 bpp). `best` selects the range stream. The C++ decoder matches the Python image to 2.98e-7 max abs on that file. A steps-0 PCA latent of the same grids is 78880 deflate bytes versus 71006 range bytes. On an artificial 64x64 grid of repeated 8x8 blocks, deflate is smaller (396 vs 1961), and `best` keeps deflate.
+
+Weights are int8 with straight-through quantization while training (`qat_weights`, `weight_bits = 8`). That is the same int8 the packed decode path multiplies. Each latent channel has its own learned step, `exp(log_scales)`, stored as fp16 and clamped to `[1e-4, 5]`. The reconstructed value is `(code - mid) * scale`. `rd_lambda` defaults to 0, which leaves that loss graph unchanged. When it is positive, each step adds `rd_lambda * sum over channels of log2(1 + mean neighbor residual) * grid_texels / image_texels`. The residual is the absolute code step to the left texel and to the upper texel, and those neighbors are detached. A constant channel adds 0. The scale parameters are outside the rate term. `ntc-encode --rd-lambda` sets it. `bench/rd_curve.py --rd-lambdas` sweeps it. On a 32x32 image, fixed grids `32x32x2@4`, hidden 32, 40 steps, `best_all`: lambda 0 stored 346 latent bytes at 25.244 dB (entropy 3.545). Lambda `1e-2` stored 342 bytes at 25.647 dB (entropy 3.530). Lambda `0.1` stored 341 bytes at 25.223 dB. The saving on that image is 4 bytes.
+
+`ntc-encode --target-psnr D` searches target rates 2, 4, 6, 8, 10, 12, 16, and 20 (plus `--bpp` when that value is outside the list). Each probe trains `search_steps` steps, or `min(20, --steps)` when `--search-steps` is 0, with `adaptive_pool = 1` and `seed_pool = 1`. The grid family is the one in `select_grids`: one and two grids, shifts 0 through 5, channel counts 2, 4, 8, and 12, latent bits 2, 4, and 8. The smallest file whose 8-bit PSNR meets D is then trained with the caller's step count and pool sizes. If no probe meets D, the highest PSNR is kept. The search stays off unless `--target-psnr` is set. `train_max` does not set it, and it does not set `rd_lambda`.
 
 ## Measurements
 
@@ -285,7 +436,7 @@ Block codecs on metal_plate resized to 256 with a box filter. BC7 is `bc7enc -l 
 
 Chart: `results/rd_metal_plate_256.png`.
 
-At 16.084 bpp the shipped network is grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, 480 MACs, 1122 flops. Per-channel 8-bit PSNR: albedo 37.018, normal 39.459, roughness 37.525, metalness 31.595, ao 32.293. Normal angle 1.769 degrees. Against the 16 bpp block bundle that is +2.550 dB PSNR and +0.0216 SSIM. It does not beat ASTC 6x6 (38.275 dB at 17.778 bpp) or per-texture BC7 (44.867 dB at 40 bpp). At 10 bpp it does not beat ASTC 8x8 (32.174 vs 34.072).
+At 16.084 bpp the network from the table above is grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, 480 MACs, 1122 flops, plain latents, mip 0 loss. Per-channel 8-bit PSNR: albedo 37.018, normal 39.459, roughness 37.525, metalness 31.595, ao 32.293. Normal angle 1.769 degrees. Against the 16 bpp block bundle that is +2.550 dB PSNR and +0.0216 SSIM. It does not beat ASTC 6x6 (38.275 dB at 17.778 bpp) or per-texture BC7 (44.867 dB at 40 bpp). The dedicated 10 bpp grids do not beat ASTC 8x8 (32.174 vs 34.072). Deflate of that same 16 bpp file is a different rate point and is in the next section.
 
 The linear network on the same grids keeps the PCA initialization (40 Adam steps scored 34.348 dB and were discarded). 54 MACs, 174 flops, 90 weight bytes. It is +1.192 dB PSNR over the 16 bpp bundle and -0.0077 SSIM.
 
@@ -347,6 +498,44 @@ Seed 0 to the four-seed pool on those grids is +0.509 dB and +0.0143 SSIM. The o
 
 Same-grid hidden 32 vs linear at seed 0 is +0.849 dB and +0.0150 SSIM for 480 MACs instead of 54. The shipped seed is a further +0.509 dB on the hidden network. The linear result does not depend on the hidden-layer seed.
 
+### Deflate and footprint mips
+
+Same machine, torch 2.14.1+cpu. `results/round2_vm.json` is a locked-grid ablation: metal_plate 256, grids `256x256x4@4` and `8x8x2@2`, hidden 32, seed 3, weighting off, one seed. `results/rd_round2.json` is the automatic selector with deflate and footprint loss on, pool 8, four trained seeds, 40 steps. Chart: `results/rd_metal_plate_256.png` plots both NTC series. Block-codec rows were not recomputed.
+
+Raw deflate (`level 9`, `wbits -15`) does not change the decoded image. On the locked 40-step network, plain bpp 16.084 becomes 9.756 at the same 35.749 dB. PavingStones070 on the same grids goes from 16.084 bpp to 9.094 bpp at the same 31.688 dB. The inflated latent is 131104 bytes in both files. That is what the GPU upload expands.
+
+Footprint loss on four mips, same locked metal network, 40 steps: mip 0 35.892 dB (+0.143 vs the mip-0-only 35.749), mip 1 35.254 vs 34.843, mip 2 34.382 vs 33.920. Deflate of that file is 9.760 bpp at the same 35.892 dB. The automatic selector picks the same grids and seed 3: `results/rd_round2.json` metal target 16 is 35.892 dB, SSIM 0.9499, 9.760 bpp. Paving target 16 is 31.693 dB, SSIM 0.9096, 9.113 bpp, seed 0.
+
+Those two operating points beat ASTC 8x8 (metal 34.072 dB at 10.000 bpp, paving 30.981 dB at 10.000 bpp) on rate and on PSNR. They do not beat ASTC 6x6 (metal 38.275 dB at 17.778 bpp, paving 33.727 dB at 17.778 bpp).
+
+More Adam steps on the locked metal grids, mip 0 loss, cosine decay already in the loop:
+
+| steps | PSNR | deflate bpp | delta vs 40 steps | train seconds |
+| --- | --- | --- | --- | --- |
+| 40 | 35.749 | 9.756 | 0 | 0.74 |
+| 80 | 36.137 | 9.820 | +0.388 | 1.10 |
+| 160 | 36.140 | 9.904 | +0.391 | 2.31 |
+| 320 | 36.446 | 10.123 | +0.697 | 4.58 |
+| 800 | 37.049 | 10.517 | +1.299 | 10.71 |
+
+The 320 to 800 step is still +0.603 dB. 37.049 is 1.226 dB under ASTC 6x6. The 2000 and 4000 step jobs were measured on the RX 9070. That table is below. Paving at 160 steps is 31.858 dB (+0.170) at deflate 9.455 bpp, still under ASTC 6x6.
+
+Automatic selector, deflate and footprint, 40 steps (`results/rd_round2.json`):
+
+| material | target | bpp | PSNR | SSIM | checkpoint |
+| --- | --- | --- | --- | --- | --- |
+| metal_plate | 4 | 3.603 | 28.389 | 0.7736 | trained |
+| metal_plate | 8 | 5.594 | 31.621 | 0.8523 | trained |
+| metal_plate | 10 | 7.340 | 32.168 | 0.8606 | init |
+| metal_plate | 12 | 8.416 | 32.183 | 0.8660 | trained |
+| metal_plate | 16 | 9.760 | 35.892 | 0.9499 | trained |
+| metal_plate linear, target 16 | 16 | 9.703 | 34.627 | 0.9175 | trained |
+| PavingStones070 | 8 | 4.672 | 28.120 | 0.8272 | trained |
+| PavingStones070 | 10 | 6.463 | 29.366 | 0.8484 | trained |
+| PavingStones070 | 16 | 9.113 | 31.693 | 0.9096 | trained |
+
+The dedicated 10 bpp grids, deflated, are 32.168 dB at 7.340 bpp on metal and 29.366 dB at 6.463 bpp on paving. Both are under ASTC 8x8. The deflated 16 bpp network is the better point near 10 bpp.
+
 ## Negative results
 
 Kept off, with the delta above:
@@ -366,6 +555,18 @@ Kept off, with the delta above:
 - Fusing latent scales into the int8 matrix. Not exact. Not implemented.
 - A subgroup or quad GEMV split of one texel. The MLP is 480 MACs. The shader stays one thread per texel. The 8x8 unique-byte count is analytical only.
 
+Same locked 256 grids, seed 3, measured in `results/round2_vm.json`. Deltas are against the 40-step int8 ReLU mip-0 network at 35.749 dB unless a same-step comparison is named. None of these are the default.
+
+- int4, one scale per row, QAT already on: 29.773 dB (-5.976). Group 16: 32.177 dB (-3.572). The same row quantizer at 160 steps is 31.971 dB against the 160-step int8 network at 36.140 dB (-4.169). The earlier -0.576 dB was the 128 locked grid. It does not carry to these grids. int4 stays off. The rate saving is about 0.03 bpp.
+- Hidden 64-32. At 40 steps the export keeps the initialization, 34.801 dB (-0.948) at 16.389 bpp. At 160 steps, 34.820 dB against 36.140 dB for hidden 32. Mixed int8/int4/int8 on the three matrices of 64-32 stays on the initialization at 34.467 dB at 40 and at 160 steps.
+- Fourier, 1 octave: 31.984 dB at 40 steps, 34.172 dB at 160 steps (against 36.140). Triangle, 3 octaves: 28.531 dB and 29.433 dB.
+- Hard GELU: 35.561 dB at 40 steps (-0.188). At 160 steps, 36.036 dB against 36.140 for ReLU. Activation requant stays on the initialization at 33.978 dB at 40 and at 160 steps (-1.771).
+- Third grid `256x256x4@4`, `64x64x2@4`, `8x8x2@2`: 35.316 dB at 40 steps (-0.434), 35.233 dB at 160 steps.
+- Mip curriculum (footprint, mip 0 only for the first half of 40 steps): mip 0 35.683 dB (-0.066). Not adopted. `geom` weights on four mips are +0.060 dB at mip 0, less than footprint.
+- Per-tile endpoints. Tile 32 at 40 steps is +0.184 dB at plain 16.208 bpp (deflate 9.896). Tile 16 at 40 steps is +0.263 dB at deflate 10.257 bpp. Tile 16 at 160 steps is 36.435 dB at deflate 10.450 bpp, under the 320-step untiled network (36.446 dB at deflate 10.123 bpp). The C++ reader rejects `tile_size != 0`, so these files are not on the GPU path.
+- Paving tile 16 at 40 steps is 31.747 dB against 31.688 dB, at a higher bpp. Not adopted.
+- Dedicated 10 bpp grids at 40 steps stay at 32.174 dB (deflate 7.393 bpp) on metal and 29.218 dB (deflate 6.505 bpp) on paving. 160 steps on metal reaches 32.251 dB. Still under ASTC 8x8.
+
 ## Correctness on this VM
 
 CPU reference vs the Python decoder on `tests/fixtures/tiny.ntc`: max abs 1.490e-8 at mip 0 and 3.725e-9 at mip 1.
@@ -376,15 +577,259 @@ OpenGL 4.5 llvmpipe, compute and fragment vs the CPU reference: max abs 0. `GL_K
 
 `pytest` covers the container, the quantizer, the reference decoder, filtering, and the cost model. `ctest` runs the C++ decoder against the fixture. glslang compiles the SPIR-V. CI is `.github/workflows/ci.yml`.
 
+### RX 9070 training
+
+`bench/train_sweep.ps1` on Windows 11, AMD Radeon RX 9070, ROCm 7.2.1, torch 2.9.1+rocm7.2.1, backend `rocm`. Wall times are the script's `wall` field. bpp is the deflate rate from that run (`latent_coder` was still deflate).
+
+| job | PSNR | bpp | wall s |
+| --- | --- | --- | --- |
+| metal_g16_s800_mip0 | 36.1321 | 10.4712 | 15.0 |
+| metal_g16_s2000_foot | 37.9472 | 10.9705 | 59.3 |
+| metal_g16_s4000_foot | 38.8116 | 11.4863 | 118.1 |
+| paving_g16_s2000_foot | 33.5768 | 11.2455 | 59.7 |
+| paving_g16_s4000_foot | 33.9188 | 11.9886 | 119.3 |
+| metal_g10_s2000_foot | 32.9017 | 7.6558 | 57.7 |
+| paving_g10_s2000_foot | 29.9804 | 7.3474 | 58.4 |
+| metal_pool8_s80_foot | 27.4268 | 14.1641 | 32.0 |
+
+The 4000-step footprint metal point is 38.8116 dB at 11.4863 bpp. ASTC 6x6 on this material is 38.275 dB at 17.778 bpp. The paving 4000-step point is 33.9188 dB at 11.9886 bpp. ASTC 6x6 on paving is 33.727 dB at 17.778 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8 on quality (metal 32.9017 vs 34.072, paving 29.9804 vs 30.981) at a lower rate. The 80-step pool of 8 picked a 14.164 bpp network at 27.4268 dB. That job is too short to rank grids.
+
+The same 800-step mip-0 configuration on this CPU (torch 2.14.1+cpu) is 37.049 dB at deflate 10.517 bpp, train 10.71 s. The GPU result is 36.1321 dB, 0.917 dB lower, wall 15.0 s. The wall time is the same order as the CPU 800-step train, not the CPU 80-step train (1.10 s, 36.137 dB). The encoder did not seed the ROCm generator or disable TF32 on that run. Both are set now for `torch.cuda` devices. Whether that closes the 0.917 dB is not measured.
+
+`bench/train_max.ps1` (and `bench/train_max.sh`) is the longer run. It downloads the extra CC0 set (`--preset max`: wood_floor, denim_fabric, aerial_rocks_01, forest_ground_04, plastered_wall, concrete_floor_02 at 1K, plus wood_floor and aerial_rocks_01 at 2K), probes 400 steps of fp32 against bf16 and keeps the higher PSNR for the rest, then runs seed pools and continuations. A job with a finished json is skipped. A `.pt` without a finished json is resumed. Output is `results/train_max/`. The printed `estimate_s` uses 118.1/4000 seconds per 256^2 step. 1024^2 full-frame steps scale by 16. The 2048 jobs sample 1024^2 pixels per step, so they also scale by 16. Early stop (8 evals, each 500 steps, without a 0.01 dB gain on the full-image 8-bit PSNR) can end a job earlier. Summing the planned steps at that rate is 2.94 hours before early stop. The script prints `estimate_s`. That figure is the extrapolation, not a completed run.
+
+### Workgroup staging
+
+`NTC_STAGE` in the compute shader copies the weight span and the latent rows touched by the 8x8 workgroup into shared memory, then the same `ntc_eval` reads them. `ntc_decompress_stage.comp` and `ntc_decompress_fp16_stage.comp`. On lavapipe, `stage_max_abs` is 0 for `tests/fixtures/tiny.ntc` and for the 256 range-coded metal file above. `fp16_stage_max_abs` matched the unstaged fp16 path: 0.000134453 on the fixture and 0.00292987 on that 256 file. `--bench` now times those shaders as `load_fp32_stage` and `load_fp16_stage` (one dispatch per mip, same output as `load_fp32`). The c33648b RX 9070 log does not have those rows.
+
 ## What is pending hardware
 
-- GPU milliseconds on AMD and NVIDIA, for inference-on-sample and inference-on-load. Lavapipe numbers stay correctness-only.
-- Official RTXNTC `ntc-cli` PSNR and encode time at matched bpp. Compression needs an NVIDIA Turing-or-newer GPU and CUDA. Decompression of an existing file can pass `--no-coopVec` on other vendors. `bench/gpu_bench.py` records the skip reason and does not fail the run. `bench/compare_runs.py` prints two result files side by side.
-- CUDA and ROCm encode times. The encoder will use those devices when `torch.cuda.is_available()` is true. This VM is CPU only.
+No GPU timing from this VM is a performance number. Lavapipe and llvmpipe rows are tagged `not_a_performance_claim` and the hosts skip 1920x1080 and 3840x2160 on a CPU device. Correctness on this VM is in the section above.
+
+Training sweep, from the repository root. On Windows, install the torch build first (`bench/train_sweep.ps1` has the RX 9070 ROCm 7.2.1 commands and the DirectML fallback), then:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\train_sweep.ps1
+```
+
+Linux, including a machine that already has a CUDA or ROCm torch:
+
+```sh
+sh bench/train_sweep.sh
+```
+
+Writes `results/train_sweep/` (`device.json`, `manifest.json`, one `.json` and one `.ntc` per job). Copy that directory back. Jobs: locked 16 bpp grids at 800 steps with mip 0 loss (the CPU cross-check; this VM measured 37.049 dB and 10.71 s of train), the same grids at 2000 and 4000 steps with footprint loss for metal and paving, locked 10 bpp grids at 2000 steps for both materials, and one metal run with pool 8 and eight seeds at 80 steps. A finished `.json` is skipped on a second run. CPU scaling from the measured 40-step and 800-step times puts the sweep near 15 minutes of train on this 4-thread CPU. The GPU wall time is whatever `device.json` and the per-job `wall_s` fields say after the run.
+
+Decode benchmark and screenshots:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
+```
+
+```sh
+sh bench/run_all.sh
+```
+
+`run_all.sh` passes `--software` when `/dev/dri` is missing or `NTC_SOFTWARE=1`. `run_all.ps1` does not. Both create a venv if needed, configure with CMake (the VS 2022 generator when Visual Studio is installed, otherwise Ninja), run `pytest` and `ctest`, download the two CC0 materials into `data/materials/`, encode them at target 16 bpp with the current defaults, and run `ntc_vk` and `ntc_gl`. Output is `results/hw/<gpu-slug>/report.json` and `report.md` (OS, CPU, GPU name, vendor id, device id, driver, Vulkan API version, subgroup size, OpenGL renderer and version) plus `screenshots/<gpu-slug>/`. PNG panels are the source image, the GPU NTC readback, an absolute-error heatmap, and a zoomed crop, per channel group, from both APIs, plus a lit image when the file has albedo and a normal. BC panels are BC7 mode 6 from `bench/bc_pack.py`, not `bc7enc`. `run_all.ps1` downloads astcenc 5.7.0 (`astcenc-avx2.exe`, zip sha256 `cbde7c78adcc90d0d90ecf10f32d03f3340fbe1720cb6d6c892147d625e74d2d`) into `tools/astcenc/` and writes ASTC 6x6 `-medium` panels. Set `ASTCENC` to skip the download. RTXNTC is probed. On a non-NVIDIA GPU the recorded reason is that compression needs an NVIDIA Turing-or-newer GPU and CUDA. `bench/compare_runs.py dirA dirB` prints the two `report.json` files side by side.
+
+`ntc_view` is `examples/realtime_viewer`. It is Vulkan 1.3 with dynamic rendering. The window is Win32 or X11. There is no second OpenGL scene renderer. The fragment shader includes `ntc_decode.glsl` and calls `ntc_eval_filtered` with lod `log2(max(|dFdx(uv)|, |dFdy(uv)|) * max(width, height))` and filter mode 3 (stochastic corner). The mean of frames is the color bilinear. `shaders/ntc_fs_stoch.frag` is the same filter for a fullscreen pass. `shaders/ntc_tile_bc7.comp` writes BC7 mode 6 blocks from the decode, the same weights as `bench/bc_pack.py`. The scene is a sphere, a plane, and a cube, orbit camera, one directional light, GGX specular, tangent frame from `dFdx/dFdy` of world position. Channel slots come from the file semantics (albedo 0..2, normal 3..5, roughness 6, metalness 7, ao 8). Keys: `1` inference-on-sample, `2` BC7 albedo plus BC5 normal plus BC7 ORM packed at load from the CPU decode, `3` the same with BC1 albedo and BC1 ORM, `4` ASTC (white placeholder; the binary has no ASTC encoder, and the format is reported unsupported when the device lacks `VK_FORMAT_ASTC_4x4_UNORM_BLOCK`), `5` the CPU decode uploaded as RGBA8, `h` albedo error heatmap against that upload, `j` wipe (left NTC, right the CPU decode), mouse drag orbits, wheel zooms. The timestamp pair is around the three draws. The overlay text (mode, resolution, GPU milliseconds, FPS from that time, bpp, material VRAM) is drawn into the readback after the timestamp, so it is not inside the query. `--benchmark` is offscreen at 1920x1080 and 2560x1440 for NTC, the BC7 transcode, and the CPU-decode reference, plus a heatmap at 1080p. A CPU device skips those sizes, renders one 256x256 NTC frame, and tags `not_a_performance_claim`. Output is `results/hw/<gpu-slug>/realtime/report.json` and `screenshots/<gpu-slug>/realtime/`. `run_all` passes `--ntc-dir results/hw_encode`, `results/train_sweep`, and `results/train_max`.
+
+```text
+build\Release\ntc_view.exe --shader-dir build\shaders
+build\Release\ntc_view.exe --benchmark --shader-dir build\shaders --ntc-dir results\train_sweep --ntc-dir results\train_max
+```
+
+A Ninja build puts the executable at `build\ntc_view.exe`.
+
+The SDK materials are ambientCG MetalPlates013, PavingStones070, and Tiles135D at 2048. `bench/download_materials.py --preset rtxntc` fetches `https://ambientcg.com/get?file=<Name>_2K-JPG.zip` with a browser User-Agent and writes a full box-filter chain under `data/materials/<Name>_2K/reference/` (`albedo.png`, `mips/albedo.01.png`, and the same for normal, roughness, metalness when the zip has it, ao, height). `train_max` trains each of those at latent rates 2.5, 5, 10, 15, and 20 for 4000 cosine steps, batch 1024^2, 12 mips, when the directory exists.
+
+`bench/score_mips.py --reference <dir> --decoded <dir>` pools 8-bit MSE over every channel and every mip present on both sides, then reports that PSNR and the same pool per channel group. PNG, JPEG, TGA, and EXR (EXR needs `imageio`) are accepted. `bench/rtxntc_compare.ps1` and `bench/rtxntc_compare.sh` download the three materials, build or locate `ntc-cli` from https://github.com/NVIDIA-RTX/RTXNTC, compress at 2.5, 5, 10, 15, and 20 bpp, decompress with `--vk` and with `--no-coopVec`, score both tools with `score_mips.py`, and write `results/rtxntc_compare/<gpu-slug>/report.json` plus `rd.svg`. The black squares on the bppc panel are Table 3. The orange series is RTXNTC. The blue series is ours. RTXNTC `latent_bpp_mip0` in that report is the requested `--bitsPerPixel`. Its `file_bpp_chain` and `bppc` use the whole `.ntc` file, because the CLI does not print a split of latents and weights.
+
+```text
+powershell -ExecutionPolicy Bypass -File bench\rtxntc_compare.ps1
+sh bench/rtxntc_compare.sh
+```
+
+### RX 9070 decode, c33648b
+
+`bench/run_all.ps1` at c33648b. Windows 11 (`10.0.26300`), AMD Radeon RX 9070, vendor `0x1002`, device `0x7550`, Vulkan 1.4.359, subgroup 64, OpenGL 4.6.0 Core Profile Context 26.10.1.261008, driver raw `8389024`. Files: `results/hw/amd-radeon-rx-9070/report.md` and `screenshots/amd-radeon-rx-9070/`. The encode inside that run is the 40-step default, not the 4000-step sweep above. ASTC panels are absent: `astcenc` was not on `PATH`. OpenGL `load_fp16` is `no_gl_fp16` on that build. Vulkan `load_fp16` did run (shaderFloat16).
+
+What the rows measure. `load_fp32` is one 8x8 compute dispatch per mip, one point `ntc_eval` per texel, writing fp32 channels to an SSBO. The timestamp pair is around those dispatches. `sample_1920x1080_fp32` and `sample_3840x2160_fp32` are one 8x8 dispatch each. Every output pixel runs `ntc_eval` at mip 0. There is no derivative, no footprint filter, and no overdraw. A 3840x2160 sample is 8,294,400 evaluations of a 256 texture, not a blit. `bc7_3840x2160` is one 8x8 dispatch, one linear `texture()` of the native-resolution BC7 image, magnified, writing four fp32 values (16 bytes) per pixel. The BC7 upload is outside the query. It is not a fragment pass into a color attachment. That is why 4.42 ms for BC7 at 4K is not a full-screen hardware sample in the usual sense: the pass stores 3840 times 2160 times 16 bytes, about 127 MB, through a storage buffer.
+
+| pass | metal Vulkan ms | metal OpenGL ms | paving Vulkan ms |
+| --- | --- | --- | --- |
+| load_fp32 | 0.160 | 0.141 | 0.159 |
+| load_fp16 | 0.165 | skipped, no_gl_fp16 | 0.163 |
+| sample_native_fp32 | 0.120 | 0.109 | 0.119 |
+| sample_1920x1080_fp32 | 2.868 | 2.868 | 2.876 |
+| sample_3840x2160_fp32 | 11.245 | 11.340 | 11.267 |
+| bc7_1920x1080 | 0.942 | 0.949 | 0.942 |
+| bc7_3840x2160 | 4.425 | 4.435 | 4.425 |
+
+BC1 and BC5 at the same sizes match BC7 to 0.01 ms. The full table, including p95, is `results/hw/amd-radeon-rx-9070/report.md`.
+
+Vaidyanathan et al. 2023 report 1.15 to 1.92 ms total at 4K for their decoder on an RTX 4090, and 0.49 ms for BC7. On this RX 9070 the 4K NTC sample is 11.245 ms, which is 5.9 times the slow end of that band and 9.8 times the fast end. The 4K BC7 row here is 4.425 ms, 9.0 times their 0.49 ms. The NTC minus BC7 gap on this GPU is 6.82 ms. Their published gap is 0.66 to 1.43 ms. This pass is slower on both sides, and the two BC7 experiments are not the same kind of draw, so the ratio is not a claim that the MLP alone is 9 times their decoder.
+
+![metal_plate albedo, Vulkan, source / NTC / error / crop](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_albedo.png)
+
+![metal_plate lit, Vulkan](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_lit.png)
+
+![metal_plate BC7 sample, Vulkan](screenshots/amd-radeon-rx-9070/metal_plate_vulkan_bc7.png)
+
+![PavingStones070 albedo, Vulkan](screenshots/amd-radeon-rx-9070/PavingStones070_vulkan_albedo.png)
+
+The same four panels exist for OpenGL, plus normal and orm, in that directory.
+
+## Decode speed
+
+The 4K number from the RX 9070 section is a compute dispatch into an SSBO. Two more passes are in `--bench` now.
+
+`sample_fs_*` and `bc7_fs_*` are one triangle into an `R8G8B8A8` color attachment. The timestamp is `VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT`. The BC7 upload is outside the pair. `bc7_1920x1080` without `_fs` is still the storage-buffer compute sample. `sample_i8_*` is the packed int8 dot. `GL_EXT_integer_dot_product` supplies `dotPacked4x8EXT`. glslang 15.1 does not provide that extension, so the shader compiles the four multiplies. Drivers that contract int8 dot-4 to DP4a can still do that. `sample_coopmat_*` runs only when `VK_KHR_cooperative_matrix` is on and a native readback matches the scalar decoder within 0.02. Otherwise the row is `skipped`. `sample_coopvec` is `skipped no_extension` or `toolchain_has_no_GL_NV_cooperative_vector`. This glslang has no `GL_NV_cooperative_vector`. `tile_cache_cold` and `tile_cache_steady` are pass 1 (requested tile ids), pass 2 (decode missing 16x16 tiles into an RGBA8 atlas), pass 3 (hardware linear sample of that atlas). The window is half the texture and steps by 16 px. `tile_cache_bytes` is the atlas plus the two masks. There is no BC7 transcode of the atlas in this build. The atlas is RGBA8.
+
+`act_int8` on `TrainConfig` is off by default. `train_max` does not set it, and a checkpoint from c33648b has no `act_log_s` parameter. When it is on, each layer input is quantized to int8 with one learned fp16 scale stored in a tail, `FLAG_ACT_INT8` (`1 << 4`). The scalar shader applies the same quantize, so the packed shader can match it. On a 64x64 smooth image, 40 steps, same grids and seed, the int8 network was 25.57 dB and the default network 27.48 dB, delta -1.91 dB (`results/qat_int8_cpu.json`). At 120 steps the delta was -1.87 dB. That is the measured loss on that image, not a claim that a long material train loses the same amount. Lavapipe `i8_exact_psnr` on the 40-step file was 100 against the CPU int8 decode.
+
+Published RTX 4090 figures from Vaidyanathan et al. 2023, a different decoder and a fragment pass: 1.15 to 1.92 ms at 4K, BC7 0.49 ms. RX 9070 compute rows from c33648b are in the table above (NTC 11.245 ms, BC7 storage-buffer 4.425 ms, gap 6.82 ms). Lavapipe rows below are `not_a_performance_claim`. 1920, 2560, and 3840 are skipped on a CPU device. Re-run `bench/run_all.ps1` on the RX 9070 to fill the fragment, int8, and tile-cache rows.
+
+| path | 1080p | 1440p | 4K | source |
+| --- | --- | --- | --- | --- |
+| NTC compute SSBO, RX 9070 | 2.868 ms | | 11.245 ms | c33648b, metal Vulkan |
+| BC7 compute SSBO, RX 9070 | 0.942 ms | | 4.425 ms | c33648b, not a color attachment |
+| NTC fragment, RTX 4090 | | | 1.15 to 1.92 ms | Vaidyanathan et al. 2023 |
+| BC7 fragment, RTX 4090 | | | 0.49 ms | same paper |
+| NTC/BC7 fragment, int8, coopmat, tile cache | | | | next `run_all.ps1` on the RX 9070 |
+
+Lavapipe, 64x64 int8 file, one iteration, not a performance number (`results/decode_speed_lavapipe.txt`): `sample_i8_native` 1.238 ms, `bc7_fs_native` 2.139 ms, `tile_cache_cold` 0.408 ms, `tile_cache_steady` 0.353 ms at a 128 shade of a 32 px window, `tile_cache_bytes` 16512. Cooperative matrix and cooperative vector were absent.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
+```
+
+The new rows are in `results\hw\<gpu-slug>\*_vulkan.txt`.
+
+## Rate curves
+
+`bench/rd_curve.py` writes `results/rd_curve.json` and `results/rd_curve.svg`. The rate list is 2, 4, 6, 8, 10, 12, 16, 20. The SVG has three panels: `latent_bpp_mip0` (domain at least 2 to 20), `file_bpp_chain` (domain at least 2 to 20), and `bppc`. Ours is blue. BC1, BC5, and BC7 from `bench/bc_pack.py` (mode 6, DXT1, BC4) are gray. ASTC 4x4, 5x5, 6x6, and 8x8 are green when `astcenc` is on PATH; otherwise those rows keep the nominal bpp (8, 5.12, 3.555..., 2 bits per texel per texture) and a null PSNR. Black squares are Table 3, labeled as a different material set. Orange points are filled from `results/rtxntc_compare/*/report.json` after `bench/rtxntc_compare` runs on the NVIDIA laptop. Until that file exists the measured RTXNTC list is empty.
+
+PSNR on every row that has one comes from `bench/score_mips.py`: pooled 8-bit MSE over the mip chain both sides actually wrote. Block rates are the nominal codec rates. BC5 normal reconstructs Z from XY. The 16 bpp bundle is BC1 albedo, BC5 normal, and one BC1 of roughness, metalness, and ao.
+
+`bd_rate` in the JSON is percent bits saved at equal PSNR. Positive means ours uses fewer bits than that baseline. Curves that overlap in PSNR use a piecewise-linear integral of `ln(rate)` over PSNR. A baseline with one point interpolates our curve at that PSNR. The comparison is kept when both sides scored the same channel groups. It is reported on `file_bpp_chain` and on `bppc` for BC and ASTC, and on `latent_bpp_mip0`, `file_bpp_chain`, and `bppc` for measured RTXNTC. The Table 3 entry is present with a null number because that table is a different 20-material average.
+
+```bash
+python bench/rd_curve.py --demo --size 32 --steps 40 --hidden 32 --rates 4 8 16 --out results/rd_curve_cpu.json
+python bench/rd_curve.py --material data/materials/MetalPlates013_2K --size 2048 --steps 4000 --rate latent --latent-coder best_all --rd-lambdas 0 1e-4 1e-3
+```
+
+`results/rd_curve_cpu.json` is that first command: a 32x32 CPU check with `sdk_2048_measured` false. Ours at 40 steps scored 18.70 dB at 4.13 `file_bpp_chain`, 24.14 dB at 5.02, and 29.97 dB at 11.41. BC1 albedo on the same chain was 27.89 dB at 4 bpp, BC7 albedo 28.03 dB at 8 bpp. Equal-PSNR interpolation on `file_bpp_chain` is -112.69% bits saved versus BC1 and -8.48% versus BC7 (negative means ours spends more bits at that PSNR). On `bppc` versus BC7 the figure is +8.34%. ASTC rows in that file are bpp anchors (`astcenc` was absent). Table 3 is plotted and its BD-rate entry is null. The 2048 curves come from the second command on the SDK materials. `train_max` is a separate resumable sweep and is unchanged.
+
+## Training throughput
+
+`train_max` is unchanged. It still calls `encode_arrays` with `fast` left off, writes `results/train_max/`, and resumes a `.pt` that has no finished json. The fast path is `TrainConfig.fast` and `bench/train_max_v2.py`, which writes `results/train_max_v2/`.
+
+On the RX 9070 (ROCm 7.2.1, torch 2.9.1, Windows) at c33648b, a 256x256 job takes about 30 s per 1000 steps (20k steps, 648 s). The precision probe ran 400 steps of fp32 in 17.0 s and bf16 in 12.0 s, then kept fp32 because that rule compares PSNR at equal steps. bf16 was 1.42x more steps per second. Seeds in a pool are separate processes in sequence. Partial results from that run: metal_g16_s20000 39.4655 dB at 11.7025 bpp, paving_g16_s20000 34.4812 at 11.8823, metal_b6_s10000 33.6462 at 5.3630, paving_b6 29.6474 at 4.9972, metal_b4 29.7362 at 3.0980, paving_b4 29.2320 at 3.4713. Those numbers are in `results/train_speed/rx9070_c33648b.json`. `gpu_idle_fraction` there is null until the command below runs on that GPU.
+
+The fast path stacks every seed of a pool into one module. Latent grids are `[seed, C, H, W]` and each MLP matrix is one `bmm`, so a step launches the gather and the GEMM once for the pool. `torch.func.vmap` is not used: the mip loop is ordinary Python, and an explicit batch dimension is what the launches see. Successive halving drops the lower half of the pool every 250 steps (200 to 300 is the range that cutoff sits in). The survivor keeps its Adam moments and continues to the original step count. uv grids and mip targets are allocated once. The step does not call `.item()`. Gradient clipping multiplies by a device tensor. `clip_grad_norm_` in the eager loop is the per-step host sync. bf16 or fp16 autocast wraps the MLP GEMM. Latents, the fp32 master weights, and the loss stay fp32. fp16 uses `GradScaler`. `torch.compile` runs on CUDA when `compile_step` is `auto`, and a CUDA graph is captured only for a constant learning rate, because a cosine schedule would freeze the first rate inside the graph. Either one records the exception and the step stays eager. A larger `batch_pixels` scales the learning rate by `batch_pixels / lr_batch_ref` when `lr_batch_ref` is set. Triton is not installed here. A fused gather kernel is turned on only when a CUDA profile names the bilinear gather as the busy op. `profile_historical_step` reports `gpu_idle_fraction` as `1 - cuda_busy_time / wall` and `launch_cpu_fraction` from profiler keys that contain `launch`.
+
+`bench/train_speed.py` prints steps/s and the wall time for the fast path to reach the eager run's 8-bit PSNR.
+
+```powershell
+powershell -ExecutionPolicy Bypass -File bench\train_speed.ps1
+python bench\train_max_v2.py --out results\train_max_v2 --materials data\materials --probe-steps 400
+.\.venv-rocm\Scripts\python.exe bench\train_max_v2.py --workers 3 --out results\train_max_v2 --materials data\materials --probe-steps 400
+```
+
+Use the same ROCm 7.2.1 / torch 2.9.1 environment as the c33648b run. The script does not install torch. The 3x wall-time bar is `speedup_time_to_target` in `results\train_speed\rx9070.json` at `--size 256 --g16 --steps 200`. `train_max_v2 --workers N` spawns N processes on one shared lock pool. Each process claims the next undone job, highest pixels times steps first, and a process that finishes takes whatever lock is free. `--shard I/N` uses that cost order, longest job first, and does not steal. Before training, the script runs the RTXNTC material download when `MetalPlates013_2K`, `PavingStones070_2K`, or `Tiles135D_2K` has no manifest, and it exits if any of those three is still missing. A finished `results/train_max_v2/<name>.json` is skipped. The claim is `locks/<name>.lock` with `O_CREAT|O_EXCL`. A lock whose pid is dead, or whose age exceeds `--stale-lock-s` (default 86400), is taken. An error json is skipped only while that material is still missing, and a later run trains it once the manifest exists. The log line is `worker queue pid ... steps/s ...`. File names are unchanged. 256 jobs stay full-frame (`batch_pixels` 0). `--batch-pixels K` overrides those jobs and sets `lr_batch_ref` to 65536 so the learning rate scales by `K/65536`. A 256 frame already has 65536 pixels, so the default batch was not raised. `--pack` (the default) stacks jobs that share an explicit grid, size, and step count into one `bmm`. `--no-pack` trains them one at a time. The precision probe still records `historical_equal_steps_choice` next to the equal-wall choice.
+
+`metal_g16_step_s10000` is the only `schedule=step` job, fixed G16 grids, seed 3, `seed_pool` 1. It is not a low-rate job. A trained G16 file from the earlier cosine runs sits near 11 bpp. 2.4254 bpp is about 19.9 KB of payload, the size of a smooth latent after the range coder. That is the PCA initialization, or codes that have run to 0 or 15. The straight-through estimator keeps sending gradient outside the bins, and this schedule holds the peak learning rate until halfway through 10000 steps. Early stop also used to give up after eight evals that had not gained 0.01 dB, including while the run was still under the init. The export then keeps the init when it scores higher. The fast path now clamps latent codes into the bin range after every step, and patience does not increment while the eval PSNR is still under the init. The json records `steps_ran`, `checkpoint`, `psnr_u8_init`, and `psnr_u8_trained`. On a 32x32 stand-in, eager and fast step-schedule PSNR matched (24.032 dB).
+
+On the RX 9070 at 724dd46 the clamped step job trained to 39.0892 dB at 11.3444 bpp. The earlier file was 18.32 dB at 2.43 bpp. `plastered_wall_b16_s10000` had the same railing: 24.18 dB at 3.96 bpp before the clamp, 41.07 dB at 12.60 bpp after. Finished jsons stay skipped, including those two. `--workers 3` on Windows ROCm ran each worker at about 49 to 50 steps/s, and one process ran at 63 steps/s, about 2.3x aggregate on the 10k-step 1K jobs.
+
+The first 2048 latent runs (bf16, 4000 steps, flat batch 1048576, three processes) were `sdk_MetalPlates013_2K_b2.5` 30.2180 dB at 1.0468 bpp (3.91 steps/s, 1295 s), `b5` 28.8361 dB at 2.2392 bpp (2.08 steps/s, 2205 s), and `b10` 31.1658 dB at 3.1346 bpp (3.76 steps/s, 1194 s). The grid search matches the packed latent size, and those three picks were exactly 2.5, 5.0, and 10.0 raw bpp. The file stores the smaller of deflate and the order-1 range coder, so the reported bpp is 0.42, 0.45, and 0.31 of the label. Twelve mips do not add a second latent. One grid is sampled at coarser UVs. The wall times match 4000 steps plus eval, so early stop did not end the runs. The 5 bpp pick was `[(2048, 2048, 2, 2), (1024, 1024, 2, 2)]`, a 2-bit code (four levels). The 2.5 bpp pick was a 4-bit half-resolution grid. On a smooth 48 stand-in at 160 steps the 2-bit full grid scored 15.264 dB and the 4-bit half grid scored 28.378 dB. An 8-bit grid at the same raw budget stayed near 17 dB, so a raw-bpp tie now prefers 4-bit codes over 2-bit and over 8-bit. The latent jobs also divide the label by 0.5 before that search, because a trained smooth latent kept about half of its packed size (0.53 on that stand-in). `train_max` still uses the old order. Delete `results/train_max_v2/sdk_*.json`, `.ntc`, and `.pt` before the next v2 pass. A finished json is skipped.
+
+A flat 1M batch on a 2048 frame also trains every pixel of mip 1, about 2.44M samples a step. `batch_mip=area` with 262144 pixels draws 262144, 65536, 16384, and so on, about 0.35M samples. On a 64 stand-in at 100 steps the full frame scored 17.039 dB. The area budget at 1/16 of the frame, with the learning rate left at the full-frame step, scored 16.957 dB. Scaling that learning rate by 1/16 scored 16.874 dB. The loss is a mean, so `lr_batch_ref` stays 0. Coarse-to-fine on that stand-in fell under the PCA init (trained 16.140, init 16.854) and stays off. `rd_lambda` is 0 on this path, so nothing in the loss trades rate against distortion.
+
+At a0f9e44 the 256K area batch was applied to every 2048 job. `sdk_MetalPlates013_2K_b5` then scored 11.87 dB at 0.149 bpp (init 10.02). Before that commit the same 2048x2048x2x4 grid, at a flat 1048576 batch, scored 28.84 dB at 2.24 bpp. `b10` (2048x2048x4x4) scored 12.45 dB at 2.58 bpp (init 9.43), down from 31.17 dB at 3.13 bpp. `b2.5` stays on a 1024 grid and scored 31.80 dB at 1.417 bpp. A 262144 sample covers 1/16 of a 2048 latent texel grid and 1/4 of a 1024 grid. The trainer now raises a full-resolution latent to a flat quarter-frame batch (1048576 on a 2048 image). A job whose trained PSNR is within 4 dB of its init is retried once at that batch, and if it is still there the json is left `done` false with `collapsed` true so the queue does not claim it again. Delete `results/train_max_v2/sdk_*_b5.json`, `sdk_*_b10.json`, and `sdk_*_b20.json` (and the matching `.ntc` and `.pt`) from the a0f9e44 run. Those labels select a 2048 grid. Leave the `b2.5` files. The fast path also keeps the best eval when the run uses every step, which is what the eager loop already did.
+
+At 678cd87, with the dense batch, `b5` (`2048x2048x2x4`) scored 29.33 dB at 2.689 bpp and `b10` (`2048x2048x4x4`) scored 33.07 dB at 4.855 bpp. `b2.5` (1024, 4 channels, 4-bit) stayed at 31.80 dB and 1.417 bpp, so the curve dips at `b5`. `b15` was `[(1024, 1024, 12, 8), (512, 512, 12, 8)]` and scored 8.16 dB trained against 10.67 init on the 256K area batch. A 4-bit grid with the same channel count climbed on a 32 stand-in (+2.55 dB) while the 8-bit grid gained 0.56 dB. The search with `min_bits` set now sorts every 4-bit candidate ahead of 8-bit, then packed-bpp error, then a quality score that discounts a finest grid of under 4 channels and discounts a full-resolution channel against a half-resolution one. `b5` becomes `[(1024, 1024, 8, 4), (512, 512, 8, 4)]`. `b15` becomes `[(2048, 2048, 4, 4), (1024, 1024, 12, 4)]`, which takes the flat 1048576 batch. `b2.5`, `b10`, and `b20` keep the grids from 678cd87. An 8-bit grid also forces that flat batch, so the area budget is not the only thing standing between `b15` and the init. `train_max` still uses `min_bits` 0. A worker that is already running keeps the code it imported. A new process claims jobs that are not locked and not `done`.
+
+On the 9070 at b031669, `b5` with that half-resolution 8-channel grid and the 256K area batch scored 11.91 dB against an init of 10.58, then the guard retried a flat 1048576 batch. `b2.5` (4 channels, same 256K area batch) had reached 31.80 dB. A finest grid of 8 or more channels now starts on the flat quarter-frame batch, so that first hour is not spent on a batch that does not move the codes. `b10` alone took 1953 s at 2.35 steps/s. Three workers on this GPU made each job about 3x slower, with no throughput gain. `b10` also recorded `best_val_psnr` 12.67 beside `psnr_u8_trained` 33.07. The loop score is a live forward and the file score is the decoded image. When they differ by more than 1 dB the json reports the file score and keeps the loop value as `best_val_psnr_loop`. On CPU the two scores match.
+
+On the RTX 5070 Laptop (torch 2.11.0+cu128, Windows, commit 989362d, `torch.compile` on) both bf16 and fp32 finished with `psnr_u8`, `psnr_u8_init`, and `psnr_u8_trained` NaN and `best_val_psnr` 100. Fresh fp32 runs were `sdk_PavingStones070_2K_b5` at 0.0116 bpp and `b10` at 0.0208 bpp. `b15` and `b2.5` then finished in seconds by resuming a `trained` checkpoint left from the NaN run (`b2.5` stored 2557 of 2621440 latent bytes). Init was already NaN, so the failure is in the export of the PCA readout, not in the autocast dtype. At 989362d the last-layer fit was an unregularized least squares. A weak hidden column becomes a huge weight. The stored fp16 scale is `amax/127`. Above 65504 that scale is inf, and `inf * 0` in the decoder is NaN. Below about 1e-6 the same scale flushes to 0 and the zero taps are `0/0`. `NaN` cast to uint8 is 0, so the coder writes a near-empty latent. `abs(100 - NaN) > 1` is false, so a loop score of 100 was kept. The readout is ridged, and the scale is clamped into the positive fp16 normal range before the cast. A non-finite loss, parameter, or PSNR raises, and the queue does not write `done` true. A checkpoint with a non-finite weight or Adam moment is deleted and is not resumed. `precision.json` stores `device_name` and `backend`. A file from another device, or an older file with no device key, is probed again.
+
+`sdk_PavingStones070_2K_b2.5` at be455c5, fp32, compiled, was not a NaN and not a divergence. The area pass scored 27.13 dB against an init of 24.73. The 4 dB rule retried a flat quarter frame (7.1 steps/s against 31 on the area batch, which is the 4x sample count). That pass climbed from 26.32 at step 500 to 27.44 at step 3500 and stopped there, loss 0.00439 to 0.00255. The json was then `collapsed` because 27.44 is within 4 dB of 24.73. The stored rate is 3.89 bpp against a 2.5 label because `latent_rate_scale` 0.5 sizes the grid at 5 raw bpp and this latent compressed to 0.78 of its plain size (2039164 of 2621440), not 0.5. A result is now rejected only when trained PSNR is below the init. A gain, including this 2.7 dB, is kept, and the area batch is not retried. A non-finite mip score is -inf, not 100 dB. One non-finite gradient is zeroed and counted; the run fails only after 8 such steps. A collapsed job deletes its checkpoint, and a checkpoint whose step is already at the job length is not resumed. At 25% and 50% of the steps, a score more than 1 dB under the init restores the last good weights, halves the latent learning rate, and resamples once. The final export does the same if the last step is still that far under the init. The bilinear backward sums samples in sorted index order, so two runs with the same seed write the same file on one thread. CUDA still needs the same thread setting for the GEMM. `predict` guards on the sample count. Twelve mips exceed the default recompile limit of 8 at the 16-versus-4 guard, so the limit is raised to cover the pyramid. Those specializations stay static, and the reduce-overhead graph is unchanged.
+
+The same 5 raw-bpp grid stored 1.42 bpp on MetalPlates (ratio about 0.28) and 3.24 bpp on Tiles (ratio about 0.65). A latent job whose `latent_rate_scale` is 0 measures stored/plain on a half-resolution 4-bit PCA latent of that image and searches at label/ratio. One probe is cached per image, so the five labels of a material share it and a higher label does not pick a smaller grid. A process that already built the job list with scale 0.5 keeps 0.5 until it exits. Delete the `sdk_*` json, ntc, and pt before redrawing the curve. New latent jobs add a Laplace rate on codes above the label (`entropy_rate`) and train with uniform noise for 70 percent of the steps, hard codes until 95 percent, then a frozen-latent MLP tail (`quant_schedule`). On a 16 stand-in the file PSNR stays within 0.1 dB of the live loop. A five-label ladder keeps 4000 steps on the lowest label and 2000 on each warm-started label, 12000 steps instead of 20000. If the lower neighbor is missing and a higher one has a trained checkpoint, the lowest label warm-starts downward from that file and keeps its own grid. The latent scale clip is the 0.99 percentile at 4 bits and 0.999 at 8 bits. On three 32x32 sets and three seeds those beat a fixed 0.995 on PSNR minus 0.4 dB per bpp. The readout ridge is unchanged. `src/ntc/ref_int.py` is the integer MLP reference: int8 activations, an int32 dot, and a multiplier-shift requant. Triangle features are the positional encoding on that path. The golden SHA-256 of the fixture layer is `03465ba9b891480ad90041e5c72149b0a9282d61da74923aa534aea69e9645d8`. `FLAG_INT_DECODE` is bit 6. The fp32 decoder ignores it, so old files stay on the float path. Lavapipe byte-identity against that golden is the GPU check below. CMake option `NTC_REQUIRE_DOT4` fails configure when `GL_EXT_integer_dot_product` does not compile. glslang 15.1.0 does not provide `dotPacked4x8EXT`, so the option stays off here and CI only asserts `OpSDot` when the probe succeeded. Pin a glslang that includes Khronos glslang PR 3832 before turning the option on. The rate is the discrete unit-bin likelihood, and on three smooth fields it stays within 3 percent of the range coder. The penalty compares that likelihood times the stored/plain ratio to the label. A raw Laplace near 4 bpp was being compared to the 2.5 file label, which held Tiles135D at 31.7 dB from step 3000 while the file was already 2.21 bpp. `bench/rtxntc_compare.py` writes a per-material table and a BD-rate of ntc against `ntc-cli` on BPPC. The tool is only a baseline. It is not linked into the trainer.
+
+At 6bb5c7e, fp32, `sdk_MetalPlates013_2K_b2.5` measured probe scale 0.397 and selected `[(1024, 1024, 4, 4), (512, 512, 8, 4)]` (raw 6.0 bpp). The file was 2.9265 bpp, 17% over the 2.5 label: the probe is the 4+4 pair, and the extra 4 channels at 512 stored near their raw size, so 6.0 times 0.397 is not the file. Trained PSNR was 28.78 against an init of 30.02, so the export kept the init. That grid's coarse channel count also tripped the dense batch (`finest_ch >= 8` on any grid), which is the flat quarter frame at about 20 steps/s. The 31.80 dB / 1.42 bpp run was the 4+4 grid on the 256K area batch. The coarse mip cap then let the coarse sum equal mip 0. On a 30 dB init that split is enough to leave the PCA codes; a 9-channel 4+8 stand-in drops more than 1 dB before the quarter mark when the cap is 1, and stays above the init with no rewind when the cap is 0.25. The dense batch now keys off the finest lattice's channel count and only when that lattice is half resolution or finer, so 1024x4 plus 512x8 stays on the area batch. An 8-channel lattice at 1024 still uses the flat quarter frame. A 12-channel 512 grid is quarter resolution (512 squared texels fit in the 256K area batch) and stays on that area batch. After the probe selection, the chosen grid is measured. A prediction more than 10% over the label is selected again at that measured ratio. 0.397 then 0.49 returns the 4+4 grid. PavingStones b2.5 at the same commit was scale 0.643, init 5.38, trained 25.32 dB, 2.6826 bpp (7% over). The old point was 27.4 dB at 3.89 bpp. The slope is (27.4 - 25.32) / (3.89 - 2.68) = 1.7 dB per bpp, and the run climbed 20 dB off a weak init. The grid was still the weak part: raw target 3.89 tied a 12-channel 512 grid with a 4-channel 1024 grid, and the quality score preferred the 512 grid. That lattice cannot carry the stone detail, which is why a later run sits near 24.8 dB at the halfway point. A finest grid coarser than half resolution now counts as 0.25 instead of 0.6, so the tie goes to 1024. The process that started on 5a71784 already selected 512 and keeps it. An unstarted job on the next process start uses 1024. The mip uv buffers and the sample-index buffers are marked dynamic before `torch.compile`. `mark_dynamic` inside the compiled frame is rejected, which is why the 65536-versus-16384 guard was a new static specialization until the 16th. Inductor still records one CUDA graph per concrete size, so reduce-overhead stays on. A process that already imported 6bb5c7e keeps that code until it exits. Do not delete its `sdk_*` files while it is running.
+
+`--profile cloud5090` is a separate 2K queue for 32 GB cards. The default `--profile laptop` list is unchanged, including `sdk_*` at 4000/2000 steps and a 262144 area batch. The cloud list is 12 train materials times 10 rates (1, 2, 2.5, 4, 6, 8, 10, 12, 16, 20): 120 jobs, 528000 steps. The first rate is 8000 steps and the rest are 4000 on the warm-started chain. Labels from 10 up train their own lattice, fitted at 1.15 times the label, from scratch for 8000 steps, since a lattice grown from b1 capped near 5 bpp and b10 and b20 landed at 3.4 to 4.6. A lower label whose grown lattice cannot reach 95 percent of its rate does the same. The batch is 2097152 flat. `quant_freeze_at` is 0.90 (a 10 percent MLP tail). The seed pool is 3 with a halving every 500 steps. bf16 versus fp32 is still the equal-wall probe, now 800 steps on this profile. TF32 stays off. One process per GPU: do not add `--workers` on the same card. Held-out, downloaded and not trained: Leather011, LeafSet017 (opacity), Gravel022. The hour budget is 720000 steps (528000 plus 4000 more on each of the 48 jobs from b10 up) times 1.25 seed factor divided by 20 steps/s, 12.5 GPU-hours. That 20 steps/s is the 5070's 1M rate used as a ceiling for a 2M batch, not a measured 5090 number. Five pods at that rate are about 1.8 hours of wall time. The live 5090 queue on c021608 measured about 7 steps/s on a 2K b1 job and 1.93 steps/s on MetalPlates013 b16. At those rates the 528000-step queue is on the order of 40 to 45 GPU-hours (about 8 to 9 hours of wall time on five cards) if step time grows with the label between those two points, and about 76 GPU-hours if every job is as slow as b16. The printed steps/s already counts a stacked seed step, so that range does not apply the 1.25 factor again. The CPU latent-rate probe between jobs left the GPU idle: a full-file Python range code of a 1024-wide grid took 8 to 14 minutes on one core. The probe now thins the PCA codes to 32 KB and fits every cloud label once per material. On a 2048 image that pass was 7.68 s for ten labels.
+
+```bash
+# each Runpod pod, shard 0/5 through 4/5
+bash bench/cloud/setup_pod.sh 0/5
+python bench/cloud/collect_results.py --inputs pod0 pod1 pod2 pod3 pod4 --out results/cloud5090/merged
+```
+
+On 27cbd68, fp32, `sdk_PavingStones070_2K_b2.5` logged 25.26 dB at step 4000. The file scored 10.32 dB, under the 23.04 init, at batch 1048576, so the init was kept (23.04 dB, 1.91 bpp) and the json was left `done` false. That batch is the flat quarter frame. A 12-channel 512 grid was taking it because the channel test ignored resolution. The loop and the decoded file on a flat quarter frame of a quarter-resolution grid now stay within 0.25 dB. When they still differ by more than 1 dB and the loop is at or above the init, the init does not replace the weights and the checkpoint is kept. `sdk_MetalPlates013_2K_b2.5` on the same run was 35.39 dB at 2.79 bpp. The PCA scale near 0.40 kept `0.40 * Laplace` under the 2.5 label, so the penalty never turned on. Every 500 steps the trainer measures stored/plain on the current codes and moves the ratio halfway toward that measurement, not below the PCA floor and not above 0.95. Two such updates on a 5 bpp Laplace at 2.79 bpp put the penalty over 2.5. Tiles at scale 0.511 with a file under the label does not move. A finished point can still sit inside the 10% grid-selection band (`RATE_OVERSHOOT`); the penalty only removes excess above the label. The 27cbd68 process keeps the code it imported. Do not stop it, and do not delete its `sdk_*` files while it is running. After it exits, PavingStones b2.5 is `done` false and the next start trains it again. MetalPlates b2.5 stays at 2.79 bpp until that json, ntc, and pt are removed.
+
+Items 11 to 15 do not change the PyTorch loop the 5a71784 queue imported. Crop batches run only when `batch_mip` is `crop`. The Vulkan trainer is not imported by `train_max_v2`. The half-resolution tie break changes an unstarted job's grid on the next process start. The in-flight PavingStones job keeps the 512 grid it already selected.
+
+```powershell
+# RTX 5070 Laptop, Windows, .venv-cuda
+$env:PYTHONPATH = "src;."
+cmake -S . -B build
+cmake --build build --target ntc_vk
+python -m pytest tests/test_coopmat_i8.py tests/test_subgroup_size.py tests/test_vk_train.py tests/test_tile_bc7.py tests/test_score_mips.py -q
+.\build\ntc_vk.exe path\to\file.ntc build\shaders --bench results\hw\rtx5070
+```
+
+```bash
+# RX 9070, Linux
+cmake -S . -B build -G Ninja
+cmake --build build --target ntc_vk
+PYTHONPATH=src:. python -m pytest tests/test_coopmat_i8.py tests/test_subgroup_size.py tests/test_vk_train.py tests/test_tile_bc7.py tests/test_score_mips.py -q
+./build/ntc_vk path/to/file.ntc build/shaders --bench results/hw/rx9070
+```
+
+Rows to read: `sample_coopmat_i8_*`, `subgroup_size_range`, `subgroup_size_control`, `float32_denorm_flush`, `sample_coopmat_*`. `ntc_tile_bc7.comp` is the mode-6 feedback kernel. It is not on the RGBA8 tile path.
+
+```powershell
+# RTX 5070 Laptop, Windows, .venv-cuda
+$env:PYTHONPATH = "src;."
+python bench/download_materials.py --preset rtxntc --dest data/materials
+python bench/rtxntc_compare.py --materials data/materials --ntc-cli C:\path\to\ntc-cli.exe --steps 4000 --repeats 3 --out results/rtxntc_compare/rtx5070
+```
+
+```bash
+# RX 9070, WSL ROCm. ntc-cli is the NVIDIA tool, so this machine records the ntc side only.
+HSA_ENABLE_DXG_DETECTION=1 PYTHONPATH=src python bench/rtxntc_compare.py --materials data/materials --skip-rtx --steps 4000 --out results/rtxntc_compare/rx9070
+```
+
+
+`sdk_MetalPlates013_2K_b15` at b031669 is `[(2048, 2048, 4, 4), (1024, 1024, 12, 4)]`. The first pass already printed `fullres batch 262144 area -> 1048576 flat` and then `near init sdk_MetalPlates013_2K_b15 trained 11.70 init 13.57, retry flat 1048576`. The dense batch ran. The file ended 1.87 dB under its own init. On a 32 checker the mip-1 term of that 4+12 grid was 0.047 against a mip-0 term of 0.00094, because a ReLU of box-filtered features is not the box of the network. The 4+4 grid's coarse terms were already smaller than mip 0, and that file reached 33.07 dB. The fast path now keeps the sum of the coarser mip terms from exceeding the finest term, so a 12-mip loss cannot drag the step off the mip-0 fit. Latent Adam uses eps 1e-15 and beta2 0.99. A mean loss at 2048 leaves per-texel gradients near 1e-10, and the default eps of 1e-8 was keeping only a few percent of the learning rate. MLP weights stay at eps 1e-8 and beta2 0.999. At step 200 the same stand-in stays near the init instead of 11 dB under it. The export still keeps the better file of the last step and of the best loop eval, then the init when that file is higher. The retry compares the batch the trainer used. A pass that already used 1048576 and is still under the init is `collapsed` and is not trained again. `b5` at 33.45 dB beat `b10` at 33.07 dB. A higher label that finishes under a cheaper sibling of the same material is retrained once on that sibling's grid with more channels, warm-started from the cheaper checkpoint when it was the trained file, so step 0 matches the cheaper PSNR. The queue claims equal-cost jobs lowest bitrate first. Progress lines are `timestamp name step/total steps/s loss psnr eta`, every 100 steps, with PSNR every 500. A job prints start and finish with wall time. `compile_step=auto` uses `reduce-overhead` on CUDA, including Windows NVIDIA. Windows ROCm cannot `torch.compile`. The RX 9070 eager rate was 2.35 steps/s and the RTX 5070 `reduce-overhead` rate was 19.99, so that platform captures a HIP graph instead and writes the learning rate before each replay. Triton remains an optional gather where it loads. It is not the ROCm path. The in-house order-1 and 256-context range coders, the mode-6 BC7 packer, and Pillow stay. None of those was the measured training limit. On an RTX 5070 Laptop that mode was 19.99 steps/s, default compile 19.57, eager 3.94. If reduce-overhead runs out of memory the step retries the default compile mode. `TRITON_DEFAULT_FP_FUSION=1` is set before Triton imports. An 8 GB card caps the batch so the gather stays under the device with about 1.2 GB free. `b15` at 1048576 was about 6.5 GB. `bench/train_2k_speed.py` runs each mode in its own process. A CUDA graph samples from buffers filled outside the capture, because `torch.randint` during capture raises `Offset increment outside graph capture`. Delete `sdk_*_2K_b15` and `sdk_*_2K_b20` (json, ntc, and pt) after the in-flight process exits if they landed within 4 dB of the init. Leave `b2.5` and a `b10` that is already above `b5`. A `b10` under `b5` is retrained by the new process.
+
+`bench/setup_wsl_rocm.sh` installs ROCm 7.2 userspace in Ubuntu 24.04 WSL. `amdgpu-install --usecase=wsl` is rejected on 7.2 (`Usecase implementation 'wsl' is not supported or invalid`). The script runs `amdgpu-install -y --usecase=rocm --no-dkms`, then installs `rocdxg-roct_1.2.2_amd64.deb` from the librocdxg v1.2.2 release and sets `HSA_ENABLE_DXG_DETECTION=1`. Torch is `pip install torch==2.9.1 torchvision==0.24.0 torchaudio==2.9.0 --index-url https://download.pytorch.org/whl/rocm6.4`. That index also has `pytorch-triton-rocm==3.5.1`. A direct torch wheel URL downloads 4.4 GB and then fails the triton pin, because PyPI does not host it. `https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2` is not a pip index. The install is skipped when the venv already has torch 2.9.1+rocm, and a nonzero pip status exits the script. After the wheel install the script deletes `torch/lib/libhsa-runtime64.so*` so the system libhsa, which loads librocdxg, is used. It does not change the Windows host driver. The venv is `.venv-wsl`. The script sets `HSA_ENABLE_DXG_DETECTION=1` before each `import torch`, and the run command does the same before `python` starts. `torch.cuda.is_available()` stays false under WSL if that variable is set after the import. It prints `torch.cuda.is_available()` and the device name. On Linux CUDA/ROCm, `compile_step=auto` uses `torch.compile(..., mode="reduce-overhead")` and reports `cuda_graph` true when that mode is active. If compile fails, the step tries a manual HIP graph. A Triton bilinear gather is used only after its first CUDA call matches the eager gather. CPU stays on the eager path.
+
+`results/train_speed/cpu.json` is a 32x32, 8-step run on this CPU (torch 2.14.1+cpu). Eager and fast one-model PSNR both 17.709 dB. One-model wall 0.031 s versus 0.027 s (1.16x). Inner steps/s 471 versus 518. A pool of 4 seeds: 0.122 s versus 0.035 s (3.48x). `gpu_idle_fraction` is null. `launch_cpu_fraction` is 0 because the CPU profiler has no CUDA launch keys. The top self-CPU ops were `aten::_to_copy`, `aten::index`, and `Adam.step`.
+
+Step count is a separate measurement. `bench/train_speed.py --ablate` trains until an 8-bit PSNR target, or until `--ablate-steps`, and keeps an idea only when it reaches the target and its train time is under 90% of the fast-path baseline. On the 24x24 CPU probe (`results/train_speed/ablation_cpu.json`, target 24.43 dB) the baseline stopped at 16 steps, 0.029 s. Warm-start fine-tune, frozen decoder, analytic latent projection, coarse-to-fine, one-cycle, warmup cosine at 3x peak LR, latent LR x8, diagonal shampoo, late QAT, importance sampling, and plateau checks did not clear that bar. Lion reached the target in 4 steps on that image and missed a higher target on one of three repeat images, so it stays behind `optimizer=lion` and is not the v2 default. Successive halving of a 4-seed pool reached the target in 12 steps and 0.026 s, against 24 steps and 0.054 s with halving off. Halving was already the fast-path behavior for `seed_pool > 1`. `train_max_v2` still uses it.
+
+The shared MLP prior is `src/ntc/priors/decoder_small.pt` (3 channels, 4 latent channels, hidden 16) and `src/ntc/priors/decoder_g16.pt` (9 channels, 6 latent channels, hidden 32). Both were trained by `bench/pretrain_decoder.py` at seed 0 on eight procedural images, because this tree has no CC0 checkout. Pass `--materials data/materials` on a machine that has the manifests and the script uses those folders instead.
+
+Two machines share one queue directory. `bench/train_queue.py enqueue --demo` writes `pending/demo-synthetic.json`. `work --worker amd-desktop` and `work --worker nvidia-laptop` claim by atomic rename into `running/<worker>/`. `merge` writes `merged.json` from `done/`. A job left in `running/` longer than `--steal-after-s` goes back to `pending`. The queue does not read or write `results/train_max`.
+
+```powershell
+python bench/pretrain_decoder.py --preset small --out src/ntc/priors/decoder_small.pt
+python bench/pretrain_decoder.py --preset g16 --out src/ntc/priors/decoder_g16.pt
+python bench/train_speed.py --ablate --ablate-steps 24 --prior src/ntc/priors/decoder_small.pt --out results/train_speed/ablation_rx9070.json
+python bench/train_queue.py enqueue --out \\share\train_queue --demo
+python bench/train_queue.py work --worker amd-desktop --out \\share\train_queue
+python bench/train_queue.py work --worker nvidia-laptop --out \\share\train_queue
+python bench/train_queue.py merge --out \\share\train_queue
+```
 
 ## Limitations
 
-The 10 bpp point loses to ASTC 8x8 on metal_plate. The 16 bpp point loses to ASTC 6x6 and to per-texture BC7. A single fp16 scale per latent channel has no spatial endpoints. Derived mips are a box filter, not a second trained pyramid. Inference-on-load writes fp32. Transcode to BC7 or BC5 is host-side through bc7enc. There is no portable GPU BC7 encoder in this tree. The seed pool trains four copies of the chosen grid.
+The 40-step deflated network beats ASTC 8x8 on metal_plate and on PavingStones070 and still loses to ASTC 6x6 and to per-texture BC7. The 4000-step footprint points on the RX 9070 are 38.81 dB at 11.49 bpp (metal) and 33.92 dB at 11.99 bpp (paving), against ASTC 6x6 at 38.28 dB and 33.73 dB, both at 17.78 bpp. The dedicated 10 bpp grids at 2000 steps are still under ASTC 8x8. Per-tile endpoints are not in the C++ or GLSL decoder. Derived mips are a box filter of the latent; footprint loss changes the trained values, not the filter. Inference-on-load writes fp32. The screenshot BC7 encoder is mode 6 in `bench/bc_pack.py` and is not the `bc7enc` used for the rate table. The seed pool trains four copies of the chosen grid. The GPU sweep trains eight. The 4K sample pass is documented above. It is not the RTX 4090 fragment timing from Vaidyanathan et al. 2023.
 
 ## Prior work
 
@@ -399,9 +844,10 @@ RTXNTC: https://github.com/NVIDIA-RTX/RTXNTC . License is the NVIDIA RTX SDKs li
 | `src/ntc` | encoder, container, reference decoder, metrics |
 | `cpp` | C++20 reader and reference decoder |
 | `shaders` | GLSL library and entry points |
-| `examples` | Vulkan 1.3 and OpenGL hosts |
-| `bench` | block codecs, ablations, GPU script |
+| `examples` | Vulkan 1.3 host, OpenGL host, realtime viewer |
+| `bench` | block codecs, ablations, `train_sweep`, `run_all`, GPU report |
 | `third_party/expcode` | vendored bf16 exponent codec, not on the decode path |
+| `third_party/puff` | puff 2.3, inflate of raw deflate latents. The header in `puff.h` is the copyright. |
 
 Pieces that can be split later without changing the format: the NTC1 container and loader, the GLSL decode library, the group quantizer (it could move into weight-quantizer), and the CPU reference decoder.
 

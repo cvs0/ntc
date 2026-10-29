@@ -1,0 +1,124 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_memory_scope_semantics : require
+// Two subgroups of 32. Each owns 16 pixels. The host asks for subgroup 32.
+layout(local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+#include "ntc_decode.glsl"
+
+layout(set = 0, binding = 6) buffer Scratch {
+    int8_t bytes[4096];
+    int acc[512];
+};
+
+shared int8_t sA[2 * 256];
+shared int8_t sB[2 * 256];
+shared int sC[2 * 256];
+shared float sFeat[2 * 16 * 160];
+
+int8_t ntc_q8(float v) {
+    int q = int(round(v * 127.0));
+    if (q < -127) q = -127;
+    if (q > 127) q = 127;
+    return int8_t(q);
+}
+
+void main() {
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint pix0 = (gl_WorkGroupID.x * 2u + sg) * 16u;
+    if (lane < 16u && pix0 + lane < g_pc.z * g_pc.w) {
+        uint pix = pix0 + lane;
+        uint x = pix % g_pc.z;
+        uint y = pix / g_pc.z;
+        vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(float(g_pc.z), float(g_pc.w));
+        ntc_features(uv, 0);
+        for (int k = 0; k < 160; ++k) {
+            float v = k < g_nfeat ? g_feat[k] : 0.0;
+            sFeat[(sg * 16u + lane) * 160u + uint(k)] = v;
+        }
+    }
+    barrier();
+    uvec4 a0 = g_desc[12u];
+    int inn = int(a0.x);
+    int out0 = int(a0.y);
+    uint woff = a0.z;
+    uint bits = g_desc[16u].w;
+    uint sbase = sg * 256u;
+    for (int o0 = 0; o0 < out0; o0 += 16) {
+        for (int k0 = 0; k0 < max(inn, 1); k0 += 16) {
+            if (lane == 0u) {
+                for (int o = 0; o < 16; ++o) {
+                    for (int k = 0; k < 16; ++k) {
+                        int w = 0;
+                        if (o0 + o < out0 && k0 + k < inn) {
+                            w = int(ntc_weight(woff, o0 + o, k0 + k, inn, bits));
+                        }
+                        sA[sbase + uint(o * 16 + k)] = int8_t(w);
+                    }
+                }
+                for (int p = 0; p < 16; ++p) {
+                    for (int k = 0; k < 16; ++k) {
+                        float v = 0.0;
+                        if (k0 + k < inn) v = sFeat[(sg * 16u + uint(p)) * 160u + uint(k0 + k)];
+                        sB[sbase + uint(k * 16 + p)] = ntc_q8(v);
+                    }
+                }
+            }
+            barrier();
+            uint byte_base = sg * 512u;
+            uint acc_base = sg * 256u;
+            if (lane == 0u) {
+                for (int i = 0; i < 256; ++i) {
+                    bytes[byte_base + uint(i)] = sA[sbase + uint(i)];
+                    bytes[byte_base + 256u + uint(i)] = sB[sbase + uint(i)];
+                    acc[acc_base + uint(i)] = 0;
+                }
+            }
+            barrier();
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseA> matA;
+            coopmat<int8_t, gl_ScopeSubgroup, 16, 16, gl_MatrixUseB> matB;
+            coopmat<int, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC;
+            coopMatLoad(matA, bytes, byte_base, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matB, bytes, byte_base + 256u, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matC, acc, acc_base, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            matC = coopMatMulAdd(matA, matB, matC);
+            coopMatStore(matC, acc, acc_base, 16u, gl_CooperativeMatrixLayoutRowMajor);
+            barrier();
+            if (lane == 0u) {
+                for (int i = 0; i < 256; ++i) sC[sbase + uint(i)] = acc[acc_base + uint(i)];
+            }
+            barrier();
+            if (lane < 16u && k0 == 0) {
+                for (int o = 0; o < 16 && o0 + o < out0; ++o) g_ha[o0 + o] = 0.0;
+            }
+            barrier();
+            if (lane < 16u) {
+                for (int o = 0; o < 16 && o0 + o < out0; ++o) {
+                    g_ha[o0 + o] += float(sC[sbase + uint(o * 16 + int(lane))]) / 127.0;
+                }
+            }
+            barrier();
+        }
+        if (lane < 16u) {
+            for (int o = 0; o < 16 && o0 + o < out0; ++o) {
+                g_ha[o0 + o] += ntc_f16(a0.w + uint(o0 + o) * 2u);
+                g_ha[o0 + o] = ntc_activate(g_ha[o0 + o], g_desc[1].y, (g_desc[2].x & 2u) != 0u);
+            }
+        }
+        barrier();
+    }
+    if (lane < 16u && pix0 + lane < g_pc.z * g_pc.w) {
+        uint nlayers = g_desc[1].x;
+        for (uint li = 1u; li < nlayers; ++li) ntc_layer(li, int(g_desc[12u + li].x));
+        if (nlayers == 1u) {
+            for (int o = 0; o < out0 && o < 16; ++o) g_y[o] = g_ha[o];
+        }
+        uint ch = g_desc[0].z;
+        uint pix = pix0 + lane;
+        uint idx = pix * ch;
+        for (uint i = 0u; i < ch; ++i) g_outimg[idx + i] = g_y[i];
+    }
+}

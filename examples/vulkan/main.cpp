@@ -4,10 +4,13 @@
 // Cooperative matrix is queried and not used: one texel does not fill a tile.
 // Subgroup size is read from the device, never assumed.
 
+#include "bench.hpp"
 #include "ntc/ntc.hpp"
 
 #include <vulkan/vulkan.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -96,12 +99,33 @@ static float max_abs(const std::vector<float>& a, const std::vector<float>& b) {
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::cerr << "usage: ntc_vk file.ntc shader_dir\n";
+        std::cerr << "usage: ntc_vk file.ntc shader_dir [--device index|name] [--bench outdir]\n"
+                     "       [--warmup N] [--iters N] [--bc7 file] [--bc1 file] [--bc5 file]\n";
         return 2;
     }
     try {
         const std::string ntc_path = argv[1];
         const std::string dir = argv[2];
+        std::string device_spec;
+        std::string bench_dir;
+        std::string bc7_path, bc1_path, bc5_path;
+        int warmup = 8;
+        int iters = 20;
+        for (int i = 3; i < argc; ++i) {
+            const std::string a = argv[i];
+            auto need = [&](const char* flag) {
+                if (i + 1 >= argc) throw std::runtime_error(std::string("missing value for ") + flag);
+                return std::string(argv[++i]);
+            };
+            if (a == "--device") device_spec = need("--device");
+            else if (a == "--bench") bench_dir = need("--bench");
+            else if (a == "--warmup") warmup = std::stoi(need("--warmup"));
+            else if (a == "--iters") iters = std::stoi(need("--iters"));
+            else if (a == "--bc7") bc7_path = need("--bc7");
+            else if (a == "--bc1") bc1_path = need("--bc1");
+            else if (a == "--bc5") bc5_path = need("--bc5");
+            else throw std::runtime_error("unknown arg " + a);
+        }
         ntc::TextureSet ts = ntc::load_file(ntc_path);
         auto cpu = ntc::decode_mip(ts, 0);
         auto up = ntc::make_gpu_upload(ts, 0, ntc::kFilterPoint, 4);
@@ -122,21 +146,54 @@ int main(int argc, char** argv) {
         CHECK(vkEnumeratePhysicalDevices(instance, &ndev, nullptr));
         std::vector<VkPhysicalDevice> devs(ndev);
         CHECK(vkEnumeratePhysicalDevices(instance, &ndev, devs.data()));
-        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        std::cout << "device_count " << ndev << "\n";
+        int chosen = -1;
+        bool spec_is_index = !device_spec.empty() &&
+                             std::all_of(device_spec.begin(), device_spec.end(),
+                                         [](unsigned char ch) { return std::isdigit(ch) != 0; });
         int best = -1;
-        for (auto d : devs) {
+        for (uint32_t i = 0; i < ndev; ++i) {
             VkPhysicalDeviceProperties p{};
-            vkGetPhysicalDeviceProperties(d, &p);
+            vkGetPhysicalDeviceProperties(devs[i], &p);
+            std::cout << "device_list " << i << " name " << p.deviceName << " vendor 0x" << std::hex << p.vendorID
+                      << " device 0x" << p.deviceID << std::dec << " type " << p.deviceType << "\n";
+            if (spec_is_index && std::stoi(device_spec) == static_cast<int>(i)) chosen = static_cast<int>(i);
+            if (!device_spec.empty() && !spec_is_index) {
+                std::string name = p.deviceName;
+                std::string needle = device_spec;
+                auto lower = [](std::string s) {
+                    for (char& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    return s;
+                };
+                if (lower(name).find(lower(needle)) != std::string::npos) chosen = static_cast<int>(i);
+            }
             int score = 0;
             if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 3;
             else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 2;
             else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) score = 1;
-            if (score > best) {
-                best = score;
-                phys = d;
+            if (score > best) best = score;
+        }
+        VkPhysicalDevice phys = VK_NULL_HANDLE;
+        if (chosen >= 0) {
+            phys = devs[static_cast<uint32_t>(chosen)];
+        } else if (device_spec.empty()) {
+            best = -1;
+            for (uint32_t i = 0; i < ndev; ++i) {
+                VkPhysicalDeviceProperties p{};
+                vkGetPhysicalDeviceProperties(devs[i], &p);
+                int score = 0;
+                if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) score = 3;
+                else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) score = 2;
+                else if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) score = 1;
+                if (score > best) {
+                    best = score;
+                    chosen = static_cast<int>(i);
+                    phys = devs[i];
+                }
             }
         }
         if (!phys) throw std::runtime_error("no device");
+        std::cout << "device_index " << chosen << "\n";
 
         VkPhysicalDeviceProperties props{};
         vkGetPhysicalDeviceProperties(phys, &props);
@@ -151,9 +208,11 @@ int main(int argc, char** argv) {
         vkEnumerateDeviceExtensionProperties(phys, nullptr, &next, exts.data());
         bool has_coop = false;
         bool has_f16ext = false;
+        bool has_coopvec = false;
         for (const auto& e : exts) {
             if (std::strcmp(e.extensionName, VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME) == 0) has_coop = true;
             if (std::strcmp(e.extensionName, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) == 0) has_f16ext = true;
+            if (std::strcmp(e.extensionName, "VK_NV_cooperative_vector") == 0) has_coopvec = true;
         }
         VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
         VkPhysicalDeviceShaderFloat16Int8Features f16q{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
@@ -169,13 +228,35 @@ int main(int argc, char** argv) {
         const bool float16 = f16q.shaderFloat16 == VK_TRUE;
         const bool int8 = f16q.shaderInt8 == VK_TRUE;
         const bool coop = has_coop && cm.cooperativeMatrix == VK_TRUE;
+        const bool coopvec = has_coopvec;
         const bool cpu_dev = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
 
+        std::cout << "device_name " << props.deviceName << "\n";
+        std::cout << "vendor_id 0x" << std::hex << props.vendorID << "\n";
+        std::cout << "device_id 0x" << props.deviceID << std::dec << "\n";
+        std::cout << "driver_raw " << props.driverVersion << "\n";
+        std::cout << "api_version " << VK_VERSION_MAJOR(props.apiVersion) << "."
+                  << VK_VERSION_MINOR(props.apiVersion) << "." << VK_VERSION_PATCH(props.apiVersion) << "\n";
+        VkPhysicalDeviceFloatControlsProperties fctl{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
+        VkPhysicalDeviceVulkan13Properties v13p{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_PROPERTIES};
+        fctl.pNext = &v13p;
+        VkPhysicalDeviceProperties2 pfloat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        pfloat.pNext = &fctl;
+        vkGetPhysicalDeviceProperties2(phys, &pfloat);
+        std::cout << "subgroup_size " << sg.subgroupSize << "\n";
+        std::cout << "subgroup_size_range " << v13p.minSubgroupSize << " " << v13p.maxSubgroupSize << "\n";
+        std::cout << "subgroup_size_control " << v13q.subgroupSizeControl
+                  << " required_stages " << v13p.requiredSubgroupSizeStages << "\n";
+        std::cout << "float32_denorm_flush " << fctl.shaderDenormFlushToZeroFloat32
+                  << " denorm_preserve " << fctl.shaderDenormPreserveFloat32
+                  << " rte " << fctl.shaderRoundingModeRTEFloat32
+                  << " rtz " << fctl.shaderRoundingModeRTZFloat32 << "\n";
+        std::cout << "timestamp_period_ns " << props.limits.timestampPeriod << "\n";
         std::cout << "device " << props.deviceName << " vendor 0x" << std::hex << props.vendorID << std::dec
                   << " type " << props.deviceType << " api " << VK_VERSION_MAJOR(props.apiVersion) << "."
                   << VK_VERSION_MINOR(props.apiVersion) << " driver " << props.driverVersion
                   << " subgroup " << sg.subgroupSize << " float16 " << float16 << " int8 " << int8
-                  << " coopmat " << coop << " cpu " << cpu_dev << "\n";
+                  << " coopmat " << coop << " coopvec " << coopvec << " cpu " << cpu_dev << "\n";
 
         uint32_t nq = 0;
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, nullptr);
@@ -183,11 +264,23 @@ int main(int argc, char** argv) {
         vkGetPhysicalDeviceQueueFamilyProperties(phys, &nq, qf.data());
         uint32_t qfam = 0;
         bool found_q = false;
+        bool graphics_q = false;
         for (uint32_t i = 0; i < nq; ++i) {
-            if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+            const auto flags = qf[i].queueFlags;
+            if ((flags & VK_QUEUE_GRAPHICS_BIT) && (flags & VK_QUEUE_COMPUTE_BIT)) {
                 qfam = i;
                 found_q = true;
+                graphics_q = true;
                 break;
+            }
+        }
+        if (!found_q) {
+            for (uint32_t i = 0; i < nq; ++i) {
+                if (qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+                    qfam = i;
+                    found_q = true;
+                    break;
+                }
             }
         }
         if (!found_q) throw std::runtime_error("no compute queue");
@@ -200,10 +293,23 @@ int main(int argc, char** argv) {
 
         VkPhysicalDeviceShaderFloat16Int8Features f16{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES};
         f16.shaderFloat16 = float16 ? VK_TRUE : VK_FALSE;
-        f16.shaderInt8 = VK_FALSE;
+        f16.shaderInt8 = int8 ? VK_TRUE : VK_FALSE;
+        VkPhysicalDeviceCooperativeMatrixFeaturesKHR cm_on{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR};
+        cm_on.cooperativeMatrix = coop ? VK_TRUE : VK_FALSE;
         VkPhysicalDeviceVulkan13Features v13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
         v13.dynamicRendering = v13q.dynamicRendering;
-        v13.pNext = has_f16ext ? static_cast<void*>(&f16) : nullptr;
+        v13.subgroupSizeControl = v13q.subgroupSizeControl;
+        v13.computeFullSubgroups = v13q.computeFullSubgroups;
+        void* feat_tail = nullptr;
+        if (has_f16ext) {
+            f16.pNext = feat_tail;
+            feat_tail = &f16;
+        }
+        if (coop) {
+            cm_on.pNext = feat_tail;
+            feat_tail = &cm_on;
+        }
+        v13.pNext = feat_tail;
         VkPhysicalDeviceFeatures2 feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
         feat.pNext = &v13;
         feat.features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
@@ -349,6 +455,38 @@ int main(int argc, char** argv) {
             return 1;
         }
 
+        auto run_extra = [&](const std::string& path, const char* label, float tol) {
+            std::ifstream probe(path);
+            if (!probe) return;
+            VkShaderModule extra = shader_mod(dev, path);
+            stage.module = extra;
+            cpi.stage = stage;
+            VkPipeline px = VK_NULL_HANDLE;
+            CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &px));
+            CHECK(vkResetCommandBuffer(cmd, 0));
+            CHECK(vkBeginCommandBuffer(cmd, &begin));
+            vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, px);
+            vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pl, 0, 1, &set, 0, nullptr);
+            vkCmdPushConstants(cmd, pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, pc);
+            vkCmdDispatch(cmd, (w + 7) / 8, (h + 7) / 8, 1);
+            vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &mb,
+                                 0, nullptr, 0, nullptr);
+            CHECK(vkEndCommandBuffer(cmd));
+            CHECK(vkQueueSubmit(queue, 1, &si, VK_NULL_HANDLE));
+            CHECK(vkQueueWaitIdle(queue));
+            std::vector<float> got(cpu.size());
+            std::memcpy(got.data(), outb.mapped, static_cast<size_t>(out_bytes));
+            const float e = max_abs(cpu, got);
+            std::cout << label << " " << e << "\n";
+            vkDestroyPipeline(dev, px, nullptr);
+            vkDestroyShaderModule(dev, extra, nullptr);
+            if (e > tol) {
+                std::cerr << label << " mismatch\n";
+                throw std::runtime_error(label);
+            }
+        };
+        run_extra(dir + "/ntc_decompress_stage.comp.spv", "stage_max_abs", 1e-3f);
+
         if (float16) {
             const std::string fp16_path = dir + "/ntc_decompress_fp16.comp.spv";
             std::ifstream probe(fp16_path);
@@ -374,9 +512,20 @@ int main(int argc, char** argv) {
                 std::cout << "fp16_max_abs " << max_abs(cpu, g16) << "\n";
                 vkDestroyPipeline(dev, p16, nullptr);
                 vkDestroyShaderModule(dev, m16, nullptr);
+                // fp16 dots are not bit-exact. The staged fp16 path must stay in
+                // the same band as the unstaged fp16 path. The 256 metal latent
+                // measured 0.00293 on both.
+                const float fp16_tol = ts.act_int8() ? 0.25f : 5e-3f;
+                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", fp16_tol);
             }
         }
 
+        if (!bench_dir.empty()) {
+            run_vk_bench(dev, phys, queue, qfam, ts, up, float16, cpu_dev, dir, bench_dir, warmup, iters, bc7_path,
+                         bc1_path, bc5_path);
+            run_vk_speed(dev, phys, queue, qfam, graphics_q, int8, coop, coopvec, ts, up, cpu_dev, dir, warmup, iters,
+                         bc7_path);
+        }
         std::cout << "ok\n";
         vkDestroyQueryPool(dev, qpool, nullptr);
         vkDestroyCommandPool(dev, cpool, nullptr);

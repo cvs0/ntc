@@ -7,4 +7,10 @@ __pycache__/
 data/
 results/*.ntc
 results/*.png.tmp
+results/train_sweep/
+results/train_max/
+results/hw/
+results/hw_encode/
+screenshots/
 .DS_Store
+tools/

@@ -1,0 +1,465 @@
+{
+  "os": "Windows-11-10.0.26300-SP0",
+  "cpu": "AMD64 Family 25 Model 97 Stepping 2, AuthenticAMD",
+  "machine": "AMD64",
+  "python": "3.12.10",
+  "software": false,
+  "gpu": {
+    "name": "AMD Radeon RX 9070",
+    "vendor_id": "0x1002",
+    "device_id": "0x7550",
+    "driver": "8389024",
+    "api": "1.4.359",
+    "subgroup_size": "64",
+    "timestamp_period_ns": "10"
+  },
+  "opengl": {
+    "vendor": "ATI Technologies Inc.",
+    "renderer": "AMD Radeon RX 9070",
+    "version": "4.6.0 Core Profile Context 26.10.1.261008",
+    "subgroup": "64"
+  },
+  "rtxntc": {
+    "available": false,
+    "reason": "ntc-cli is not on PATH. Compression in NVIDIA-RTX/RTXNTC requires an NVIDIA Turing-or-newer GPU and CUDA. Decompression of an existing file can pass --no-coopVec. This run did not invoke it."
+  },
+  "astc": {
+    "available": false,
+    "reason": "astcenc is not on PATH. ASTC screenshot panels are skipped. The rate table still uses the earlier astcenc 5.7.0 numbers."
+  },
+  "bc_encoder": "bc_pack.py BC7 mode 6, BC1, BC5. Not bc7enc.",
+  "warmup": 8,
+  "iters": 30,
+  "runs": [
+    {
+      "material": "metal_plate",
+      "api": "vulkan",
+      "returncode": 0,
+      "timings": [
+        {
+          "name": "load_fp32",
+          "raw": "bench load_fp32 median_ms 0.16036 p95_ms 0.165 texels_s 5.44899e+08 gb_s 19.6164",
+          "median_ms": 0.16036,
+          "p95_ms": 0.165,
+          "texels_s": 544899000.0,
+          "gb_s": 19.6164
+        },
+        {
+          "name": "load_fp16",
+          "raw": "bench load_fp16 median_ms 0.16512 p95_ms 0.16808 texels_s 5.29191e+08 gb_s 19.0509",
+          "median_ms": 0.16512,
+          "p95_ms": 0.16808,
+          "texels_s": 529191000.0,
+          "gb_s": 19.0509
+        },
+        {
+          "name": "sample_native_fp32",
+          "raw": "bench sample_native_fp32 median_ms 0.11988 p95_ms 0.12204 texels_s 5.4668e+08 gb_s 19.6805",
+          "median_ms": 0.11988,
+          "p95_ms": 0.12204,
+          "texels_s": 546680000.0,
+          "gb_s": 19.6805
+        },
+        {
+          "name": "sample_1920x1080_fp32",
+          "raw": "bench sample_1920x1080_fp32 median_ms 2.86832 p95_ms 2.87564 texels_s 7.22932e+08 gb_s 26.0255",
+          "median_ms": 2.86832,
+          "p95_ms": 2.87564,
+          "texels_s": 722932000.0,
+          "gb_s": 26.0255
+        },
+        {
+          "name": "sample_3840x2160_fp32",
+          "raw": "bench sample_3840x2160_fp32 median_ms 11.2448 p95_ms 11.2531 texels_s 7.37624e+08 gb_s 26.5544",
+          "median_ms": 11.2448,
+          "p95_ms": 11.2531,
+          "texels_s": 737624000.0,
+          "gb_s": 26.5544
+        },
+        {
+          "name": "bc7_1920x1080",
+          "raw": "bench bc7_1920x1080 median_ms 0.942 p95_ms 0.94552 texels_s 2.20127e+09 gb_s 35.2204",
+          "median_ms": 0.942,
+          "p95_ms": 0.94552,
+          "texels_s": 2201270000.0,
+          "gb_s": 35.2204
+        },
+        {
+          "name": "bc7_3840x2160",
+          "raw": "bench bc7_3840x2160 median_ms 4.42496 p95_ms 4.4302 texels_s 1.87446e+09 gb_s 29.9913",
+          "median_ms": 4.42496,
+          "p95_ms": 4.4302,
+          "texels_s": 1874460000.0,
+          "gb_s": 29.9913
+        },
+        {
+          "name": "bc1_1920x1080",
+          "raw": "bench bc1_1920x1080 median_ms 0.94224 p95_ms 0.94416 texels_s 2.20071e+09 gb_s 35.2114",
+          "median_ms": 0.94224,
+          "p95_ms": 0.94416,
+          "texels_s": 2200710000.0,
+          "gb_s": 35.2114
+        },
+        {
+          "name": "bc1_3840x2160",
+          "raw": "bench bc1_3840x2160 median_ms 4.42496 p95_ms 4.42988 texels_s 1.87446e+09 gb_s 29.9913",
+          "median_ms": 4.42496,
+          "p95_ms": 4.42988,
+          "texels_s": 1874460000.0,
+          "gb_s": 29.9913
+        },
+        {
+          "name": "bc5_1920x1080",
+          "raw": "bench bc5_1920x1080 median_ms 0.94264 p95_ms 0.94656 texels_s 2.19978e+09 gb_s 35.1965",
+          "median_ms": 0.94264,
+          "p95_ms": 0.94656,
+          "texels_s": 2199780000.0,
+          "gb_s": 35.1965
+        },
+        {
+          "name": "bc5_3840x2160",
+          "raw": "bench bc5_3840x2160 median_ms 4.42484 p95_ms 4.42916 texels_s 1.87451e+09 gb_s 29.9921",
+          "median_ms": 4.42484,
+          "p95_ms": 4.42916,
+          "texels_s": 1874510000.0,
+          "gb_s": 29.9921
+        }
+      ],
+      "wrote": [
+        "results\\hw_encode\\metal_plate_vulkan/vk_ntc_fp32.f32 256 256 9",
+        "results\\hw_encode\\metal_plate_vulkan/vk_lit_fp32.f32",
+        "results\\hw_encode\\metal_plate_vulkan/bc7.f32 256 256",
+        "results\\hw_encode\\metal_plate_vulkan/bc1.f32 256 256",
+        "results\\hw_encode\\metal_plate_vulkan/bc5.f32 256 256"
+      ],
+      "psnr_u8": 22.13265761059422,
+      "total_bpp": 14.152587890625,
+      "bc_encoder": "bc_pack.py mode6 / dxt1 / bc4"
+    },
+    {
+      "material": "metal_plate",
+      "api": "opengl",
+      "returncode": 0,
+      "timings": [
+        {
+          "name": "load_fp32",
+          "raw": "bench load_fp32 median_ms 0.14068 p95_ms 0.14336 texels_s 6.21126e+08 gb_s 22.3605",
+          "median_ms": 0.14068,
+          "p95_ms": 0.14336,
+          "texels_s": 621126000.0,
+          "gb_s": 22.3605
+        },
+        {
+          "name": "load_fp16",
+          "raw": "bench load_fp16 skipped no_gl_fp16",
+          "skipped": "no_gl_fp16"
+        },
+        {
+          "name": "sample_native_fp32",
+          "raw": "bench sample_native_fp32 median_ms 0.1086 p95_ms 0.11048 texels_s 6.03462e+08 gb_s 21.7246",
+          "median_ms": 0.1086,
+          "p95_ms": 0.11048,
+          "texels_s": 603462000.0,
+          "gb_s": 21.7246
+        },
+        {
+          "name": "sample_1920x1080_fp32",
+          "raw": "bench sample_1920x1080_fp32 median_ms 2.86812 p95_ms 2.87412 texels_s 7.22982e+08 gb_s 26.0274",
+          "median_ms": 2.86812,
+          "p95_ms": 2.87412,
+          "texels_s": 722982000.0,
+          "gb_s": 26.0274
+        },
+        {
+          "name": "sample_3840x2160_fp32",
+          "raw": "bench sample_3840x2160_fp32 median_ms 11.3399 p95_ms 11.3606 texels_s 7.31436e+08 gb_s 26.3317",
+          "median_ms": 11.3399,
+          "p95_ms": 11.3606,
+          "texels_s": 731436000.0,
+          "gb_s": 26.3317
+        },
+        {
+          "name": "lit_native_fp32",
+          "raw": "bench lit_native_fp32 median_ms 0.09148 p95_ms 0.09324 texels_s 7.16397e+08 gb_s 8.59676",
+          "median_ms": 0.09148,
+          "p95_ms": 0.09324,
+          "texels_s": 716397000.0,
+          "gb_s": 8.59676
+        },
+        {
+          "name": "bc7_1920x1080",
+          "raw": "bench bc7_1920x1080 median_ms 0.94904 p95_ms 0.9528 texels_s 2.18494e+09 gb_s 34.9591",
+          "median_ms": 0.94904,
+          "p95_ms": 0.9528,
+          "texels_s": 2184940000.0,
+          "gb_s": 34.9591
+        },
+        {
+          "name": "bc7_3840x2160",
+          "raw": "bench bc7_3840x2160 median_ms 4.43472 p95_ms 4.4374 texels_s 1.87033e+09 gb_s 29.9253",
+          "median_ms": 4.43472,
+          "p95_ms": 4.4374,
+          "texels_s": 1870330000.0,
+          "gb_s": 29.9253
+        },
+        {
+          "name": "bc1_1920x1080",
+          "raw": "bench bc1_1920x1080 median_ms 0.94692 p95_ms 0.95224 texels_s 2.18984e+09 gb_s 35.0374",
+          "median_ms": 0.94692,
+          "p95_ms": 0.95224,
+          "texels_s": 2189840000.0,
+          "gb_s": 35.0374
+        },
+        {
+          "name": "bc1_3840x2160",
+          "raw": "bench bc1_3840x2160 median_ms 4.4348 p95_ms 4.44084 texels_s 1.8703e+09 gb_s 29.9248",
+          "median_ms": 4.4348,
+          "p95_ms": 4.44084,
+          "texels_s": 1870300000.0,
+          "gb_s": 29.9248
+        },
+        {
+          "name": "bc5_1920x1080",
+          "raw": "bench bc5_1920x1080 median_ms 0.94708 p95_ms 0.95128 texels_s 2.18947e+09 gb_s 35.0315",
+          "median_ms": 0.94708,
+          "p95_ms": 0.95128,
+          "texels_s": 2189470000.0,
+          "gb_s": 35.0315
+        },
+        {
+          "name": "bc5_3840x2160",
+          "raw": "bench bc5_3840x2160 median_ms 4.43424 p95_ms 4.4372 texels_s 1.87053e+09 gb_s 29.9286",
+          "median_ms": 4.43424,
+          "p95_ms": 4.4372,
+          "texels_s": 1870530000.0,
+          "gb_s": 29.9286
+        }
+      ],
+      "wrote": [
+        "results\\hw_encode\\metal_plate_opengl/gl_ntc_fp32.f32 256 256 9",
+        "results\\hw_encode\\metal_plate_opengl/gl_lit_fp32.f32",
+        "results\\hw_encode\\metal_plate_opengl/bc7.f32 256 256",
+        "results\\hw_encode\\metal_plate_opengl/bc1.f32 256 256",
+        "results\\hw_encode\\metal_plate_opengl/bc5.f32 256 256"
+      ],
+      "psnr_u8": 22.13265761059422,
+      "total_bpp": 14.152587890625,
+      "bc_encoder": "bc_pack.py mode6 / dxt1 / bc4"
+    },
+    {
+      "material": "PavingStones070",
+      "api": "vulkan",
+      "returncode": 0,
+      "timings": [
+        {
+          "name": "load_fp32",
+          "raw": "bench load_fp32 median_ms 0.15912 p95_ms 0.16284 texels_s 5.49145e+08 gb_s 19.7692",
+          "median_ms": 0.15912,
+          "p95_ms": 0.16284,
+          "texels_s": 549145000.0,
+          "gb_s": 19.7692
+        },
+        {
+          "name": "load_fp16",
+          "raw": "bench load_fp16 median_ms 0.16344 p95_ms 0.16724 texels_s 5.3463e+08 gb_s 19.2467",
+          "median_ms": 0.16344,
+          "p95_ms": 0.16724,
+          "texels_s": 534630000.0,
+          "gb_s": 19.2467
+        },
+        {
+          "name": "sample_native_fp32",
+          "raw": "bench sample_native_fp32 median_ms 0.11876 p95_ms 0.12088 texels_s 5.51836e+08 gb_s 19.8661",
+          "median_ms": 0.11876,
+          "p95_ms": 0.12088,
+          "texels_s": 551836000.0,
+          "gb_s": 19.8661
+        },
+        {
+          "name": "sample_1920x1080_fp32",
+          "raw": "bench sample_1920x1080_fp32 median_ms 2.87604 p95_ms 2.88848 texels_s 7.20991e+08 gb_s 25.9557",
+          "median_ms": 2.87604,
+          "p95_ms": 2.88848,
+          "texels_s": 720991000.0,
+          "gb_s": 25.9557
+        },
+        {
+          "name": "sample_3840x2160_fp32",
+          "raw": "bench sample_3840x2160_fp32 median_ms 11.2672 p95_ms 11.277 texels_s 7.36152e+08 gb_s 26.5015",
+          "median_ms": 11.2672,
+          "p95_ms": 11.277,
+          "texels_s": 736152000.0,
+          "gb_s": 26.5015
+        },
+        {
+          "name": "bc7_1920x1080",
+          "raw": "bench bc7_1920x1080 median_ms 0.94236 p95_ms 0.94404 texels_s 2.20043e+09 gb_s 35.2069",
+          "median_ms": 0.94236,
+          "p95_ms": 0.94404,
+          "texels_s": 2200430000.0,
+          "gb_s": 35.2069
+        },
+        {
+          "name": "bc7_3840x2160",
+          "raw": "bench bc7_3840x2160 median_ms 4.42512 p95_ms 4.42796 texels_s 1.87439e+09 gb_s 29.9902",
+          "median_ms": 4.42512,
+          "p95_ms": 4.42796,
+          "texels_s": 1874390000.0,
+          "gb_s": 29.9902
+        },
+        {
+          "name": "bc1_1920x1080",
+          "raw": "bench bc1_1920x1080 median_ms 0.94208 p95_ms 0.9454 texels_s 2.20109e+09 gb_s 35.2174",
+          "median_ms": 0.94208,
+          "p95_ms": 0.9454,
+          "texels_s": 2201090000.0,
+          "gb_s": 35.2174
+        },
+        {
+          "name": "bc1_3840x2160",
+          "raw": "bench bc1_3840x2160 median_ms 4.42532 p95_ms 4.42736 texels_s 1.87431e+09 gb_s 29.9889",
+          "median_ms": 4.42532,
+          "p95_ms": 4.42736,
+          "texels_s": 1874310000.0,
+          "gb_s": 29.9889
+        },
+        {
+          "name": "bc5_1920x1080",
+          "raw": "bench bc5_1920x1080 median_ms 0.94268 p95_ms 0.94464 texels_s 2.19969e+09 gb_s 35.195",
+          "median_ms": 0.94268,
+          "p95_ms": 0.94464,
+          "texels_s": 2199690000.0,
+          "gb_s": 35.195
+        },
+        {
+          "name": "bc5_3840x2160",
+          "raw": "bench bc5_3840x2160 median_ms 4.42532 p95_ms 4.42784 texels_s 1.87431e+09 gb_s 29.9889",
+          "median_ms": 4.42532,
+          "p95_ms": 4.42784,
+          "texels_s": 1874310000.0,
+          "gb_s": 29.9889
+        }
+      ],
+      "wrote": [
+        "results\\hw_encode\\PavingStones070_vulkan/vk_ntc_fp32.f32 256 256 9",
+        "results\\hw_encode\\PavingStones070_vulkan/vk_lit_fp32.f32",
+        "results\\hw_encode\\PavingStones070_vulkan/bc7.f32 256 256",
+        "results\\hw_encode\\PavingStones070_vulkan/bc1.f32 256 256",
+        "results\\hw_encode\\PavingStones070_vulkan/bc5.f32 256 256"
+      ],
+      "psnr_u8": 23.197909998138954,
+      "total_bpp": 13.3189697265625,
+      "bc_encoder": "bc_pack.py mode6 / dxt1 / bc4"
+    },
+    {
+      "material": "PavingStones070",
+      "api": "opengl",
+      "returncode": 0,
+      "timings": [
+        {
+          "name": "load_fp32",
+          "raw": "bench load_fp32 median_ms 0.13836 p95_ms 0.1424 texels_s 6.31541e+08 gb_s 22.7355",
+          "median_ms": 0.13836,
+          "p95_ms": 0.1424,
+          "texels_s": 631541000.0,
+          "gb_s": 22.7355
+        },
+        {
+          "name": "load_fp16",
+          "raw": "bench load_fp16 skipped no_gl_fp16",
+          "skipped": "no_gl_fp16"
+        },
+        {
+          "name": "sample_native_fp32",
+          "raw": "bench sample_native_fp32 median_ms 0.10848 p95_ms 0.11648 texels_s 6.0413e+08 gb_s 21.7487",
+          "median_ms": 0.10848,
+          "p95_ms": 0.11648,
+          "texels_s": 604130000.0,
+          "gb_s": 21.7487
+        },
+        {
+          "name": "sample_1920x1080_fp32",
+          "raw": "bench sample_1920x1080_fp32 median_ms 2.86964 p95_ms 2.87748 texels_s 7.22599e+08 gb_s 26.0136",
+          "median_ms": 2.86964,
+          "p95_ms": 2.87748,
+          "texels_s": 722599000.0,
+          "gb_s": 26.0136
+        },
+        {
+          "name": "sample_3840x2160_fp32",
+          "raw": "bench sample_3840x2160_fp32 median_ms 11.3469 p95_ms 11.3653 texels_s 7.30983e+08 gb_s 26.3154",
+          "median_ms": 11.3469,
+          "p95_ms": 11.3653,
+          "texels_s": 730983000.0,
+          "gb_s": 26.3154
+        },
+        {
+          "name": "lit_native_fp32",
+          "raw": "bench lit_native_fp32 median_ms 0.08248 p95_ms 0.08376 texels_s 7.94568e+08 gb_s 9.53482",
+          "median_ms": 0.08248,
+          "p95_ms": 0.08376,
+          "texels_s": 794568000.0,
+          "gb_s": 9.53482
+        },
+        {
+          "name": "bc7_1920x1080",
+          "raw": "bench bc7_1920x1080 median_ms 0.95284 p95_ms 0.95788 texels_s 2.17623e+09 gb_s 34.8197",
+          "median_ms": 0.95284,
+          "p95_ms": 0.95788,
+          "texels_s": 2176230000.0,
+          "gb_s": 34.8197
+        },
+        {
+          "name": "bc7_3840x2160",
+          "raw": "bench bc7_3840x2160 median_ms 4.43172 p95_ms 4.436 texels_s 1.8716e+09 gb_s 29.9456",
+          "median_ms": 4.43172,
+          "p95_ms": 4.436,
+          "texels_s": 1871600000.0,
+          "gb_s": 29.9456
+        },
+        {
+          "name": "bc1_1920x1080",
+          "raw": "bench bc1_1920x1080 median_ms 0.95308 p95_ms 0.95904 texels_s 2.17568e+09 gb_s 34.8109",
+          "median_ms": 0.95308,
+          "p95_ms": 0.95904,
+          "texels_s": 2175680000.0,
+          "gb_s": 34.8109
+        },
+        {
+          "name": "bc1_3840x2160",
+          "raw": "bench bc1_3840x2160 median_ms 4.43168 p95_ms 4.43736 texels_s 1.87162e+09 gb_s 29.9458",
+          "median_ms": 4.43168,
+          "p95_ms": 4.43736,
+          "texels_s": 1871620000.0,
+          "gb_s": 29.9458
+        },
+        {
+          "name": "bc5_1920x1080",
+          "raw": "bench bc5_1920x1080 median_ms 0.9542 p95_ms 0.95832 texels_s 2.17313e+09 gb_s 34.7701",
+          "median_ms": 0.9542,
+          "p95_ms": 0.95832,
+          "texels_s": 2173130000.0,
+          "gb_s": 34.7701
+        },
+        {
+          "name": "bc5_3840x2160",
+          "raw": "bench bc5_3840x2160 median_ms 4.4316 p95_ms 4.43584 texels_s 1.87165e+09 gb_s 29.9464",
+          "median_ms": 4.4316,
+          "p95_ms": 4.43584,
+          "texels_s": 1871650000.0,
+          "gb_s": 29.9464
+        }
+      ],
+      "wrote": [
+        "results\\hw_encode\\PavingStones070_opengl/gl_ntc_fp32.f32 256 256 9",
+        "results\\hw_encode\\PavingStones070_opengl/gl_lit_fp32.f32",
+        "results\\hw_encode\\PavingStones070_opengl/bc7.f32 256 256",
+        "results\\hw_encode\\PavingStones070_opengl/bc1.f32 256 256",
+        "results\\hw_encode\\PavingStones070_opengl/bc5.f32 256 256"
+      ],
+      "psnr_u8": 23.197909998138954,
+      "total_bpp": 13.3189697265625,
+      "bc_encoder": "bc_pack.py mode6 / dxt1 / bc4"
+    }
+  ]
+}

@@ -1,10 +1,15 @@
 #include "ntc/ntc.hpp"
+#include "range_coder.hpp"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+
+extern "C" {
+#include "puff.h"
+}
 
 namespace ntc {
 namespace {
@@ -16,6 +21,10 @@ uint16_t rd_u16(const uint8_t* p) {
 uint32_t rd_u32(const uint8_t* p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
            (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
+}
+
+void need(size_t size, uint64_t off, uint64_t n, const char* what) {
+    if (n > size || off > size - n) throw std::runtime_error(what);
 }
 
 float f16_to_f32(uint16_t h) {
@@ -45,7 +54,8 @@ float f16_to_f32(uint16_t h) {
     return f;
 }
 
-float read_f16(const uint8_t* data, uint32_t offset) {
+float read_f16(const uint8_t* data, size_t size, uint32_t offset) {
+    need(size, offset, 2, "fp16 out of range");
     return f16_to_f32(rd_u16(data + offset));
 }
 
@@ -61,9 +71,13 @@ uint32_t crc32(const uint8_t* data, size_t n) {
     return ~c;
 }
 
-void unpack_codes(const uint8_t* data, uint32_t offset, int c, int h, int w, int bits, int stride,
-                  std::vector<uint8_t>& dst) {
-    dst.assign(static_cast<size_t>(c) * h * w, 0);
+void unpack_codes(const uint8_t* data, size_t limit, uint32_t offset, int c, int h, int w, int bits,
+                  int stride, std::vector<uint8_t>& dst) {
+    if (c < 0 || h < 0 || w < 0 || stride < 0) throw std::runtime_error("bad latent shape");
+    if (w > 0 && stride <= 0) throw std::runtime_error("latent stride");
+    const uint64_t nbytes = static_cast<uint64_t>(c) * static_cast<uint64_t>(stride) * static_cast<uint64_t>(h);
+    need(limit, offset, nbytes, "latent codes out of range");
+    dst.assign(static_cast<size_t>(c) * static_cast<size_t>(h) * static_cast<size_t>(w), 0);
     for (int ci = 0; ci < c; ++ci) {
         for (int y = 0; y < h; ++y) {
             const uint8_t* row = data + offset + static_cast<uint32_t>(ci) * stride * h +
@@ -296,6 +310,8 @@ void features_at(const TextureSet& ts, float u, float v, int mip, float* feat) {
     }
 }
 
+void quantize_inplace(float* v, int n, float scale);
+
 void mlp(const TextureSet& ts, const float* feat, float* out) {
     float a[kMaxHidden];
     float b[kMaxHidden];
@@ -305,6 +321,12 @@ void mlp(const TextureSet& ts, const float* feat, float* out) {
     for (int li = 0; li <= last; ++li) {
         const Layer& layer = ts.layers[li];
         if (layer.in_features != cur_n) throw std::runtime_error("layer input mismatch");
+        float qbuf[kMaxHidden];
+        if (!ts.act_scales.empty() && li < static_cast<int>(ts.act_scales.size())) {
+            std::memcpy(qbuf, cur, static_cast<size_t>(cur_n) * sizeof(float));
+            quantize_inplace(qbuf, cur_n, ts.act_scales[static_cast<size_t>(li)]);
+            cur = qbuf;
+        }
         float* dst = (li == last) ? out : ((li % 2 == 0) ? a : b);
         // first hidden writes a, but if last, out. For li==0 and not last, dst=a.
         if (li != last && li % 2 == 1) dst = b;
@@ -317,6 +339,16 @@ void mlp(const TextureSet& ts, const float* feat, float* out) {
             cur = dst;
             cur_n = layer.out_features;
         }
+    }
+}
+
+void quantize_inplace(float* v, int n, float scale) {
+    const float s = scale > 1e-6f ? scale : 1e-6f;
+    for (int i = 0; i < n; ++i) {
+        float q = std::round(v[i] / s);
+        if (q < -127.f) q = -127.f;
+        if (q > 127.f) q = 127.f;
+        v[i] = q * s;
     }
 }
 
@@ -379,10 +411,55 @@ TextureSet parse(const uint8_t* data, size_t size) {
     ts.pe_octaves = rd_u16(data + 32);
     ts.weight_bits = rd_u16(data + 34);
     ts.group_size = rd_u16(data + 36);
+    ts.tile_size = rd_u16(data + 38);
+    if (ts.tile_size != 0) {
+        throw std::runtime_error("per-tile latent endpoints are not in this reader");
+    }
+    if (ts.width == 0 || ts.height == 0 || ts.num_mips == 0) {
+        throw std::runtime_error("empty image");
+    }
     const uint32_t channel_off = rd_u32(data + 40);
+    const uint32_t latent_off = rd_u32(data + 52);
+    const uint32_t latent_bytes = rd_u32(data + 56);
+    ts.latent_stored_bytes = latent_bytes;
+    ts.scale_stored_bytes = rd_u32(data + 72);
+    const uint32_t plain_len = rd_u32(data + 84);
+    const bool flag_deflate = (ts.flags & kFlagLatentDeflate) != 0;
+    const bool flag_range = (ts.flags & kFlagLatentRange) != 0;
+    const bool flag_ctx = (ts.flags & kFlagLatentCtx) != 0;
+    if ((flag_deflate && flag_range) || (flag_deflate && flag_ctx) || (flag_range && flag_ctx)) {
+        throw std::runtime_error("latent coder flags are mutually exclusive");
+    }
+    ts.latent_plain_bytes = (ts.flags & kFlagLatentCompressed) ? plain_len : latent_bytes;
+    std::vector<uint8_t> inflated;
+    const uint8_t* code_base = data;
+    if (ts.flags & kFlagLatentCompressed) {
+        if (plain_len == 0 || plain_len > 64u * 1024u * 1024u ||
+            static_cast<uint64_t>(latent_off) + latent_bytes > size) {
+            throw std::runtime_error("bad compressed latent span");
+        }
+        if (flag_deflate) {
+            inflated.assign(plain_len, 0);
+            unsigned long dlen = plain_len;
+            unsigned long slen = latent_bytes;
+            const int rc = puff(inflated.data(), &dlen, data + latent_off, &slen);
+            if (rc != 0 || dlen != plain_len) throw std::runtime_error("latent deflate");
+        } else if (flag_ctx) {
+            inflated = range_decode_ctx(data + latent_off, latent_bytes, plain_len);
+            if (inflated.size() != plain_len) throw std::runtime_error("latent context range");
+        } else {
+            inflated = range_decode(data + latent_off, latent_bytes, plain_len);
+            if (inflated.size() != plain_len) throw std::runtime_error("latent range");
+        }
+        code_base = inflated.data();
+    }
     const uint32_t grid_off = rd_u32(data + 44);
     const uint32_t layer_off = rd_u32(data + 48);
+    need(size, channel_off, static_cast<uint64_t>(num_channels) * 8u, "channel table");
+    need(size, grid_off, static_cast<uint64_t>(num_grids) * 24u, "grid table");
+    need(size, layer_off, static_cast<uint64_t>(num_layers) * 32u, "layer table");
     ts.raw.assign(data, data + size);
+    const size_t code_limit = (ts.flags & kFlagLatentCompressed) ? inflated.size() : size;
 
     ts.channels.resize(num_channels);
     for (uint32_t i = 0; i < num_channels; ++i) {
@@ -403,10 +480,12 @@ TextureSet parse(const uint8_t* data, size_t size) {
         g.data_bytes = rd_u32(p + 12);
         g.scale_offset = rd_u32(p + 16);
         g.plane_bytes = rd_u32(p + 20);
-        unpack_codes(data, g.data_offset, g.channels, g.height, g.width, g.bits, g.row_stride, g.codes);
+        unpack_codes(code_base, code_limit, g.data_offset, g.channels, g.height, g.width, g.bits,
+                     g.row_stride, g.codes);
         g.scale.resize(g.channels);
+        need(size, g.scale_offset, static_cast<uint64_t>(g.channels) * 2u, "latent scale");
         for (int c = 0; c < g.channels; ++c) {
-            g.scale[c] = read_f16(data, g.scale_offset + static_cast<uint32_t>(c) * 2);
+            g.scale[c] = read_f16(data, size, g.scale_offset + static_cast<uint32_t>(c) * 2);
         }
         build_mips(g);
         ts.grids[i] = std::move(g);
@@ -423,13 +502,21 @@ TextureSet parse(const uint8_t* data, size_t size) {
         layer.scale_offset = rd_u32(p + 16);
         layer.group_size = rd_u16(p + 20);
         layer.num_groups = rd_u16(p + 22);
+        const uint32_t lbits = rd_u32(p + 24);
+        layer.weight_bits = lbits ? lbits : ts.weight_bits;
         const int out = layer.out_features;
         const int inn = layer.in_features;
         layer.weight.assign(static_cast<size_t>(out) * inn, 0.f);
-        if (ts.weight_bits == 8) {
+        const uint64_t wbytes = layer.weight_bits == 8
+                                    ? static_cast<uint64_t>(out) * static_cast<uint64_t>(inn)
+                                    : static_cast<uint64_t>(out) * static_cast<uint64_t>((inn + 1) / 2);
+        if (layer.weight_bits == 8 || layer.weight_bits == 4) {
+            need(size, layer.weight_offset, wbytes, "weights");
+        }
+        if (layer.weight_bits == 8) {
             const int8_t* w = reinterpret_cast<const int8_t*>(data + layer.weight_offset);
             for (int k = 0; k < out * inn; ++k) layer.weight[k] = static_cast<float>(w[k]);
-        } else if (ts.weight_bits == 4) {
+        } else if (layer.weight_bits == 4) {
             const int row_bytes = (inn + 1) / 2;
             const uint8_t* raw = data + layer.weight_offset;
             for (int o = 0; o < out; ++o) {
@@ -444,14 +531,26 @@ TextureSet parse(const uint8_t* data, size_t size) {
             throw std::runtime_error("bad weight bits");
         }
         layer.bias.resize(out);
+        need(size, layer.bias_offset, static_cast<uint64_t>(out) * 2u, "bias");
         for (int o = 0; o < out; ++o) {
-            layer.bias[o] = read_f16(data, layer.bias_offset + static_cast<uint32_t>(o) * 2);
+            layer.bias[o] = read_f16(data, size, layer.bias_offset + static_cast<uint32_t>(o) * 2);
         }
         layer.scale.resize(static_cast<size_t>(out) * layer.num_groups);
+        need(size, layer.scale_offset, static_cast<uint64_t>(layer.scale.size()) * 2u, "weight scale");
         for (size_t k = 0; k < layer.scale.size(); ++k) {
-            layer.scale[k] = read_f16(data, layer.scale_offset + static_cast<uint32_t>(k) * 2);
+            layer.scale[k] = read_f16(data, size, layer.scale_offset + static_cast<uint32_t>(k) * 2);
         }
         ts.layers[i] = std::move(layer);
+    }
+    if (ts.flags & kFlagActInt8) {
+        const int n = static_cast<int>(ts.layers.size());
+        const uint32_t nbytes = static_cast<uint32_t>(n) * 2u;
+        if (nbytes > size) throw std::runtime_error("act int8 tail missing");
+        ts.act_scales.resize(static_cast<size_t>(n));
+        for (int i = 0; i < n; ++i) {
+            ts.act_scales[static_cast<size_t>(i)] =
+                read_f16(data, size, static_cast<uint32_t>(size - nbytes + static_cast<uint32_t>(i) * 2u));
+        }
     }
     return ts;
 }
@@ -486,10 +585,11 @@ std::vector<float> decode_mip(const TextureSet& ts, int mip) {
 
 uint32_t payload_bytes(const TextureSet& ts) {
     uint32_t n = 0;
-    for (const auto& g : ts.grids) {
-        n += g.data_bytes;
-        n += static_cast<uint32_t>(g.channels) * 2u;
+    if (ts.flags & kFlagLatentCompressed) n += ts.latent_stored_bytes;
+    else {
+        for (const auto& g : ts.grids) n += g.data_bytes;
     }
+    n += ts.scale_stored_bytes;
     for (const auto& layer : ts.layers) {
         n += layer.weight_bytes;
         n += static_cast<uint32_t>(layer.out_features) * 2u;
@@ -501,6 +601,48 @@ uint32_t payload_bytes(const TextureSet& ts) {
 float total_bpp(const TextureSet& ts) {
     return 8.f * static_cast<float>(payload_bytes(ts)) /
            static_cast<float>(ts.width * ts.height);
+}
+
+int mip_chain_texels(const TextureSet& ts) {
+    int total = 0;
+    const uint32_t mips = std::max(1u, ts.num_mips);
+    for (uint32_t m = 0; m < mips; ++m) {
+        total += static_cast<int>(std::max(1u, ts.width >> m) * std::max(1u, ts.height >> m));
+    }
+    return total;
+}
+
+float latent_bpp_mip0(const TextureSet& ts) {
+    uint32_t latent = 0;
+    if (ts.flags & kFlagLatentCompressed) latent = ts.latent_stored_bytes;
+    else {
+        for (const auto& g : ts.grids) latent += g.data_bytes;
+    }
+    uint32_t scales = ts.scale_stored_bytes;
+    if (!scales) {
+        for (const auto& g : ts.grids) scales += static_cast<uint32_t>(g.channels) * 2u;
+    }
+    return 8.f * static_cast<float>(latent + scales) / static_cast<float>(ts.width * ts.height);
+}
+
+float file_bpp_chain(const TextureSet& ts) {
+    return 8.f * static_cast<float>(ts.raw.size()) / static_cast<float>(mip_chain_texels(ts));
+}
+
+float bppc(const TextureSet& ts) {
+    const int ch = std::max(1, ts.num_channels());
+    return 8.f * static_cast<float>(payload_bytes(ts)) /
+           static_cast<float>(mip_chain_texels(ts) * ch);
+}
+
+uint32_t network_bytes(const TextureSet& ts) {
+    uint32_t n = 0;
+    for (const auto& layer : ts.layers) {
+        n += layer.weight_bytes;
+        n += static_cast<uint32_t>(layer.out_features) * 2u;
+        n += static_cast<uint32_t>(layer.out_features) * layer.num_groups * 2u;
+    }
+    return n;
 }
 
 GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_mode,
@@ -518,7 +660,12 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
          static_cast<uint32_t>(ts.grids.size()));
     set4(1, static_cast<uint32_t>(ts.layers.size()), ts.activation, ts.pe_mode, ts.pe_octaves);
     set4(2, ts.flags, ts.weight_bits, ts.num_mips, frame);
-    set4(3, filter_mode, max_aniso, kMaxMips, 0);
+    uint32_t act_off = 0;
+    if (!ts.act_scales.empty()) {
+        const uint32_t nbytes = static_cast<uint32_t>(ts.act_scales.size()) * 2u;
+        if (ts.raw.size() >= nbytes) act_off = static_cast<uint32_t>(ts.raw.size() - nbytes);
+    }
+    set4(3, filter_mode, max_aniso, kMaxMips, act_off);
     for (size_t g = 0; g < ts.grids.size() && g < 8; ++g) {
         const Grid& grid = ts.grids[g];
         set4(4 + static_cast<int>(g), static_cast<uint32_t>(grid.channels),
@@ -527,7 +674,7 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
         for (size_t k = 0; k < grid.mips.size() && k < 8; ++k) {
             uint32_t data_off = grid.data_offset;
             int stride = grid.row_stride;
-            if (k > 0) {
+            if (k > 0 || (ts.flags & kFlagLatentCompressed)) {
                 int ps = 0;
                 auto packed = pack_codes(grid.mips[k], grid.channels, grid.mip_h[k], grid.mip_w[k],
                                          grid.bits, ps);
@@ -545,8 +692,9 @@ GpuUpload make_gpu_upload(const TextureSet& ts, uint32_t frame, uint32_t filter_
         const Layer& layer = ts.layers[l];
         set4(12 + static_cast<int>(l), static_cast<uint32_t>(layer.in_features),
              static_cast<uint32_t>(layer.out_features), layer.weight_offset, layer.bias_offset);
+        const uint32_t lbits = layer.weight_bits ? layer.weight_bits : ts.weight_bits;
         set4(16 + static_cast<int>(l), layer.scale_offset, static_cast<uint32_t>(layer.group_size),
-             static_cast<uint32_t>(layer.num_groups), ts.weight_bits);
+             static_cast<uint32_t>(layer.num_groups), lbits);
     }
     while (up.blob.size() % 4) up.blob.push_back(0);
     return up;
