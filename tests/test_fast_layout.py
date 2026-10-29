@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -42,8 +44,9 @@ def test_spec_constant_ids_match():
 
 
 def test_signed_packed_dot():
-    # The uint overload of dotPacked4x8EXT is the unsigned dot. Every call
-    # on packed int8 weights must pass int operands.
+    # The uint overload of dotPacked4x8EXT is the unsigned dot. The weights
+    # are signed, so every call must pass them as int. The activation operand
+    # is int for signed codes and uint for unsigned codes (signed x unsigned).
     for name in ("ntc_fast.glsl", "ntc_sample_i8.comp"):
         src = (ROOT / "shaders" / name).read_text()
         for call in re.findall(r"dotPacked4x8EXT\(([^;]*)\);", src):
@@ -69,3 +72,11 @@ def test_make_bench_ntc_shapes(tmp_path):
         assert size & (size - 1) == 0, name
         assert sum(g[2] for g in grids) <= 160
         assert all(h <= 64 for h in hidden)
+
+
+def test_fast_shader_generated():
+    # ntc_fast.glsl is written by shaders/gen_ntc_fast.py.
+    r = subprocess.run([sys.executable, str(ROOT / "shaders" / "gen_ntc_fast.py"), "--check"], capture_output=True)
+    assert r.returncode == 0, r.stdout + r.stderr
+    # No loop over a private array is left for the driver to unroll.
+    assert "[[unroll]]" not in (ROOT / "shaders" / "ntc_fast.glsl").read_text()

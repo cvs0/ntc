@@ -196,34 +196,43 @@ FastUpload make_fast_upload(const TextureSet& ts) {
         fu.spec[kSpecNumGroups0 + l] = static_cast<uint32_t>(ng);
         const int stride_groups = std::max(1, layer.num_groups);
 
+        // Every block starts on a uvec4. Rows are padded with zeros to whole
+        // uvec4s (4 fp32, 8 fp16 or 16 int8 weights), and the row count to a
+        // multiple of 4, the rows of one step of the shader's row loop.
+        const auto align4 = [&p]() { while (p.size() % 4) p.push_back(0); };
+        const auto wt = [&layer, inn, out](int o, int i) {
+            return i < inn && o < out ? layer.weight[static_cast<size_t>(o) * inn + i] : 0.f;
+        };
+        const int outp = (out + 3) & ~3;
+        align4();
         fu.spec[kSpecWOff0 + l] = static_cast<uint32_t>(p.size());
-        for (int o = 0; o < out; ++o)
-            for (int i = 0; i < inn; ++i) p.push_back(f32_bits(layer.weight[static_cast<size_t>(o) * inn + i]));
-        fu.spec[kSpecBOff0 + l] = static_cast<uint32_t>(p.size());
-        for (int o = 0; o < out; ++o) p.push_back(f32_bits(layer.bias[o]));
-        fu.spec[kSpecSOff0 + l] = static_cast<uint32_t>(p.size());
-        for (int o = 0; o < out; ++o)
-            for (int g = 0; g < ng; ++g) p.push_back(f32_bits(layer.scale[static_cast<size_t>(o) * stride_groups + g]));
-        fu.spec[kSpecQOff0 + l] = static_cast<uint32_t>(p.size());
         const int in4 = (inn + 3) / 4;
-        for (int o = 0; o < out; ++o) {
-            for (int j = 0; j < in4; ++j) {
+        for (int o = 0; o < outp; ++o)
+            for (int i = 0; i < in4 * 4; ++i) p.push_back(f32_bits(wt(o, i)));
+        fu.spec[kSpecBOff0 + l] = static_cast<uint32_t>(p.size());
+        for (int o = 0; o < outp; ++o) p.push_back(f32_bits(o < out ? layer.bias[o] : 0.f));
+        fu.spec[kSpecSOff0 + l] = static_cast<uint32_t>(p.size());
+        for (int o = 0; o < outp; ++o)
+            for (int g = 0; g < ng; ++g)
+                p.push_back(f32_bits(o < out ? layer.scale[static_cast<size_t>(o) * stride_groups + g] : 0.f));
+        align4();
+        fu.spec[kSpecQOff0 + l] = static_cast<uint32_t>(p.size());
+        const int in16 = (inn + 15) / 16;
+        for (int o = 0; o < outp; ++o) {
+            for (int j = 0; j < in16 * 4; ++j) {
                 uint32_t wd = 0;
                 for (int b = 0; b < 4; ++b) {
-                    const int i = j * 4 + b;
-                    const int v = i < inn ? static_cast<int>(layer.weight[static_cast<size_t>(o) * inn + i]) : 0;
+                    const int v = static_cast<int>(wt(o, j * 4 + b));
                     wd |= (static_cast<uint32_t>(v) & 0xFFu) << (8 * b);
                 }
                 p.push_back(wd);
             }
         }
         fu.spec[kSpecHOff0 + l] = static_cast<uint32_t>(p.size());
-        const int in2 = (inn + 1) / 2;
-        for (int o = 0; o < out; ++o) {
-            for (int j = 0; j < in2; ++j) {
-                const int i0 = j * 2;
-                const float a = layer.weight[static_cast<size_t>(o) * inn + i0];
-                const float b = i0 + 1 < inn ? layer.weight[static_cast<size_t>(o) * inn + i0 + 1] : 0.f;
+        const int in8 = (inn + 7) / 8;
+        for (int o = 0; o < outp; ++o) {
+            for (int j = 0; j < in8 * 4; ++j) {
+                const float a = wt(o, 2 * j), b = wt(o, 2 * j + 1);
                 p.push_back(static_cast<uint32_t>(f32_to_f16(a)) | (static_cast<uint32_t>(f32_to_f16(b)) << 16));
             }
         }
@@ -338,11 +347,12 @@ std::vector<float> decode_fast_mip(const FastUpload& fu, int mip, int width, int
                 const int gs = static_cast<int>(S[kSpecGroupSize0 + l]);
                 const int ng = static_cast<int>(S[kSpecNumGroups0 + l]);
                 const uint32_t wo = S[kSpecWOff0 + l], bo = S[kSpecBOff0 + l], so = S[kSpecSOff0 + l];
+                const int stride = (inn + 3) & ~3;   // rows are padded to whole uvec4s
                 for (int o = 0; o < out; ++o) {
                     float r;
                     if (gs == 0) {
                         float acc = 0.f;
-                        for (int i = 0; i < inn; ++i) acc += pf(wo + static_cast<uint32_t>(o * inn + i)) * x[i];
+                        for (int i = 0; i < inn; ++i) acc += pf(wo + static_cast<uint32_t>(o * stride + i)) * x[i];
                         r = pf(bo + o) + pf(so + static_cast<uint32_t>(o * ng)) * acc;
                     } else {
                         r = pf(bo + o);
@@ -350,7 +360,7 @@ std::vector<float> decode_fast_mip(const FastUpload& fu, int mip, int width, int
                             const int i0 = g * gs;
                             const int i1 = std::min(inn, i0 + gs);
                             float acc = 0.f;
-                            for (int i = i0; i < i1; ++i) acc += pf(wo + static_cast<uint32_t>(o * inn + i)) * x[i];
+                            for (int i = i0; i < i1; ++i) acc += pf(wo + static_cast<uint32_t>(o * stride + i)) * x[i];
                             r += pf(so + static_cast<uint32_t>(o * ng + g)) * acc;
                         }
                     }

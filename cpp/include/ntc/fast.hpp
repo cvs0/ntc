@@ -5,14 +5,16 @@
 // The file format is unchanged. This is a GPU-only layout derived at upload:
 //
 //   spec     Vulkan specialization constants, index = constant_id. Every
-//            loop bound, width, grid shape, and parameter offset is a
-//            constant, so the driver unrolls the MLP and keeps the feature
-//            and hidden vectors in registers.
+//            width, grid shape, and parameter offset is a constant, so the
+//            driver keeps the feature and layer-input vectors in registers.
 //   params   Uniform buffer words (at most kFastParamWords). Mip table,
-//            fp32 latent scales, fp32 activation scales, then per layer
-//            fp32 weights [out][in], fp32 bias [out], fp32 scales
-//            [out][groups], packed int8 weights [out][ceil(in/4)] and
-//            packed fp16 weights [out][ceil(in/2)]. Weight codes are small
+//            fp32 latent scales, fp32 activation scales, then per layer,
+//            every block starting on a 4-word (uvec4) boundary and the
+//            output count padded to outp = out rounded up to 4 with zero
+//            rows: fp32 weights [outp][in rounded up to 4], fp32 bias
+//            [outp], fp32 scales [outp][groups], packed int8 weights
+//            [outp][in rounded up to 16 codes] and packed fp16 weights
+//            [outp][in rounded up to 8 halves]. Weight codes are small
 //            integers, so the fp32 and fp16 copies are exact.
 //   latents  Storage buffer words. Each grid mip is split into channel
 //            planes whose record (channels * bits) is a power of two of at

@@ -11,7 +11,7 @@
 //      the same 4 B. Timing is GPU timestamps around each dispatch.
 //
 // Variants: legacy (shaders/ntc_decode.glsl interpreter), exact, fma, fp16,
-// i8 (shaders/ntc_fast.glsl), bc7, bc_mat.
+// i8, i16 (shaders/ntc_fast.glsl), bc7, bc_mat.
 //
 // Options:
 //   --device N          physical device index (default: first discrete, else 0)
@@ -626,7 +626,7 @@ std::vector<uint8_t> synth_blocks(int w, int h, bool bc7, uint32_t seed) {
 int main(int argc, char** argv) {
     int want_dev = -1, iters = 50, warmup = 10;
     std::string sizes_s = "1920x1080,2560x1440,3840x2160", uv_s = "auto", variants_s, json_path, shader_dir;
-    bool check_only = false;
+    bool check_only = false, stats_only = false;
     int check_mips_max = 3;
     std::vector<std::string> files;
     for (int i = 1; i < argc; ++i) {
@@ -645,12 +645,14 @@ int main(int argc, char** argv) {
         else if (a == "--uv-scale") uv_s = next();
         else if (a == "--variants") variants_s = next();
         else if (a == "--check-only") check_only = true;
+        else if (a == "--stats-only") stats_only = true;
         else if (a == "--check-mips") check_mips_max = std::max(0, std::atoi(next().c_str()));
         else if (a == "--json") json_path = next();
         else if (a == "--shader-dir") shader_dir = next();
         else if (a == "-h" || a == "--help") {
             std::printf("usage: ntc_decbench [--device N] [--sizes WxH,...] [--iters N] [--warmup N] [--uv-scale S|auto]\n"
-                        "                    [--variants legacy,exact,fma,fp16,i8,bc7,bc_mat] [--check-only] [--check-mips N]\n"
+                        "                    [--variants legacy,exact,fma,fp16,i8,i16,bc7,bc_mat] [--check-only] [--stats-only]\n"
+                        "                    [--check-mips N]\n"
                         "                    [--json PATH]\n"
                         "                    [--shader-dir DIR] FILE.ntc ...\n");
             return 0;
@@ -679,6 +681,7 @@ int main(int argc, char** argv) {
         {"fma", "ntc_fast_fma.comp.spv", true, false, true},
         {"fp16", "ntc_fast_fp16.comp.spv", true, false, false},
         {"i8", "ntc_fast_i8.comp.spv", true, false, false},
+        {"i16", "ntc_fast_i16.comp.spv", true, false, false},
         {"bc7", "", false, false, false},
         {"bc_mat", "", false, false, false},
     };
@@ -689,8 +692,8 @@ int main(int argc, char** argv) {
             std::printf("skip fp16: shaderFloat16 unsupported\n");
             continue;
         }
-        if (v.name == "i8" && !c.dot) {
-            std::printf("skip i8: shaderIntegerDotProduct unsupported\n");
+        if ((v.name == "i8" || v.name == "i16") && !c.dot) {
+            std::printf("skip %s: shaderIntegerDotProduct unsupported\n", v.name.c_str());
             continue;
         }
         if ((v.name == "bc7" || v.name == "bc_mat") && !c.bc) {
@@ -746,6 +749,30 @@ int main(int argc, char** argv) {
                     ((ts.width + 3) / 4) * ((ts.height + 3) / 4) * 16,
                     3 * ((ts.width + 3) / 4) * ((ts.height + 3) / 4) * 16);
         if (!fu.ok) std::printf("fast layout unavailable: %s\n", fu.why.c_str());
+        if (stats_only) {
+            // Compile only: register, scratch, and instruction statistics of
+            // every fast variant for both entry modes. Needs no buffers, so it
+            // also works on a driver without a GPU (RADV on the amdgpu noop DRM shim).
+            const std::vector<VkDescriptorType> st_types = {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,
+                                                            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                                                            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+            if (fu.ok) {
+                std::printf("spec");
+                for (size_t i = 0; i < fu.spec.size(); ++i) std::printf(" %u", fu.spec[i]);
+                std::printf("\n");
+            }
+            for (const auto& v : vars) {
+                if (!v.ntc_fast || !fu.ok) continue;
+                for (int mode = 0; mode < 2; ++mode) {
+                    std::vector<int32_t> sp(fu.spec.begin(), fu.spec.end());
+                    sp.push_back(mode);
+                    Pipe p = make_pipe(c, shader_dir + "/" + v.spv, st_types, sp, sizeof(Pc));
+                    std::printf("stats %-6s mode %d  %s\n", v.name.c_str(), mode, p.stats.c_str());
+                    free_pipe(c, p);
+                }
+            }
+            continue;
+        }
         if (!first_file) js << ",";
         first_file = false;
         js << "{\"path\":\"" << path << "\",\"width\":" << ts.width << ",\"height\":" << ts.height
