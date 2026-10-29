@@ -24,7 +24,9 @@ def test_pipeline_helper_and_precise_mad_are_in_the_sources(tmp_path: Path):
     assert "requiredSubgroupSize = 32" in header
     assert "minSubgroupSize > 32" in header
     decode = (ROOT / "shaders/ntc_decode.glsl").read_text()
-    assert "precise float prod = acc * w;" in decode
+    # acc + w * x, not acc * w + x (the c99bb23 regression)
+    assert "precise float prod = w * x;" in decode
+    assert "precise float prod = acc * w;" not in decode
     glslang = shutil.which("glslangValidator")
     spirv_dis = shutil.which("spirv-dis")
     if glslang and spirv_dis:
