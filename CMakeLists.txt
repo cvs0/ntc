@@ -24,7 +24,7 @@ function(ntc_warnings target)
     endif()
 endfunction()
 
-add_library(ntc STATIC cpp/src/ntc.cpp third_party/puff/puff.c)
+add_library(ntc STATIC cpp/src/ntc.cpp cpp/src/fast.cpp third_party/puff/puff.c)
 target_include_directories(ntc PUBLIC cpp/include ${CMAKE_SOURCE_DIR}/third_party ${CMAKE_SOURCE_DIR}/third_party/puff)
 if(MSVC)
     set_source_files_properties(third_party/puff/puff.c PROPERTIES COMPILE_OPTIONS "/w")
@@ -47,7 +47,9 @@ target_include_directories(expcode_bytes PRIVATE ${CMAKE_SOURCE_DIR}/third_party
 ntc_warnings(expcode_bytes)
 
 enable_testing()
-add_test(NAME test_ntc COMMAND test_ntc ${CMAKE_SOURCE_DIR}/tests/fixtures)
+# Extra arguments are trained files for the fast-layout bit-exact test.
+file(GLOB NTC_TRAINED_FILES ${CMAKE_SOURCE_DIR}/results/train_sweep/*.ntc)
+add_test(NAME test_ntc COMMAND test_ntc ${CMAKE_SOURCE_DIR}/tests/fixtures ${NTC_TRAINED_FILES})
 
 find_program(GLSLANG glslangValidator)
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
@@ -81,9 +83,10 @@ function(ntc_spirv src env out_name)
     endif()
     add_custom_command(
         OUTPUT ${SPV_DIR}/${out_name}
-        COMMAND ${GLSLANG} -V --target-env ${env} "-I${SPV_DIR}" "-I${SHADER_DIR}"
+        COMMAND ${GLSLANG} -V --target-env ${env} "-I${SPV_DIR}" "-I${SHADER_DIR}" ${ARGN}
                 ${SHADER_DIR}/${src} -o ${SPV_DIR}/${out_name}
-        DEPENDS ${SHADER_DIR}/${src} ${SHADER_DIR}/ntc_decode.glsl ${SPV_DIR}/ntc_dot_config.glsl
+        DEPENDS ${SHADER_DIR}/${src} ${SHADER_DIR}/ntc_decode.glsl ${SHADER_DIR}/ntc_fast.glsl
+                ${SPV_DIR}/ntc_dot_config.glsl
         VERBATIM)
     set(NTC_SPV_OUTPUTS ${NTC_SPV_OUTPUTS} ${SPV_DIR}/${out_name} PARENT_SCOPE)
 endfunction()
@@ -113,6 +116,12 @@ if(GLSLANG)
     ntc_spirv(ntc_coopmat_i8.comp vulkan1.3 ntc_coopmat_i8.comp.spv)
     ntc_spirv(ntc_train_adam.comp vulkan1.3 ntc_train_adam.comp.spv)
     ntc_spirv(ntc_train_gather.comp vulkan1.3 ntc_train_gather.comp.spv)
+    ntc_spirv(ntc_fast_bench.comp vulkan1.3 ntc_fast_exact.comp.spv -DNTC_FAST_EXACT)
+    ntc_spirv(ntc_fast_bench.comp vulkan1.3 ntc_fast_fma.comp.spv)
+    ntc_spirv(ntc_fast_bench.comp vulkan1.3 ntc_fast_fp16.comp.spv -DNTC_FAST_FP16)
+    ntc_spirv(ntc_fast_bench.comp vulkan1.3 ntc_fast_i8.comp.spv -DNTC_FAST_I8)
+    ntc_spirv(ntc_legacy_bench.comp vulkan1.3 ntc_legacy_bench.comp.spv)
+    ntc_spirv(bc_bench.comp vulkan1.3 bc_bench.comp.spv)
     ntc_spirv(ntc_decompress_gl.comp opengl ntc_decompress_gl.comp.spv)
     ntc_spirv(ntc_sample_gl.frag opengl ntc_sample_gl.frag.spv)
     ntc_spirv(ntc_sample_res_gl.comp opengl ntc_sample_res_gl.comp.spv)
@@ -127,6 +136,16 @@ if(Vulkan_FOUND)
     target_link_libraries(ntc_vk PRIVATE ntc Vulkan::Vulkan)
     ntc_warnings(ntc_vk)
     add_dependencies(ntc_vk ntc_shaders)
+
+    add_executable(ntc_decbench examples/decbench/decbench.cpp)
+    target_link_libraries(ntc_decbench PRIVATE ntc Vulkan::Vulkan)
+    ntc_warnings(ntc_decbench)
+    add_dependencies(ntc_decbench ntc_shaders)
+    # Exit code 3 means no Vulkan 1.3 device; the test is then skipped.
+    add_test(NAME decbench_check
+             COMMAND ntc_decbench --check-only --shader-dir ${SPV_DIR}
+                     ${CMAKE_SOURCE_DIR}/tests/fixtures/tiny.ntc ${CMAKE_SOURCE_DIR}/tests/fixtures/ctx.ntc)
+    set_tests_properties(decbench_check PROPERTIES SKIP_RETURN_CODE 3)
 
     add_executable(ntc_view examples/realtime_viewer/main.cpp)
     target_link_libraries(ntc_view PRIVATE ntc Vulkan::Vulkan)

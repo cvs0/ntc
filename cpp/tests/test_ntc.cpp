@@ -1,3 +1,4 @@
+#include "ntc/fast.hpp"
 #include "ntc/group_quant.hpp"
 #include "ntc/ntc.hpp"
 #include "../src/range_coder.hpp"
@@ -161,6 +162,37 @@ static void test_wild_offset(const std::string& dir) {
     expect(threw, "wild channel offset throws");
 }
 
+// The fast layout must decode bit-identically to the reference, every mip.
+static void test_fast_layout(const std::string& path) {
+    const auto bytes = read_bin(path);
+    if (bytes.empty()) return;
+    ntc::TextureSet ts = ntc::parse(bytes.data(), bytes.size());
+    ntc::FastUpload fu = ntc::make_fast_upload(ts);
+    expect(fu.ok, "fast upload ok");
+    if (!fu.ok) return;
+    for (uint32_t m = 0; m < ts.num_mips && m < 4; ++m) {
+        auto want = ntc::decode_mip(ts, static_cast<int>(m));
+        auto got = ntc::decode_fast_mip(fu, static_cast<int>(m), static_cast<int>(ts.width), static_cast<int>(ts.height));
+        expect(want.size() == got.size(), "fast size");
+        size_t diff = 0;
+        for (size_t i = 0; i < want.size() && i < got.size(); ++i) diff += want[i] != got[i];
+        if (diff) std::cerr << path << " mip " << m << " fast differs at " << diff << " values\n";
+        expect(diff == 0, "fast layout bit-identical");
+    }
+}
+
+static void test_fast_planes() {
+    auto p = ntc::fast_planes(12, 4);
+    expect(p.size() == 2 && p[0].channels == 8 && p[1].channels == 4, "12x4 planes 8+4");
+    p = ntc::fast_planes(6, 8);
+    expect(p.size() == 2 && p[0].record_bits == 32 && p[1].record_bits == 16, "6x8 planes 32+16");
+    p = ntc::fast_planes(2, 2);
+    expect(p.size() == 1 && p[0].record_bits == 4, "2x2 one 4-bit record");
+    p = ntc::fast_planes(16, 4);
+    expect(p.size() == 2 && p[1].ch0 == 8, "16x4 planes 8+8");
+    expect(ntc::fast_row_words(5, 16) == 3, "row words");
+}
+
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "tests/fixtures";
     test_quant();
@@ -169,6 +201,10 @@ int main(int argc, char** argv) {
     test_ctx_file(dir);
     test_fixture(dir);
     test_wild_offset(dir);
+    test_fast_planes();
+    test_fast_layout(dir + "/tiny.ntc");
+    test_fast_layout(dir + "/ctx.ntc");
+    for (int i = 2; i < argc; ++i) test_fast_layout(argv[i]);
     if (g_fails) {
         std::cerr << g_fails << " failures\n";
         return 1;

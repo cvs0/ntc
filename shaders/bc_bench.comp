@@ -1,0 +1,21 @@
+#version 450
+// Block-compressed baseline at the same output cost as ntc_fast_bench.comp
+// mode 1. BC_TEX textures, each one bilinear textureLod at level 0: 1 is a
+// single BC7 texture, 3 is a BC7 albedo + BC5 normal + BC7 ORM material.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(constant_id = 0) const int BC_TEX = 3;
+layout(set = 0, binding = 0) uniform sampler2D bc_t0;
+layout(set = 0, binding = 1) uniform sampler2D bc_t1;
+layout(set = 0, binding = 2) uniform sampler2D bc_t2;
+layout(std430, set = 0, binding = 3) writeonly buffer BcOut { uint bc_out[]; };
+layout(push_constant) uniform Pc { uint w, h, mip, pad; vec2 uv_scale, uv_offset; } pc;
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= pc.w || id.y >= pc.h) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(float(pc.w), float(pc.h)) * pc.uv_scale + pc.uv_offset;
+    vec4 v = textureLod(bc_t0, uv, 0.0);
+    if (BC_TEX > 1) v += textureLod(bc_t1, uv, 0.0).xyxy;
+    if (BC_TEX > 2) v += textureLod(bc_t2, uv, 0.0);
+    bc_out[id.y * pc.w + id.x] = packUnorm4x8(v * 0.25);
+}
