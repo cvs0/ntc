@@ -106,7 +106,11 @@ RATE_BUFFERS = ("file_rate_scale", "rate_target_bpp", "rate_weight_mult")
 # Bounds of the eval controller (``_steer_rate``).
 RATE_MULT_MAX = 64.0
 RATE_GOAL_FLOOR = 0.5
-RATE_GOAL_CEIL = 1.0
+# The hinge goal is in the loss's model units. When the measured file stays
+# under the budget the goal may climb past it, since the model overstated
+# the file: Bark b10 at 256 went 9.16 bpp / 34.44 dB to 9.70 / 34.91. The
+# export trim still holds the file under the label.
+RATE_GOAL_CEIL = 1.3
 
 
 def rate_guard_on(cfg: TrainConfig) -> bool:
@@ -1431,9 +1435,10 @@ def steer_rate_values(
     ``goal`` is the hinge point in the loss's own estimate, ``budget`` the
     latent file rate the codes must reach. Over budget, the goal moves down
     by the miss (at most 10 percent per eval) and the hinge weight doubles.
-    Under budget, the weight halves back toward 1 and the goal climbs back
-    toward the budget (at most 5 percent per eval). The goal never passes
-    the budget, so a run that was already under the label trains as before.
+    Under budget, the weight halves back toward 1 and the goal climbs
+    (at most 5 percent per eval). The goal never passes
+    the budget by more than ``RATE_GOAL_CEIL``, and only while the measured
+    file is under it.
     """
     if not (math.isfinite(measured) and measured > 0 and budget > 0):
         return goal, mult

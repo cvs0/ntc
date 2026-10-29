@@ -9,6 +9,7 @@ import torch
 from ntc.container import parse_texture_set, rate_report
 from ntc.encode import TrainConfig, export_network
 from ntc.train_fast import (
+    RATE_GOAL_CEIL,
     RATE_MARGIN,
     RATE_MULT_MAX,
     _build_nets,
@@ -30,12 +31,15 @@ def test_steer_over_budget_lowers_goal_and_raises_weight():
     assert goal >= 0.5
 
 
-def test_steer_under_budget_relaxes_but_never_passes_budget():
+def test_steer_under_budget_relaxes_up_to_the_ceiling():
     goal, mult = steer_rate_values(0.8, 8.0, 1.0, 0.9)
     assert mult == 4.0
     assert 0.8 < goal <= 1.0
     goal, mult = steer_rate_values(1.0, 1.0, 1.0, 0.5)
-    assert (goal, mult) == (1.0, 1.0)
+    assert (goal, mult) == (pytest.approx(1.05), 1.0)
+    for _ in range(20):
+        goal, mult = steer_rate_values(goal, mult, 1.0, 0.5)
+    assert goal == pytest.approx(RATE_GOAL_CEIL)
     # A measurement that failed leaves the controller alone.
     assert steer_rate_values(0.9, 2.0, 1.0, float("nan")) == (0.9, 2.0)
 
