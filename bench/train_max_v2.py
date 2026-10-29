@@ -277,18 +277,47 @@ def apply_rate_neighbor(job: dict, out: Path) -> dict:
         target = target / scale
     # A calibrated grid on this label is replaced. Higher labels keep the
     # lower neighbor's lattice and only add channels.
+    if is_cloud_profile(job.get("profile")):
+        target = target * cloud_grid_headroom(float(job["bpp"]))
     grown = grow_grids(
         [tuple(g) for g in lower["grids"]],
         int(job["size"]),
         int(job["size"]),
         target,
     )
+    calibrated = job.get("grids")
+    headroom = cloud_grid_headroom(float(job["bpp"])) if is_cloud_profile(job.get("profile")) else 1.0
+    if calibrated and (headroom > 1.0 or not grown_reaches(grown, int(job["size"]), target)):
+        # The lower lattice tops out near 5 bpp at 16 channels. The label's
+        # own finer lattice reaches the rate, so it trains from scratch on
+        # the full step budget instead. From b10 up the grown chain also
+        # landed 8 to 19 percent under the label (Tiles b10 at 256: 32.48 dB
+        # at 8.83 bpp chained, 33.73 dB at 10.00 bpp on its own lattice).
+        full = int(job.get("full_steps") or 0)
+        if full > int(job["steps"]):
+            job["steps"] = full
+            job["warmup"] = int(job.get("full_warmup") or job.get("warmup") or 200)
+        print(
+            f"own lattice {job['name']} {calibrated}, {lower['name']} grown {grown} "
+            f"is under {target:.2f} raw bpp",
+            flush=True,
+        )
+        return job
     job["grids"] = [list(g) for g in grown]
     prior = out / f"{lower['name']}.pt"
     if prior.is_file() and lower.get("checkpoint") == "trained" and not job.get("warm_start"):
         job["warm_start"] = str(prior)
     print(f"warm start {job['name']} from {lower['name']}", flush=True)
     return job
+
+
+def grown_reaches(grids, size: int, target_raw_bpp: float) -> bool:
+    """True when ``grids`` store at least 95 percent of ``target_raw_bpp``."""
+    from ntc.grids import latent_payload_bits
+
+    pixels = float(max(int(size) * int(size), 1))
+    have = latent_payload_bits([tuple(g) for g in grids]) / pixels
+    return have >= 0.95 * float(target_raw_bpp)
 
 
 def upper_hull(points: list[tuple[float, float, str]]) -> set[str]:
@@ -449,6 +478,19 @@ def cloud_profile_bpp(profile: str | None) -> tuple[float, ...]:
 
 _CLOUD_FIT: dict[tuple, dict[float, tuple]] = {}
 
+# Grids are sized for this much over the label. The PCA coder ratio
+# overestimates the trained file, so a grid fit to the label itself landed
+# 4 to 20 percent under it (Tiles b5 at 256: 4.56 bpp). The hinge and the
+# export trim bring a larger grid down onto the label.
+# Low labels keep the plain fit: a 1.25 grid trimmed onto b1 lost 0.6 to
+# 1.0 dB at 256, more than the 3 percent rate it recovered.
+CLOUD_GRID_HEADROOM = 1.15
+CLOUD_HEADROOM_FROM_BPP = 10.0
+
+
+def cloud_grid_headroom(bpp: float) -> float:
+    return CLOUD_GRID_HEADROOM if float(bpp) >= CLOUD_HEADROOM_FROM_BPP - 1e-9 else 1.0
+
 
 def cloud_latent_setups(
     images,
@@ -483,7 +525,7 @@ def cloud_latent_setups(
             semantics,
             int(size),
             int(size),
-            float(bpp),
+            float(bpp) * cloud_grid_headroom(float(bpp)),
             [32],
             int(images.shape[0]),
             int(min_bits),
@@ -1066,7 +1108,11 @@ def _run_claimed(
                 target,
             )
             trained_grids = [tuple(g) for g in (row.get("grids") or [])]
-            if grown and [tuple(g) for g in grown] != trained_grids:
+            if (
+                grown
+                and [tuple(g) for g in grown] != trained_grids
+                and grown_reaches(grown, int(job["size"]), target)
+            ):
                 print(
                     f"rd {job['name']} {float(row['psnr_u8']):.2f} under {lower['name']} "
                     f"{lower['psnr']:.2f}, retry grown {grown}",
@@ -1137,6 +1183,8 @@ def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list
                 "material": str(root / folder),
                 "size": 2048,
                 "steps": int(steps),
+                "full_steps": CLOUD_FULL_STEPS,
+                "full_warmup": 800,
                 "bpp": float(bpp),
                 "seed": 0,
                 "warmup": 800 if int(steps) >= CLOUD_FULL_STEPS else 400,

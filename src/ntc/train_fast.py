@@ -106,6 +106,7 @@ RATE_BUFFERS = ("file_rate_scale", "rate_target_bpp", "rate_weight_mult")
 # Bounds of the eval controller (``_steer_rate``).
 RATE_MULT_MAX = 64.0
 RATE_GOAL_FLOOR = 0.5
+RATE_GOAL_CEIL = 1.0
 
 
 def rate_guard_on(cfg: TrainConfig) -> bool:
@@ -377,6 +378,15 @@ class _BilinearDeterministic(torch.autograd.Function):
         w01 = tx * (1 - ty)
         w10 = (1 - tx) * ty
         w11 = tx * ty
+
+        if grad.device.type == "cpu" and not torch.compiler.is_compiling():
+            # CPU index_add_ walks the index list in order, so it is already
+            # deterministic. One call for all four taps skips the sort that
+            # made a CPU step take seconds.
+            index = torch.cat([y0i * width + x0i, y0i * width + x1i, y1i * width + x0i, y1i * width + x1i])
+            values = torch.cat([grad_out * w00, grad_out * w01, grad_out * w10, grad_out * w11], dim=1)
+            grad.index_add_(2, index, values.permute(0, 2, 1).contiguous())
+            return grad.view(seeds, channels, height, width), None
 
         def splat(yy: torch.Tensor, xx: torch.Tensor, weight: torch.Tensor) -> None:
             values = (grad_out * weight).permute(0, 2, 1).contiguous()
@@ -1434,7 +1444,7 @@ def steer_rate_values(
     else:
         goal = goal * min(1.05, ratio)
         mult = max(1.0, mult * 0.5)
-    goal = min(budget, max(RATE_GOAL_FLOOR * budget, goal))
+    goal = min(RATE_GOAL_CEIL * budget, max(RATE_GOAL_FLOOR * budget, goal))
     return goal, mult
 
 

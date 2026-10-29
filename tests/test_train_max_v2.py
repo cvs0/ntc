@@ -442,3 +442,77 @@ def test_result_json_records_wall_and_bpp(tmp_path: Path, monkeypatch):
         assert isinstance(got["wall"], float) and got["wall"] >= got["wall_s"] >= 0
         assert got["bpp"] == 0.995
         assert got["target_bpp"] == 1.0
+
+
+def test_label_keeps_its_own_lattice_when_the_lower_one_caps(tmp_path: Path):
+    """b10 on a 64/32 lattice tops out at 16 channels, about 5 raw bpp.
+
+    The label's own finer lattice reaches the rate, so it is kept and the
+    job trains from scratch on the full step budget.
+    """
+    (tmp_path / "sdk_Metal_b5.json").write_text(json.dumps({
+        "name": "sdk_Metal_b5",
+        "done": True,
+        "psnr_u8": 33.45,
+        "grids": [[16, 16, 16, 4], [8, 8, 16, 4]],
+        "checkpoint": "trained",
+    }))
+    (tmp_path / "sdk_Metal_b5.pt").write_bytes(b"pt")
+    own = [[64, 64, 4, 4], [16, 16, 12, 4]]
+    job = {
+        "name": "sdk_Metal_b10",
+        "bpp": 10.0,
+        "rate": "latent",
+        "latent_rate_scale": 0.6,
+        "size": 64,
+        "grids": own,
+        "steps": 1000,
+        "warmup": 400,
+        "full_steps": 2000,
+        "full_warmup": 800,
+    }
+    got = apply_rate_neighbor(job, tmp_path)
+    assert got["grids"] == own
+    assert got.get("warm_start") in (None, "")
+    assert got["steps"] == 2000 and got["warmup"] == 800
+
+
+def test_cloud_b10_trains_on_its_own_lattice(tmp_path: Path):
+    """A grown b5 chain landed 8 to 9.6 bpp on a b10 label at 256."""
+    from bench.train_max_v2 import cloud_grid_headroom
+
+    assert cloud_grid_headroom(5.0) == 1.0
+    assert cloud_grid_headroom(10.0) > 1.0
+    (tmp_path / "cloud_M_2K_b5.json").write_text(json.dumps({
+        "name": "cloud_M_2K_b5",
+        "done": True,
+        "psnr_u8": 31.0,
+        "grids": [[32, 32, 8, 4], [16, 16, 4, 4]],
+        "checkpoint": "trained",
+    }))
+    (tmp_path / "cloud_M_2K_b5.pt").write_bytes(b"pt")
+    own = [[64, 64, 4, 4], [32, 32, 4, 4]]
+    job = {
+        "name": "cloud_M_2K_b10",
+        "bpp": 10.0,
+        "rate": "latent",
+        "latent_rate_scale": 0.6,
+        "size": 64,
+        "grids": own,
+        "steps": 1000,
+        "warmup": 400,
+        "full_steps": 2000,
+        "full_warmup": 800,
+        "profile": "cloudfast",
+    }
+    got = apply_rate_neighbor(job, tmp_path)
+    assert got["grids"] == own
+    assert got.get("warm_start") in (None, "")
+    assert got["steps"] == 2000
+
+
+def test_cloudfast_jobs_carry_the_full_budget():
+    from bench.train_max_v2 import CLOUD_FULL_STEPS, build_cloud_jobs
+
+    jobs = build_cloud_jobs(Path("/nonexistent"), "cloudfast")
+    assert jobs and all(job["full_steps"] == CLOUD_FULL_STEPS for job in jobs)
