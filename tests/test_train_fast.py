@@ -911,11 +911,11 @@ def test_recompile_limit_covers_every_mip_sample_count():
     previous = dyn.recompile_limit
     try:
         dyn.recompile_limit = 8
-        assert _cover_mip_recompiles(12) >= 16
-        assert dyn.recompile_limit >= 16
+        assert _cover_mip_recompiles(12) >= 64
+        assert dyn.recompile_limit >= 64
         # A higher limit already set for another run is left alone.
-        dyn.recompile_limit = 32
-        assert _cover_mip_recompiles(12) == 32
+        dyn.recompile_limit = 128
+        assert _cover_mip_recompiles(12) == 128
     finally:
         dyn.recompile_limit = previous
 

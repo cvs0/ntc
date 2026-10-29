@@ -95,6 +95,26 @@ MLP_ADAM_EPS = 1e-8
 MLP_ADAM_BETAS = (0.9, 0.999)
 
 
+# Rate control. The label is the whole payload (codes, scales, network). The
+# loss hinge saw only the latent estimate, and the eval-time coder ratio is
+# capped at 0.95 and moves halfway per eval, so b1 files on 676ca19 landed
+# 3 to 6 percent over. The loop aims the codes at
+# ``target * (1 - RATE_MARGIN) - overhead`` and the export trims any rest.
+RATE_MARGIN = 0.005
+# Loss-side buffers that follow the stack through ``slice_seeds``.
+RATE_BUFFERS = ("file_rate_scale", "rate_target_bpp", "rate_weight_mult")
+# Bounds of the eval controller (``_steer_rate``).
+RATE_MULT_MAX = 64.0
+RATE_GOAL_FLOOR = 0.5
+
+
+def rate_guard_on(cfg: TrainConfig) -> bool:
+    """True when the run budgets the file rate. NTC_RATE_GUARD=0 turns it off."""
+    if os.environ.get("NTC_RATE_GUARD", "1") == "0":
+        return False
+    return bool(cfg.entropy_rate) and float(cfg.target_bpp) > 0 and cfg.rate == "latent"
+
+
 def wide_latent(grids) -> bool:
     """True when any latent grid has 8 or more channels."""
     return any(int(g[2]) >= 8 for g in grids)
@@ -230,7 +250,10 @@ def _cover_mip_recompiles(mip_levels: int) -> int:
     frame is four times the area batch, and 31 steps/s divided by four is
     the 7.1 steps/s the dense retry measured.
     """
-    needed = max(16, int(mip_levels) + 4)
+    # A chain worker runs every rate of a material in one process. Each grid
+    # adds a seed-pool shape and the noise, STE, and frozen quant phases, so
+    # 16 entries run out by the fourth label and the step after it is eager.
+    needed = max(64, int(mip_levels) + 4)
     current = int(getattr(torch._dynamo.config, "recompile_limit", 8))
     if current < needed:
         torch._dynamo.config.recompile_limit = needed
@@ -273,21 +296,30 @@ def _segment_add(dest: torch.Tensor, index: torch.Tensor, values: torch.Tensor) 
     Indices are sorted and each texel is summed in that order. An atomic
     scatter-add changes the float result when several samples hit one texel,
     which made the same seed train to different files.
+
+    The shapes do not depend on the data. ``unique_consecutive`` did, and
+    under ``torch.compile`` it was a graph break that cannot resume: Dynamo
+    compiled the loss up to the first bilinear tap and ran the rest of the
+    step eager, outside the reduce-overhead CUDA graph. Each sorted run is
+    found with ``searchsorted`` instead. Only the last element of a run
+    carries its sum and every other slot adds an exact zero, so the result
+    is bit-identical to the compacted version.
     """
     if index.numel() == 0:
         return
     order = torch.argsort(index, stable=True)
     index_s = index[order]
     values_s = values[:, :, order]
-    _unique, counts = torch.unique_consecutive(index_s, return_counts=True)
-    ends = torch.cumsum(counts, 0) - 1
+    start = torch.searchsorted(index_s, index_s, right=False)
+    nxt = torch.cat([index_s[1:], index_s.new_full((1,), -1)])
+    is_end = (nxt != index_s).view(1, 1, -1)
     csum = torch.cumsum(values_s, dim=2)
-    gathered = csum.index_select(2, ends)
-    prev = ends - counts
+    prev = start - 1
     prev_vals = csum.index_select(2, prev.clamp(min=0))
     first = (prev < 0).view(1, 1, -1)
-    summed = torch.where(first, gathered, gathered - prev_vals)
-    dest.index_add_(2, index_s[ends], summed)
+    summed = torch.where(first, csum, csum - prev_vals)
+    summed = torch.where(is_end, summed, torch.zeros_like(summed))
+    dest.index_add_(2, index_s, summed)
 
 
 def _bilinear_forward(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
@@ -409,6 +441,9 @@ class StackedTrain(nn.Module):
         self.group_size = ref.group_size
         self.layer_bits = tuple(ref.layer_bits)
         self.n_seeds = len(nets)
+        # Same as the getattr default in prepare_mip_chains. Set here so the
+        # compiled step does not specialize once on the attribute missing.
+        self.latent_proxy = "ste"
         self.latents = nn.ParameterList(
             [
                 nn.Parameter(torch.stack([n.latents[i].detach() for n in nets], 0))
@@ -575,9 +610,12 @@ class StackedTrain(nn.Module):
         out.quantize = self.quantize
         out.quantize_weights = self.quantize_weights
         out.allow_weight_qat = self.allow_weight_qat
-        src_scale = getattr(self, "file_rate_scale", None)
-        if src_scale is not None and getattr(out, "file_rate_scale", None) is None:
-            out.register_buffer("file_rate_scale", src_scale.detach().clone())
+        for name in RATE_BUFFERS:
+            src_buf = getattr(self, name, None)
+            if src_buf is not None and getattr(out, name, None) is None:
+                out.register_buffer(name, src_buf.detach().clone())
+        if hasattr(self, "rate_budget_bpp"):
+            out.rate_budget_bpp = self.rate_budget_bpp
         with torch.no_grad():
             for dst, src in zip(out.latents, self.latents, strict=True):
                 dst.copy_(src.index_select(0, index))
@@ -1040,8 +1078,16 @@ def _loss_from_mips(
                 rate_bpp = file_rate_bpp(model_bpp, float(cfg.latent_rate_scale))
             else:
                 rate_bpp = file_rate_bpp(model_bpp, scale_t)
-            excess = (rate_bpp - float(cfg.target_bpp)).clamp(min=0.0)
+            # The goal and the weight multiplier are buffers that the eval
+            # controller moves (``_steer_rate``). Without them the goal is
+            # the label and the multiplier is 1, the old penalty.
+            goal_t = getattr(stacked, "rate_target_bpp", None)
+            goal = float(cfg.target_bpp) if goal_t is None else goal_t
+            excess = (rate_bpp - goal).clamp(min=0.0)
             weight = 0.002 / max(float(cfg.target_bpp), 0.5)
+            mult_t = getattr(stacked, "rate_weight_mult", None)
+            if mult_t is not None:
+                excess = excess * mult_t
             distortion = distortion + excess * weight
         return distortion
     finally:
@@ -1127,6 +1173,72 @@ def portable_step_plan(
     return compile_step, schedule == "constant"
 
 
+# Compiler log lines that repeat for every graph, rate and worker without
+# saying anything new: autotune candidates that do not fit the card, CUDA
+# graph skips, the AOT cache bypass on the custom bilinear autograd
+# function, and the dynamic-shape graph count. The first of each still prints.
+KNOWN_COMPILE_NOISE = (
+    "Runtime error during autotuning",
+    "out of resource",
+    "skipping cudagraphs",
+    "Bypassing autograd cache",
+    "CUDAGraph supports dynamic shapes by recording a new graph",
+    "cudagraph_dynamic_shape_warn_limit",
+    "Not enough SMs to use max_autotune_gemm",
+    "TensorFloat32 tensor cores",
+)
+
+
+class CompileNoiseFilter:
+    """Logging filter: each known compiler message once, everything else as is."""
+
+    def __init__(self, patterns=KNOWN_COMPILE_NOISE) -> None:
+        self.patterns = tuple(patterns)
+        self.counts: dict[str, int] = {}
+
+    def filter(self, record) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:
+            return True
+        if record.exc_info and record.exc_info[1] is not None:
+            text = f"{text} {record.exc_info[1]}"
+        for pattern in self.patterns:
+            if pattern in text:
+                seen = self.counts.get(pattern, 0)
+                self.counts[pattern] = seen + 1
+                if seen:
+                    return False
+                record.msg = f"{record.msg} (later repeats of this message are hidden)"
+                return True
+        return True
+
+
+_NOISE_FILTER = CompileNoiseFilter()
+
+
+def install_compile_log_filter() -> CompileNoiseFilter:
+    """Put the shared filter on every handler of the ``torch`` loggers.
+
+    torch gives each logger its own handler and turns propagation off, so a
+    filter on one logger does not see its children. Handler filters do.
+    Safe to call more than once. NTC_COMPILE_LOGS=all leaves logs alone.
+    """
+    if os.environ.get("NTC_COMPILE_LOGS") == "all":
+        return _NOISE_FILTER
+    import logging
+
+    loggers = [logging.getLogger("torch")]
+    for name, item in list(logging.root.manager.loggerDict.items()):
+        if name.startswith("torch") and isinstance(item, logging.Logger):
+            loggers.append(item)
+    for logger in loggers:
+        for handler in logger.handlers:
+            if _NOISE_FILTER not in handler.filters:
+                handler.addFilter(_NOISE_FILTER)
+    return _NOISE_FILTER
+
+
 def configure_inductor_process(shard: str | None = None) -> str:
     """Private Inductor and Triton caches, and no compile-worker pool.
 
@@ -1159,6 +1271,7 @@ def configure_inductor_process(shard: str | None = None) -> str:
         inductor_config.compile_threads = 1
     except Exception:
         pass
+    install_compile_log_filter()
     return os.environ["TORCHINDUCTOR_CACHE_DIR"]
 
 
@@ -1194,6 +1307,51 @@ def compile_attempts(device_type: str) -> list[str]:
     if forced:
         attempts = [forced] + [mode for mode in attempts if mode != forced]
     return attempts
+
+
+def identical_seed_pool(nets: list) -> bool:
+    """True when every net of a pool holds the same parameters and buffers.
+
+    ``_transplant_checkpoint`` copies the cheaper label's latents and MLP and
+    sets the new channels to fixed values, so a warm-started pool starts from
+    one net. ``NTC_KEEP_IDENTICAL_POOL=1`` keeps the pool anyway.
+    """
+    if len(nets) < 2 or os.environ.get("NTC_KEEP_IDENTICAL_POOL", "") == "1":
+        return False
+    ref = nets[0].state_dict()
+    for net in nets[1:]:
+        other = net.state_dict()
+        if other.keys() != ref.keys():
+            return False
+        for key, value in ref.items():
+            peer = other[key]
+            if not torch.is_tensor(value):
+                if value != peer:
+                    return False
+                continue
+            if value.shape != peer.shape or not torch.equal(value, peer):
+                return False
+    return True
+
+
+_COMPILED_LOSS: dict[str, object] = {}
+
+
+def compiled_loss_fn(mode: str):
+    """One ``torch.compile`` wrapper per mode for the whole process.
+
+    ``_run_loop`` is entered once per halving rung and once per eval span.
+    Dynamo keeps its cache on the code object, so a later span or a later
+    job with the same grid and quant phase reuses the compiled step. One
+    wrapper keeps that reuse from depending on a fresh ``torch.compile``
+    call resolving to the same backend every time.
+    """
+    fn = _COMPILED_LOSS.get(mode)
+    if fn is None:
+        install_compile_log_filter()
+        fn = torch.compile(_loss_from_mips, dynamic=False, mode=mode)
+        _COMPILED_LOSS[mode] = fn
+    return fn
 
 
 def _format_eta(seconds: float) -> str:
@@ -1235,19 +1393,151 @@ def _refresh_file_rate_scale(stacked: StackedTrain, cfg: TrainConfig, pixels: in
     scale_t = getattr(stacked, "file_rate_scale", None)
     if scale_t is None or stacked.n_seeds != 1 or not cfg.entropy_rate:
         return
-    if not (0.0 < float(cfg.latent_rate_scale) < 1.0):
-        return
-    from ntc.entropy import blend_file_rate_scale, latent_rate_bits
+    measured = None
+    if 0.0 < float(cfg.latent_rate_scale) < 1.0:
+        from ntc.entropy import blend_file_rate_scale, latent_rate_bits
 
-    model = float(latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels))
-    measured = measure_latent_file_bpp(stacked, pixels)
-    updated = blend_file_rate_scale(
-        float(scale_t.detach().cpu()),
-        float(cfg.latent_rate_scale),
-        measured,
-        model,
+        with torch.no_grad():
+            model = float(latent_rate_bits(list(stacked.latents), list(stacked.grid_bits)) / float(pixels))
+        measured = measure_latent_file_bpp(stacked, pixels)
+        updated = blend_file_rate_scale(
+            float(scale_t.detach().cpu()),
+            float(cfg.latent_rate_scale),
+            measured,
+            model,
+        )
+        scale_t.fill_(updated)
+    if getattr(stacked, "rate_target_bpp", None) is not None:
+        if measured is None:
+            measured = measure_latent_file_bpp(stacked, pixels)
+        _steer_rate(stacked, measured)
+
+
+def steer_rate_values(
+    goal: float, mult: float, budget: float, measured: float
+) -> tuple[float, float]:
+    """One controller update from a measured latent file rate.
+
+    ``goal`` is the hinge point in the loss's own estimate, ``budget`` the
+    latent file rate the codes must reach. Over budget, the goal moves down
+    by the miss (at most 10 percent per eval) and the hinge weight doubles.
+    Under budget, the weight halves back toward 1 and the goal climbs back
+    toward the budget (at most 5 percent per eval). The goal never passes
+    the budget, so a run that was already under the label trains as before.
+    """
+    if not (math.isfinite(measured) and measured > 0 and budget > 0):
+        return goal, mult
+    ratio = budget / measured
+    if measured > budget:
+        goal = goal * max(0.9, ratio)
+        mult = min(RATE_MULT_MAX, mult * 2.0)
+    else:
+        goal = goal * min(1.05, ratio)
+        mult = max(1.0, mult * 0.5)
+    goal = min(budget, max(RATE_GOAL_FLOOR * budget, goal))
+    return goal, mult
+
+
+def _steer_rate(stacked: StackedTrain, measured: float) -> None:
+    goal_t = stacked.rate_target_bpp
+    mult_t = stacked.rate_weight_mult
+    budget = float(getattr(stacked, "rate_budget_bpp", float(goal_t.detach().cpu())))
+    goal, mult = steer_rate_values(
+        float(goal_t.detach().cpu()), float(mult_t.detach().cpu()), budget, float(measured)
     )
-    scale_t.fill_(updated)
+    goal_t.fill_(goal)
+    mult_t.fill_(mult)
+
+
+def rate_overhead_bpp(
+    net: NtcNet,
+    semantics,
+    width: int,
+    height: int,
+    num_mips: int,
+    latent_deflate: bool,
+    latent_coder: str,
+) -> float:
+    """Payload bpp that is not latent codes: scales, tile tables and the network.
+
+    Those bytes depend on layout, not on code values. A copy with all-zero
+    codes exports in a fraction of the time of the real grids and gives the
+    same non-latent bytes.
+    """
+    import copy
+
+    from ntc.container import parse_texture_set, rate_report
+
+    shell = copy.deepcopy(net).cpu()
+    with torch.no_grad():
+        for lat in shell.latents:
+            lat.zero_()
+    blob = export_network(
+        shell, semantics, width, height, num_mips, latent_deflate=latent_deflate, latent_coder=latent_coder
+    )
+    rates = rate_report(parse_texture_set(blob))
+    extra = int(rates["payload_bytes"]) - int(rates["latent_code_bytes"])
+    return 8.0 * max(0, extra) / float(max(1, int(width) * int(height)))
+
+
+def trim_latents_to_rate(
+    net: NtcNet, export_fn, limit_bpp: float, window: float = RATE_MARGIN, iters: int = 24
+):
+    """Fold codes nearest each channel's mode into it until the file fits.
+
+    ``export_fn(net)`` returns ``(blob, total_bpp)``. Codes off the mode are
+    ranked by distance to it, nearest first: those are the cheapest bits to
+    drop and the smallest change to the decode. Trained codes pile up just
+    past the rounding edge, so a distance threshold jumps; a count does not.
+    A bisection on the count keeps the fewest snaps that fit, and stops once
+    the file is within ``window`` under ``limit_bpp``. Returns
+    ``(blob, total_bpp, snapped)``; ``snapped`` is None when even snapping
+    every code does not fit, and then the most trimmed file is returned.
+    """
+    base = [lat.detach().clone() for lat in net.latents]
+    modes = []
+    dists = []
+    for lat in base:
+        code = torch.round(lat.float())
+        flat = code.reshape(lat.shape[0], -1)
+        mode = flat.mode(dim=1).values.reshape(-1, *([1] * (lat.dim() - 1)))
+        modes.append(mode.to(lat.dtype))
+        dist = (lat.float() - mode).abs()
+        # Codes that already round to the mode cost nothing to leave alone.
+        dists.append(torch.where(code == mode, torch.full_like(dist, float("inf")), dist).reshape(-1))
+    order = torch.argsort(torch.cat(dists), stable=True)
+    total = int(sum(int(torch.isfinite(d).sum()) for d in dists))
+    sizes = [int(d.numel()) for d in dists]
+
+    def _apply(count: int):
+        pick = torch.zeros(sum(sizes), dtype=torch.bool)
+        pick[order[:count]] = True
+        with torch.no_grad():
+            offset = 0
+            for lat, src, mode, size in zip(net.latents, base, modes, sizes, strict=True):
+                near = pick[offset : offset + size].reshape(src.shape).to(src.device)
+                lat.copy_(torch.where(near, mode.expand_as(src), src))
+                offset += size
+        return export_fn(net)
+
+    blob_hi, bpp_hi = _apply(total)
+    if bpp_hi > limit_bpp:
+        return blob_hi, bpp_hi, None
+    lo, hi = 0, total
+    best = (blob_hi, bpp_hi, total)
+    floor = float(limit_bpp) * (1.0 - float(window))
+    for _ in range(int(iters)):
+        if hi - lo <= 1 or best[1] >= floor:
+            break
+        mid = (lo + hi) // 2
+        blob_m, bpp_m = _apply(mid)
+        if bpp_m <= limit_bpp:
+            hi = mid
+            best = (blob_m, bpp_m, mid)
+        else:
+            lo = mid
+    _apply(best[2])
+    return best
 
 
 def _log_progress(
@@ -1444,7 +1734,7 @@ def _run_loop(
         _mark_sample_shapes(mips, graph_idx)
         for compile_mode in attempts:
             try:
-                compiled_loss = torch.compile(_loss_from_mips, dynamic=False, mode=compile_mode)
+                compiled_loss = compiled_loss_fn(compile_mode)
                 # Touch it once outside the timed region of the caller. A failure
                 # here is recorded and the eager function stays in use.
                 probe = compiled_loss(
@@ -2137,6 +2427,13 @@ def encode_arrays_fast(
         seeds = [cfg.seed]
     target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
     nets = _build_nets(target, cfg, grids, seeds, device)
+    pooled = len(seeds) > 1
+    if pooled and identical_seed_pool(nets):
+        # A warm start overwrites every parameter the seed drew, so the
+        # pool would train the same net three times for the first rung.
+        print(f"seed pool {len(seeds)} -> 1, warm-started seeds are identical", flush=True)
+        nets = nets[:1]
+        seeds = seeds[:1]
     if cfg.resume:
         ckpt = torch.load(cfg.resume, map_location=device, weights_only=False)
         nets[0].load_state_dict(ckpt["model"])
@@ -2155,6 +2452,24 @@ def encode_arrays_fast(
         "file_rate_scale",
         torch.tensor(float(cfg.latent_rate_scale), device=device),
     )
+    rate_guard = rate_guard_on(cfg)
+    rate_overhead = 0.0
+    if rate_guard:
+        # Aim the codes at what the label leaves after scales and network,
+        # minus a small margin, so the whole file lands just under.
+        rate_overhead = rate_overhead_bpp(
+            nets[0],
+            semantics,
+            width,
+            height,
+            min(8, int(math.floor(math.log2(max(width, height)))) + 1),
+            cfg.latent_deflate,
+            cfg.latent_coder if cfg.latent_deflate else "raw",
+        )
+        budget = max(1e-6, float(cfg.target_bpp) * (1.0 - RATE_MARGIN) - rate_overhead)
+        stacked.rate_budget_bpp = budget
+        stacked.register_buffer("rate_target_bpp", torch.tensor(budget, device=device))
+        stacked.register_buffer("rate_weight_mult", torch.tensor(1.0, device=device))
     amp_dtype = None
     if cfg.precision == "bf16":
         amp_dtype = torch.bfloat16
@@ -2217,7 +2532,7 @@ def encode_arrays_fast(
     best_val = -1e9
     images_bank = target.unsqueeze(0).expand(stacked.n_seeds, -1, -1, -1).contiguous()
     rewind = None
-    if stacked.n_seeds == 1 and cfg.steps >= 4 and not cfg.resume:
+    if stacked.n_seeds == 1 and not pooled and cfg.steps >= 4 and not cfg.resume:
         rewind = {
             "init_score": _psnr_per_seed(stacked, images_bank, device)[0],
             "retries": 0,
@@ -2390,6 +2705,21 @@ def encode_arrays_fast(
         decoded = _decode(parsed, 0)
         return exported, decoded, psnr_u8(decoded, ref)
 
+    rate_limit = float(cfg.target_bpp)
+
+    def _blob_bpp(data: bytes) -> float:
+        return float(rate_report(parse_texture_set(data))["total_bpp"])
+
+    def _prefer_export(new_blob: bytes, new_psnr: float, old_blob: bytes, old_psnr: float) -> bool:
+        # Two trained states: a file within the label beats one over it.
+        # Otherwise the higher PSNR wins, as before.
+        if rate_guard:
+            fits_new = _blob_bpp(new_blob) <= rate_limit
+            fits_old = _blob_bpp(old_blob) <= rate_limit
+            if fits_new != fits_old:
+                return fits_new
+        return _better_psnr(new_psnr, old_psnr)
+
     # The parameters here are the last step. best_state is the eval whose
     # loop score was highest. On b10 that loop score was 12.67 while the
     # file was 33.07, so the loop ranking is not the file. Keep whichever
@@ -2410,7 +2740,7 @@ def encode_arrays_fast(
             for param, src in zip(stacked.parameters(), best_state, strict=True):
                 param.copy_(src)
         blob_b, recon_b, psnr_b = _export_current()
-        if _better_psnr(psnr_b, trained_psnr):
+        if _prefer_export(blob_b, psnr_b, blob, trained_psnr):
             blob, recon, trained_psnr = blob_b, recon_b, psnr_b
         else:
             with torch.no_grad():
@@ -2435,6 +2765,46 @@ def encode_arrays_fast(
         if _better_psnr(init_psnr, trained_psnr) and not disagree:
             blob, recon, kept = blob_i, recon_i, "init"
             ts = parse_texture_set(blob)
+    rate_trim = None
+    if rate_guard and _blob_bpp(blob) > rate_limit:
+        # Last resort when the loop ended over the label: fold codes next to
+        # each channel's mode into it until the whole file fits.
+        if kept == "init":
+            src_net = init_net
+            psnr_before = float(init_psnr)
+        else:
+            stacked.write_seed(winner, export_net)
+            src_net = export_net
+            psnr_before = float(trained_psnr)
+        before_bpp = _blob_bpp(blob)
+
+        def _export_bpp(net: NtcNet) -> tuple[bytes, float]:
+            data = export_network(
+                net, semantics, width, height, num_mips, latent_deflate=cfg.latent_deflate, latent_coder=coder
+            )
+            return data, _blob_bpp(data)
+
+        blob_t, bpp_t, snapped = trim_latents_to_rate(src_net, _export_bpp, rate_limit)
+        recon_t = _decode(parse_texture_set(blob_t), 0)
+        psnr_t = float(psnr_u8(recon_t, ref))
+        blob, recon = blob_t, recon_t
+        ts = parse_texture_set(blob)
+        if kept == "init":
+            init_psnr = psnr_t
+        else:
+            trained_psnr = psnr_t
+        rate_trim = {
+            "before_bpp": before_bpp,
+            "after_bpp": bpp_t,
+            "snapped_codes": snapped,
+            "psnr_before": psnr_before,
+            "psnr_after": psnr_t,
+        }
+        print(
+            f"rate trim {before_bpp:.4f} -> {bpp_t:.4f} bpp (label {rate_limit:g}) "
+            f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
+            flush=True,
+        )
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
         "psnr_u8": psnr_u8(recon, ref),
     }
@@ -2493,6 +2863,16 @@ def encode_arrays_fast(
         "latent_stored_bytes": ts.latent_stored_bytes,
         "latent_plain_bytes": ts.latent_plain_bytes,
         "metrics": metrics,
+        "rate_guard": rate_guard,
+        "rate_overhead_bpp": rate_overhead,
+        "rate_budget_bpp": getattr(stacked, "rate_budget_bpp", None),
+        "rate_goal_bpp": None
+        if getattr(stacked, "rate_target_bpp", None) is None
+        else float(stacked.rate_target_bpp.detach().cpu()),
+        "rate_weight_mult": None
+        if getattr(stacked, "rate_weight_mult", None) is None
+        else float(stacked.rate_weight_mult.detach().cpu()),
+        "rate_trim": rate_trim,
         "fused_kernel": "not_used",
         "fused_kernel_reason": "enabled only when a CUDA profile names the bilinear gather as the busy op",
         **rates,
