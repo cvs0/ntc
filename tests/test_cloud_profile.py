@@ -106,9 +106,9 @@ def test_cloud_queue_shape_and_hours():
     assert held.isdisjoint({job["name"] for job in jobs})
     assert all(is_dense_2k(job) for job in jobs)
     hours = cloud_queue_gpu_hours(jobs)
-    steps = sum(int(job["steps"]) for job in jobs)
+    steps = sum(int(job["full_steps"] if job["bpp"] >= 10 else job["steps"]) for job in jobs)
     assert hours == pytest.approx(steps * CLOUD_SEED_FACTOR / CLOUD_STEPS_PER_S / 3600.0)
-    assert 8 < hours < 12
+    assert 8 < hours < 14
     assign = assign_shards(jobs, 5)
     assert sorted(set(assign)) == [0, 1, 2, 3, 4]
 

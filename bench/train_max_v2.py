@@ -584,11 +584,26 @@ def watch_first_step(job_name: str, timeout_s: float | None = None) -> threading
     return stop
 
 
+def planned_steps(job: dict) -> int:
+    """Steps a ladder job runs when nothing stops it early."""
+    steps = int(job["steps"])
+    full = int(job.get("full_steps") or 0)
+    if full and cloud_grid_headroom(float(job.get("bpp") or 0)) > 1.0:
+        return max(steps, full)
+    return steps
+
+
 def cloud_queue_gpu_hours(jobs: list[dict] | None = None) -> float:
-    """GPU-hours for the cloud queue on the 30 steps/s budget."""
+    """GPU-hours for the cloud queue on the 30 steps/s budget.
+
+    Labels from ``CLOUD_HEADROOM_FROM_BPP`` up always train their own
+    lattice for ``full_steps``. A lower label also does when its grown
+    lattice cannot reach the rate, which is decided at run time, so it is
+    counted at its chain budget here.
+    """
     if jobs is None:
         jobs = build_cloud_jobs(Path("."))
-    steps = sum(int(job["steps"]) for job in jobs)
+    steps = sum(planned_steps(job) for job in jobs)
     return steps * CLOUD_SEED_FACTOR / CLOUD_STEPS_PER_S / 3600.0
 
 
