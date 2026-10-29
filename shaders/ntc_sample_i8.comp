@@ -19,7 +19,8 @@ int ntc_dot4(int w0, int w1, int w2, int w3, int x0, int x1, int x2, int x3) {
 #ifdef NTC_HAVE_DOT4
     uint wp = (uint(w0) & 255u) | ((uint(w1) & 255u) << 8) | ((uint(w2) & 255u) << 16) | ((uint(w3) & 255u) << 24);
     uint xp = (uint(x0) & 255u) | ((uint(x1) & 255u) << 8) | ((uint(x2) & 255u) << 16) | ((uint(x3) & 255u) << 24);
-    return int(dotPacked4x8EXT(wp, xp));
+    // int operands select the signed dot; the uint overload is unsigned.
+    return dotPacked4x8EXT(int(wp), int(xp));
 #else
     i8vec4 wv = i8vec4(int8_t(w0), int8_t(w1), int8_t(w2), int8_t(w3));
     i8vec4 xv = i8vec4(int8_t(x0), int8_t(x1), int8_t(x2), int8_t(x3));
