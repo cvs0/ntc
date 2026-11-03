@@ -60,6 +60,34 @@ jobs:
           cmake --build build --config Release --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
           ctest --test-dir build -C Release -R test_ntc --output-on-failure
 
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install cmake ninja glslang molten-vk vulkan-loader vulkan-headers vulkan-tools
+          ICD="$(find "$(brew --prefix molten-vk)" "$(brew --prefix vulkan-loader)" -name 'MoltenVK_icd.json' | head -1)"
+          test -n "$ICD"
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$ICD" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: python
+        run: |
+          pip install torch numpy pillow pytest ruff
+      - name: pytest
+        run: PYTHONPATH=src pytest -q
+      - name: cmake
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+          ./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
+          ./build/ntc_decbench --check-only --sizes 64x64 --shader-dir build/shaders tests/fixtures/tiny.ntc tests/fixtures/ctx.ntc
+
   windows-clang:
     runs-on: windows-latest
     steps:

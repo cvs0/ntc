@@ -316,6 +316,21 @@ bench/decbench.sh
 ```
 
 ```sh
+# Apple Silicon, macOS. Homebrew molten-vk, vulkan-loader, vulkan-headers,
+# vulkan-tools, glslang, cmake, ninja. MoltenVK is a portability driver:
+# the hosts enable VK_KHR_portability_enumeration on the instance and
+# VK_KHR_portability_subset on the device. ntc_gl is not built (no EGL).
+# fp16, int8 dot, BC, and cooperative matrix run only when the device
+# reports them. The fp32 path is the one that must match the CPU decoder
+# within 1e-3.
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
+./build/ntc_decbench --check-only --shader-dir build/shaders tests/fixtures/tiny.ntc
+```
+
+```sh
 # cost model, any machine
 PYTHONPATH=src python -m ntc.cost results/train_sweep/metal_g16_s4000_foot.ntc
 ```

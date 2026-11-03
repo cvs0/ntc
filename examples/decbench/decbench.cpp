@@ -27,10 +27,12 @@
 
 #include "ntc/fast.hpp"
 #include "ntc/ntc.hpp"
+#include "ntc/vk_host.hpp"
 
 #include <vulkan/vulkan.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -68,6 +70,10 @@ struct Ctx {
     bool dot_accel = false;
     bool exec_props = false;
     bool bc = false;
+    bool portability = false;
+    bool gpu_time = false;
+    uint32_t max_invocations = 0;
+    uint32_t max_shared = 0;
     PFN_vkGetPipelineExecutablePropertiesKHR get_exec = nullptr;
     PFN_vkGetPipelineExecutableStatisticsKHR get_stats = nullptr;
 };
@@ -314,7 +320,8 @@ Pipe make_pipe(const Ctx& c, const std::string& spv_path, const std::vector<VkDe
     const auto code = read_spv(spv_path);
     if (code.empty()) {
         std::fprintf(stderr, "missing %s\n", spv_path.c_str());
-        std::exit(2);
+        free_pipe(c, p);
+        return Pipe{};
     }
     VkShaderModuleCreateInfo mi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     mi.codeSize = code.size() * 4;
@@ -337,8 +344,13 @@ Pipe make_pipe(const Ctx& c, const std::string& spv_path, const std::vector<VkDe
     ci.stage.pSpecializationInfo = spec.empty() ? nullptr : &si;
     ci.layout = p.pl;
     if (c.exec_props) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-    VKC(vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe));
+    const VkResult pr = vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
     vkDestroyShaderModule(c.dev, mod, nullptr);
+    if (pr != VK_SUCCESS || !p.pipe) {
+        std::fprintf(stderr, "pipeline failed %d for %s\n", static_cast<int>(pr), spv_path.c_str());
+        free_pipe(c, p);
+        return Pipe{};
+    }
     p.stats = pipeline_stats(c, p.pipe);
 
     std::vector<VkDescriptorPoolSize> ps;
@@ -417,6 +429,34 @@ struct Timing {
 
 Timing time_pipe(const Ctx& c, const Pipe& p, const void* pc, uint32_t pc_size, uint32_t w, uint32_t h, int warmup,
                  int iters) {
+    auto finish = [](std::vector<double> ms) {
+        std::sort(ms.begin(), ms.end());
+        Timing t;
+        t.min_ms = ms.front();
+        t.median_ms = ms[ms.size() / 2];
+        t.p95_ms = ms[std::min(ms.size() - 1, static_cast<size_t>(std::ceil(0.95 * ms.size())) - 1)];
+        return t;
+    };
+    if (!c.gpu_time) {
+        auto once = [&]() {
+            VkCommandBuffer cb = begin_cmd(c);
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pipe);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, p.pl, 0, 1, &p.set, 0, nullptr);
+            vkCmdPushConstants(cb, p.pl, VK_SHADER_STAGE_COMPUTE_BIT, 0, pc_size, pc);
+            vkCmdDispatch(cb, (w + 7) / 8, (h + 7) / 8, 1);
+            barrier(cb);
+            end_cmd(c, cb);
+        };
+        for (int i = 0; i < warmup; ++i) once();
+        std::vector<double> ms(static_cast<size_t>(iters));
+        for (int i = 0; i < iters; ++i) {
+            const auto t0 = std::chrono::steady_clock::now();
+            once();
+            ms[static_cast<size_t>(i)] =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        }
+        return finish(std::move(ms));
+    }
     VkQueryPoolCreateInfo qi{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
     qi.queryType = VK_QUERY_TYPE_TIMESTAMP;
     qi.queryCount = static_cast<uint32_t>(2 * iters);
@@ -442,25 +482,18 @@ Timing time_pipe(const Ctx& c, const Pipe& p, const void* pc, uint32_t pc_size, 
     std::vector<double> ms(iters);
     for (int i = 0; i < iters; ++i)
         ms[i] = static_cast<double>(ts[2 * i + 1] - ts[2 * i]) * c.props.limits.timestampPeriod * 1e-6;
-    std::sort(ms.begin(), ms.end());
-    Timing t;
-    t.min_ms = ms.front();
-    t.median_ms = ms[ms.size() / 2];
-    t.p95_ms = ms[std::min(ms.size() - 1, static_cast<size_t>(std::ceil(0.95 * ms.size())) - 1)];
-    return t;
+    return finish(std::move(ms));
 }
 
 Ctx make_ctx(int want_dev) {
     Ctx c;
-    VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-    app.pApplicationName = "ntc_decbench";
-    app.apiVersion = VK_API_VERSION_1_3;
-    VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-    ici.pApplicationInfo = &app;
-    if (vkCreateInstance(&ici, nullptr, &c.inst) != VK_SUCCESS) {
-        std::fprintf(stderr, "no vulkan 1.3 instance\n");
+    auto created = ntc::vkhost::create_instance("ntc_decbench", VK_API_VERSION_1_3);
+    if (!created.handle) {
+        std::fprintf(stderr, "no vulkan 1.3 instance: %s\n", created.error.c_str());
         std::exit(3);
     }
+    c.inst = created.handle;
+    c.portability = created.portability;
     uint32_t n = 0;
     vkEnumeratePhysicalDevices(c.inst, &n, nullptr);
     if (n == 0) {
@@ -487,20 +520,35 @@ Ctx make_ctx(int want_dev) {
         std::exit(3);
     }
 
+    const auto caps = ntc::vkhost::query_caps(c.phys);
+    c.max_invocations = caps.max_compute_invocations;
+    c.max_shared = caps.max_shared_memory;
+    if (caps.max_compute_invocations && caps.max_compute_invocations < 64) {
+        std::fprintf(stderr, "compute workgroup limit %u is below the 8x8 decode shader\n",
+                     caps.max_compute_invocations);
+        std::exit(3);
+    }
     uint32_t qn = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(c.phys, &qn, nullptr);
     std::vector<VkQueueFamilyProperties> qf(qn);
     vkGetPhysicalDeviceQueueFamilyProperties(c.phys, &qn, qf.data());
     c.qfam = UINT32_MAX;
-    for (uint32_t i = 0; i < qn; ++i)
-        if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && qf[i].timestampValidBits > 0) {
+    uint32_t fallback_q = UINT32_MAX;
+    for (uint32_t i = 0; i < qn; ++i) {
+        if ((qf[i].queueFlags & VK_QUEUE_COMPUTE_BIT) == 0) continue;
+        if (fallback_q == UINT32_MAX) fallback_q = i;
+        if (qf[i].timestampValidBits > 0) {
             c.qfam = i;
+            c.gpu_time = true;
             break;
         }
+    }
+    if (c.qfam == UINT32_MAX) c.qfam = fallback_q;
     if (c.qfam == UINT32_MAX) {
-        std::fprintf(stderr, "no compute queue with timestamps\n");
+        std::fprintf(stderr, "no compute queue\n");
         std::exit(3);
     }
+    if (!c.gpu_time) std::fprintf(stderr, "no timestamp bits; timing on the host clock\n");
 
     uint32_t en = 0;
     vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &en, nullptr);
@@ -545,16 +593,18 @@ Ctx make_ctx(int want_dev) {
     VkPhysicalDeviceVulkan12Features v12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
     v12.shaderFloat16 = c.fp16 ? VK_TRUE : VK_FALSE;
     v12.pNext = &v13;
+    std::vector<const char*> extra_ext;
+    if (c.exec_props) extra_ext.push_back(VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
+    auto extras = ntc::vkhost::device_extras(c.phys, extra_ext);
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.features.textureCompressionBC = c.bc ? VK_TRUE : VK_FALSE;
-    f2.pNext = &v12;
-    const char* ext_names[] = {VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME};
+    f2.pNext = extras.chain(&v12);
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &f2;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = c.exec_props ? 1u : 0u;
-    dci.ppEnabledExtensionNames = ext_names;
+    dci.enabledExtensionCount = static_cast<uint32_t>(extras.extensions.size());
+    dci.ppEnabledExtensionNames = extras.extensions.empty() ? nullptr : extras.extensions.data();
     VKC(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
     vkGetDeviceQueue(c.dev, c.qfam, 0, &c.queue);
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -566,9 +616,11 @@ Ctx make_ctx(int want_dev) {
         c.get_stats = reinterpret_cast<PFN_vkGetPipelineExecutableStatisticsKHR>(
             vkGetDeviceProcAddr(c.dev, "vkGetPipelineExecutableStatisticsKHR"));
     }
-    std::printf("using %s driver %u fp16 %d int_dot %d int_dot_accel %d exec_stats %d bc %d max_ubo %u\n",
-                c.props.deviceName, c.props.driverVersion, c.fp16, c.dot, c.dot_accel, c.exec_props, c.bc,
-                c.props.limits.maxUniformBufferRange);
+    std::printf(
+        "using %s driver %u fp16 %d int_dot %d int_dot_accel %d exec_stats %d bc %d portability %d "
+        "timestamps %d workgroup %u shared %u subgroup %u max_ubo %u\n",
+        c.props.deviceName, c.props.driverVersion, c.fp16, c.dot, c.dot_accel, c.exec_props, c.bc, c.portability,
+        c.gpu_time, c.max_invocations, c.max_shared, caps.subgroup_size, c.props.limits.maxUniformBufferRange);
     return c;
 }
 
@@ -767,6 +819,10 @@ int main(int argc, char** argv) {
                     std::vector<int32_t> sp(fu.spec.begin(), fu.spec.end());
                     sp.push_back(mode);
                     Pipe p = make_pipe(c, shader_dir + "/" + v.spv, st_types, sp, sizeof(Pc));
+                    if (!p.pipe) {
+                        std::printf("stats %-6s mode %d skipped pipeline\n", v.name.c_str(), mode);
+                        continue;
+                    }
                     std::printf("stats %-6s mode %d  %s\n", v.name.c_str(), mode, p.stats.c_str());
                     free_pipe(c, p);
                 }
@@ -832,13 +888,18 @@ int main(int argc, char** argv) {
             if (v.name == "bc7" || v.name == "bc_mat") continue;
             if (v.ntc_fast && !fu.ok) continue;
             Pipe p;
-            if (v.ntc_fast) {
-                p = make_pipe(c, shader_dir + "/" + v.spv, fast_types, fast_spec(0), sizeof(Pc));
-                bind_fast(p);
-            } else {
-                p = make_pipe(c, shader_dir + "/ntc_decompress.comp.spv", leg_types, {}, 16);
-                bind_leg(p);
+            if (v.ntc_fast) p = make_pipe(c, shader_dir + "/" + v.spv, fast_types, fast_spec(0), sizeof(Pc));
+            else p = make_pipe(c, shader_dir + "/ntc_decompress.comp.spv", leg_types, {}, 16);
+            if (!p.pipe) {
+                std::printf("check %-6s skipped pipeline\n", v.name.c_str());
+                if (v.exact || v.name == "legacy") ++failures;
+                js << (first_check ? "" : ",") << "{\"variant\":\"" << v.name
+                   << "\",\"verdict\":\"SKIP\"}";
+                first_check = false;
+                continue;
             }
+            if (v.ntc_fast) bind_fast(p);
+            else bind_leg(p);
             for (int m = 0; m < check_mips; ++m) {
                 const uint32_t w = std::max(1u, ts.width >> m), h = std::max(1u, ts.height >> m);
                 std::vector<uint8_t> got;
@@ -913,11 +974,9 @@ int main(int argc, char** argv) {
                     int model_bytes = 4;
                     if (v.ntc_fast) {
                         p = make_pipe(c, shader_dir + "/" + v.spv, fast_types, fast_spec(1), sizeof(Pc));
-                        bind_fast(p);
                         model_bytes += fc.load_bytes;
                     } else if (v.name == "legacy") {
                         p = make_pipe(c, shader_dir + "/" + v.spv, leg_types, {}, 16);
-                        bind_leg(p);
                         pcp = lpc;
                         pcs = 16;
                         model_bytes += lc.load_bytes;
@@ -928,11 +987,20 @@ int main(int argc, char** argv) {
                                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
                                       {ntex}, sizeof(Pc));
+                        model_bytes += 16 * ntex;  // one 16 B block per texture per sample at 1 texel/pixel
+                    }
+                    if (!p.pipe) {
+                        std::printf("%-8s %-10s skipped pipeline\n", v.name.c_str(),
+                                    (std::to_string(W) + "x" + std::to_string(H)).c_str());
+                        continue;
+                    }
+                    if (v.ntc_fast) bind_fast(p);
+                    else if (v.name == "legacy") bind_leg(p);
+                    else {
                         bind_img(c, p, 0, t_bc7a.view, sampler);
                         bind_img(c, p, 1, t_bc5.view, sampler);
                         bind_img(c, p, 2, t_bc7b.view, sampler);
                         bind_buf(c, p, 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, b_out.buf, VK_WHOLE_SIZE);
-                        model_bytes += 16 * ntex;  // one 16 B block per texture per sample at 1 texel/pixel
                     }
                     const Timing t = time_pipe(c, p, pcp, pcs, W, H, warmup, iters);
                     const double samples = static_cast<double>(W) * H;

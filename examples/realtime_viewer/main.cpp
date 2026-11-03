@@ -11,6 +11,7 @@
 // and records the skip. Those rows are not a performance claim.
 
 #include "ntc/ntc.hpp"
+#include "ntc/vk_host.hpp"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -630,15 +631,13 @@ int main(int argc, char** argv) {
         return benchmark ? 0 : 2;
     }
     try {
-        VkApplicationInfo ai{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        ai.pApplicationName = "ntc_view";
-        ai.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &ai;
-        VkInstance inst = VK_NULL_HANDLE;
-        CHECK(vkCreateInstance(&ici, nullptr, &inst));
+        auto created = ntc::vkhost::create_instance("ntc_view", VK_API_VERSION_1_3);
+        if (!created.handle) throw std::runtime_error("no vulkan 1.3 instance: " + created.error);
+        VkInstance inst = created.handle;
+        std::cout << "portability_enumeration " << created.portability << "\n";
         uint32_t ndev = 0;
         CHECK(vkEnumeratePhysicalDevices(inst, &ndev, nullptr));
+        if (ndev == 0) throw std::runtime_error("no vulkan device");
         std::vector<VkPhysicalDevice> phys_list(ndev);
         CHECK(vkEnumeratePhysicalDevices(inst, &ndev, phys_list.data()));
         auto score = [](VkPhysicalDevice p) {
@@ -698,12 +697,21 @@ int main(int argc, char** argv) {
         qci.queueFamilyIndex = qfam;
         qci.queueCount = 1;
         qci.pQueuePriorities = &prio;
+        const auto caps = ntc::vkhost::query_caps(phys);
+        std::cout << "caps portability " << caps.portability_subset << " dynamic_rendering " << caps.dynamic_rendering
+                  << " float16 " << caps.shader_float16 << " bc " << caps.texture_compression_bc << " subgroup "
+                  << caps.subgroup_size << " workgroup " << caps.max_compute_invocations << " shared "
+                  << caps.max_shared_memory << "\n";
+        if (!caps.dynamic_rendering) throw std::runtime_error("dynamic rendering is not supported");
+        auto extras = ntc::vkhost::device_extras(phys);
         VkPhysicalDeviceDynamicRenderingFeatures dyn{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES};
         dyn.dynamicRendering = VK_TRUE;
         VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-        dci.pNext = &dyn;
+        dci.pNext = extras.chain(&dyn);
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
+        dci.enabledExtensionCount = static_cast<uint32_t>(extras.extensions.size());
+        dci.ppEnabledExtensionNames = extras.extensions.empty() ? nullptr : extras.extensions.data();
         VkDevice dev = VK_NULL_HANDLE;
         CHECK(vkCreateDevice(phys, &dci, nullptr, &dev));
         VkQueue queue = VK_NULL_HANDLE;

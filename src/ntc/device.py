@@ -1,12 +1,14 @@
 """Torch device selection.
 
-Order for ``auto``: CUDA, then ROCm, then DirectML, then CPU.
+Order for ``auto``: CUDA, then ROCm, then MPS, then DirectML, then CPU.
 
 CUDA and ROCm both report ``torch.cuda``. A ROCm build sets
 ``torch.version.hip`` and still uses the ``cuda`` device API, including
 AMD's Windows ROCm wheels (RDNA4 / RX 9070 is gfx1201 in the ROCm 7.2.1
-Windows wheels). DirectML is the ``torch_directml`` package and shows up
-as a ``privateuseone`` device. There is no CUDA-only op in the encoder.
+Windows wheels). MPS is the Apple Silicon backend. DirectML is the
+``torch_directml`` package and shows up as a ``privateuseone`` device.
+There is no CUDA-only op in the encoder. A non-CUDA device takes the
+eager path.
 """
 
 from __future__ import annotations
@@ -33,13 +35,30 @@ def _try_directml():
         return None
 
 
+def _mps_available() -> bool:
+    mps = getattr(torch.backends, "mps", None)
+    if mps is None or not getattr(mps, "is_available", lambda: False)():
+        return False
+    try:
+        torch.zeros(1, device="mps")
+        return True
+    except Exception:
+        return False
+
+
 def pick_device(name: str = "auto") -> torch.device:
     if name and name != "auto":
         if name.lower() in ("dml", "directml"):
             return _directml_device()
+        if name.lower() == "mps":
+            if not _mps_available():
+                raise RuntimeError("mps is not available")
+            return torch.device("mps")
         return torch.device(name)
     if torch.cuda.is_available():
         return torch.device("cuda")
+    if _mps_available():
+        return torch.device("mps")
     dml = _try_directml()
     if dml is not None:
         return dml
@@ -60,6 +79,9 @@ def device_report(device: torch.device) -> dict:
         except Exception as exc:
             info["name"] = "cuda"
             info["name_error"] = str(exc)
+    elif device.type == "mps":
+        info["backend"] = "mps"
+        info["name"] = "mps"
     elif device.type == "privateuseone" or str(device).startswith("privateuseone"):
         info["backend"] = "directml"
         info["name"] = str(device)

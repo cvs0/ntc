@@ -6,6 +6,7 @@
 
 #include "bench.hpp"
 #include "ntc/ntc.hpp"
+#include "ntc/vk_host.hpp"
 
 #include <vulkan/vulkan.h>
 
@@ -134,13 +135,10 @@ int main(int argc, char** argv) {
         const uint32_t c = static_cast<uint32_t>(ts.num_channels());
         const VkDeviceSize out_bytes = static_cast<VkDeviceSize>(w) * h * c * 4u;
 
-        VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
-        app.pApplicationName = "ntc_vk";
-        app.apiVersion = VK_API_VERSION_1_3;
-        VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ici.pApplicationInfo = &app;
-        VkInstance instance = VK_NULL_HANDLE;
-        CHECK(vkCreateInstance(&ici, nullptr, &instance));
+        auto created = ntc::vkhost::create_instance("ntc_vk", VK_API_VERSION_1_3);
+        if (!created.handle) throw std::runtime_error("no vulkan 1.3 instance: " + created.error);
+        VkInstance instance = created.handle;
+        std::cout << "portability_enumeration " << created.portability << "\n";
 
         uint32_t ndev = 0;
         CHECK(vkEnumeratePhysicalDevices(instance, &ndev, nullptr));
@@ -310,14 +308,29 @@ int main(int argc, char** argv) {
             feat_tail = &cm_on;
         }
         v13.pNext = feat_tail;
+        // Only request bits the device reported. Forcing a missing feature
+        // makes vkCreateDevice fail on MoltenVK.
+        auto extras = ntc::vkhost::device_extras(phys);
+        const auto caps = ntc::vkhost::query_caps(phys);
+        std::cout << "caps portability " << caps.portability_subset << " float16 " << caps.shader_float16
+                  << " int8 " << caps.shader_int8 << " int_dot " << caps.shader_int_dot << " bc "
+                  << caps.texture_compression_bc << " dynamic_index " << caps.storage_buffer_dynamic_index
+                  << " subgroup " << caps.subgroup_size << " workgroup " << caps.max_compute_invocations
+                  << " shared " << caps.max_shared_memory << " timestamps " << caps.timestamp_valid_bits << "\n";
+        if (caps.max_compute_invocations && caps.max_compute_invocations < 64)
+            throw std::runtime_error("compute workgroup limit is below the 8x8 decode shader");
+
         VkPhysicalDeviceFeatures2 feat{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
-        feat.pNext = &v13;
-        feat.features.shaderStorageBufferArrayDynamicIndexing = VK_TRUE;
+        feat.pNext = extras.chain(&v13);
+        feat.features.shaderStorageBufferArrayDynamicIndexing =
+            fq.features.shaderStorageBufferArrayDynamicIndexing;
 
         VkDeviceCreateInfo di{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
         di.pNext = &feat;
         di.queueCreateInfoCount = 1;
         di.pQueueCreateInfos = &qi;
+        di.enabledExtensionCount = static_cast<uint32_t>(extras.extensions.size());
+        di.ppEnabledExtensionNames = extras.extensions.empty() ? nullptr : extras.extensions.data();
         VkDevice dev = VK_NULL_HANDLE;
         CHECK(vkCreateDevice(phys, &di, nullptr, &dev));
         VkQueue queue = VK_NULL_HANDLE;
@@ -462,7 +475,11 @@ int main(int argc, char** argv) {
             stage.module = extra;
             cpi.stage = stage;
             VkPipeline px = VK_NULL_HANDLE;
-            CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &px));
+            if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &px) != VK_SUCCESS || !px) {
+                std::cout << label << " skipped pipeline\n";
+                vkDestroyShaderModule(dev, extra, nullptr);
+                return;
+            }
             CHECK(vkResetCommandBuffer(cmd, 0));
             CHECK(vkBeginCommandBuffer(cmd, &begin));
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, px);
@@ -495,7 +512,10 @@ int main(int argc, char** argv) {
                 stage.module = m16;
                 cpi.stage = stage;
                 VkPipeline p16 = VK_NULL_HANDLE;
-                CHECK(vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &p16));
+                if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &p16) != VK_SUCCESS || !p16) {
+                    std::cout << "fp16_max_abs skipped pipeline\n";
+                    vkDestroyShaderModule(dev, m16, nullptr);
+                } else {
                 CHECK(vkResetCommandBuffer(cmd, 0));
                 CHECK(vkBeginCommandBuffer(cmd, &begin));
                 vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, p16);
@@ -517,6 +537,7 @@ int main(int argc, char** argv) {
                 // measured 0.00293 on both.
                 const float fp16_tol = ts.act_int8() ? 0.25f : 5e-3f;
                 run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", fp16_tol);
+                }
             }
         }
 
