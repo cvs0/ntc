@@ -1524,6 +1524,19 @@ def trim_keeps_file(
     return abs(float(loop_psnr) - float(psnr_after)) <= 1.0
 
 
+def _channel_mode(flat: torch.Tensor) -> torch.Tensor:
+    """Mode of each row of ``[C, N]``.
+
+    ``aten::mode`` is not implemented on MPS. The codes are a small export
+    step, so that device runs the reduction on the CPU and copies the
+    result back. This is not the MPS fallback switch.
+    """
+    if flat.device.type == "mps":
+        values = flat.detach().to("cpu").mode(dim=1).values
+        return values.to(device=flat.device, dtype=flat.dtype)
+    return flat.mode(dim=1).values
+
+
 def trim_latents_to_rate(
     net: NtcNet, export_fn, limit_bpp: float, window: float = RATE_MARGIN, iters: int = 24
 ):
@@ -1544,7 +1557,7 @@ def trim_latents_to_rate(
     for lat in base:
         code = torch.round(lat.float())
         flat = code.reshape(lat.shape[0], -1)
-        mode = flat.mode(dim=1).values.reshape(-1, *([1] * (lat.dim() - 1)))
+        mode = _channel_mode(flat).reshape(-1, *([1] * (lat.dim() - 1)))
         modes.append(mode.to(lat.dtype))
         dist = (lat.float() - mode).abs()
         # Codes that already round to the mode cost nothing to leave alone.

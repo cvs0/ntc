@@ -121,6 +121,7 @@ def test_stacked_matches_net_including_mip1():
 
 
 def test_fast_flag_off_is_the_historical_loop_and_on_matches_psnr():
+    # CPU only. MPS is not the same rounding, and this comparison is 1e-4 dB.
     img = np.linspace(0.0, 1.0, 3 * 16 * 16, dtype=np.float32).reshape(3, 16, 16)
     common = dict(
         steps=3,
@@ -134,6 +135,7 @@ def test_fast_flag_off_is_the_historical_loop_and_on_matches_psnr():
         seed=1,
         compile_step="off",
         cuda_graph="off",
+        device="cpu",
     )
     _b0, slow = encode_arrays(img, [0, 1, 2], TrainConfig(fast=False, **common))
     assert "fast" not in slow or slow.get("fast") is not True
@@ -808,6 +810,13 @@ def test_quant_schedule_file_stays_near_the_loop():
         ),
     )
     assert abs(float(stats["metrics"]["psnr_u8"]) - float(stats["psnr_u8_loop"])) < 0.1
+
+
+def test_channel_mode_matches_torch_mode():
+    from ntc.train_fast import _channel_mode
+
+    flat = torch.tensor([[1.0, 2.0, 2.0, 3.0], [5.0, 5.0, 0.0, 1.0]])
+    assert torch.equal(_channel_mode(flat), flat.mode(dim=1).values)
 
 
 def test_dense_quarter_frame_matches_the_loop():

@@ -55,7 +55,9 @@ HEADER = """\
 //
 // Variants (pick one define before the include):
 //   NTC_FAST_EXACT  NoContraction on every lerp and product. Bit-identical
-//                   to ntc::decode_mip under default fp32 rounding.
+//                   to ntc::decode_mip under default fp32 rounding. MoltenVK
+//                   also needs MVK_CONFIG_FAST_MATH_ENABLED=0, because Metal
+//                   fast-math contracts those mul and add pairs.
 //   (none)          fma for lerps and dots. Within 1e-5 of the reference.
 //   NTC_FAST_FP16   packed fp16 weights and activations, f16vec2 fma
 //                   (v_pk_fma_f16 on AMD, HFMA2 on NVIDIA), fp16 sums. fp32

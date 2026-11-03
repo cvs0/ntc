@@ -322,7 +322,12 @@ bench/decbench.sh
 # VK_KHR_portability_subset on the device. ntc_gl is not built (no EGL).
 # fp16, int8 dot, BC, and cooperative matrix run only when the device
 # reports them. The fp32 path is the one that must match the CPU decoder
-# within 1e-3.
+# within 1e-3. The hosts set MVK_CONFIG_FAST_MATH_ENABLED=0 so the exact
+# variant's separate mul and add are not contracted. fp16 is checked at
+# max abs 0.02 and at least 35 dB against that fp32 image: an int8 weight
+# times a unit feature sits near magnitude 128, where the fp16 ulp is
+# 0.0625, and the 2K files measured 0.0033 to 0.0125 after the scale.
+# decbench writes a pipeline cache under ~/.cache/ntc.
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
 cmake --build build
 ctest --test-dir build --output-on-failure

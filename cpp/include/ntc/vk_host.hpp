@@ -10,7 +10,12 @@
 
 #include <vulkan/vulkan.h>
 
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -56,9 +61,23 @@ struct Instance {
     std::string error;
 };
 
+// MoltenVK compiles MSL with Metal fast-math unless this is 0. fast-math
+// contracts a multiply and a following add even when SPIR-V marked them
+// NoContraction, so the exact variant disagreed with the CPU by a few ulps
+// (7e-9 on tiny.ntc, about 5e-7 on a 2K file). Other drivers ignore the
+// variable. Set it before the loader opens the ICD.
+inline void force_moltenvk_ieee() {
+#if defined(_WIN32)
+    _putenv_s("MVK_CONFIG_FAST_MATH_ENABLED", "0");
+#else
+    setenv("MVK_CONFIG_FAST_MATH_ENABLED", "0", 1);
+#endif
+}
+
 // `extra` holds surface extensions the caller already decided to enable.
 // Pointers in `extra` must outlive the call.
 inline Instance create_instance(const char* app_name, uint32_t api, const std::vector<const char*>& extra = {}) {
+    force_moltenvk_ieee();
     Instance out;
     const auto have = instance_extensions();
     std::vector<const char*> names = extra;
@@ -199,6 +218,82 @@ inline DeviceExtras device_extras(VkPhysicalDevice phys, std::vector<const char*
     out.subset_feat.pNext = nullptr;
 #endif
     return out;
+}
+
+// On-disk VkPipelineCache. MoltenVK's first compile of the specialized
+// fast shaders is minutes. A later run of the same device and driver
+// reuses this file. A cache from another GPU is ignored by the driver.
+struct DiskPipelineCache {
+    VkPipelineCache handle = VK_NULL_HANDLE;
+    std::string path;
+
+    void save(VkDevice dev) const {
+        if (!handle || path.empty()) return;
+        size_t n = 0;
+        if (vkGetPipelineCacheData(dev, handle, &n, nullptr) != VK_SUCCESS || n == 0) return;
+        std::vector<uint8_t> data(n);
+        if (vkGetPipelineCacheData(dev, handle, &n, data.data()) != VK_SUCCESS) return;
+        data.resize(n);
+        const std::filesystem::path dest(path);
+        const std::filesystem::path tmp = dest.string() + ".tmp";
+        {
+            std::ofstream out(tmp, std::ios::binary);
+            if (!out) return;
+            out.write(reinterpret_cast<const char*>(data.data()), static_cast<std::streamsize>(data.size()));
+            if (!out) return;
+        }
+        std::error_code ec;
+        std::filesystem::rename(tmp, dest, ec);
+    }
+
+    void destroy(VkDevice dev) {
+        save(dev);
+        if (handle && dev) vkDestroyPipelineCache(dev, handle, nullptr);
+        handle = VK_NULL_HANDLE;
+    }
+};
+
+inline DiskPipelineCache open_pipeline_cache(VkDevice dev, const VkPhysicalDeviceProperties& props) {
+    DiskPipelineCache cache;
+    std::filesystem::path root;
+#if defined(_WIN32)
+    if (const char* local = std::getenv("LOCALAPPDATA")) root = local;
+#else
+    if (const char* home = std::getenv("HOME")) root = std::filesystem::path(home) / ".cache";
+#endif
+    if (root.empty()) root = std::filesystem::temp_directory_path();
+    root /= "ntc";
+    std::error_code ec;
+    std::filesystem::create_directories(root, ec);
+    char leaf[96];
+    std::snprintf(leaf, sizeof(leaf), "pipelines-%08x-%08x-%u.bin", props.vendorID, props.deviceID,
+                  props.driverVersion);
+    cache.path = (root / leaf).string();
+
+    std::vector<uint8_t> initial;
+    {
+        std::ifstream in(cache.path, std::ios::binary);
+        if (in) {
+            in.seekg(0, std::ios::end);
+            const auto bytes = in.tellg();
+            if (bytes > 0 && bytes < 64 * 1024 * 1024) {
+                initial.resize(static_cast<size_t>(bytes));
+                in.seekg(0);
+                in.read(reinterpret_cast<char*>(initial.data()), static_cast<std::streamsize>(initial.size()));
+                if (!in) initial.clear();
+            }
+        }
+    }
+    VkPipelineCacheCreateInfo ci{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+    ci.initialDataSize = initial.size();
+    ci.pInitialData = initial.empty() ? nullptr : initial.data();
+    if (vkCreatePipelineCache(dev, &ci, nullptr, &cache.handle) != VK_SUCCESS) {
+        ci.initialDataSize = 0;
+        ci.pInitialData = nullptr;
+        cache.handle = VK_NULL_HANDLE;
+        vkCreatePipelineCache(dev, &ci, nullptr, &cache.handle);
+    }
+    return cache;
 }
 
 }  // namespace ntc::vkhost

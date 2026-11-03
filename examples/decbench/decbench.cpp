@@ -74,6 +74,7 @@ struct Ctx {
     bool gpu_time = false;
     uint32_t max_invocations = 0;
     uint32_t max_shared = 0;
+    ntc::vkhost::DiskPipelineCache pipelines;
     PFN_vkGetPipelineExecutablePropertiesKHR get_exec = nullptr;
     PFN_vkGetPipelineExecutableStatisticsKHR get_stats = nullptr;
 };
@@ -344,7 +345,7 @@ Pipe make_pipe(const Ctx& c, const std::string& spv_path, const std::vector<VkDe
     ci.stage.pSpecializationInfo = spec.empty() ? nullptr : &si;
     ci.layout = p.pl;
     if (c.exec_props) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
-    const VkResult pr = vkCreateComputePipelines(c.dev, VK_NULL_HANDLE, 1, &ci, nullptr, &p.pipe);
+    const VkResult pr = vkCreateComputePipelines(c.dev, c.pipelines.handle, 1, &ci, nullptr, &p.pipe);
     vkDestroyShaderModule(c.dev, mod, nullptr);
     if (pr != VK_SUCCESS || !p.pipe) {
         std::fprintf(stderr, "pipeline failed %d for %s\n", static_cast<int>(pr), spv_path.c_str());
@@ -606,6 +607,8 @@ Ctx make_ctx(int want_dev) {
     dci.enabledExtensionCount = static_cast<uint32_t>(extras.extensions.size());
     dci.ppEnabledExtensionNames = extras.extensions.empty() ? nullptr : extras.extensions.data();
     VKC(vkCreateDevice(c.phys, &dci, nullptr, &c.dev));
+    c.pipelines = ntc::vkhost::open_pipeline_cache(c.dev, c.props);
+    if (!c.pipelines.path.empty()) std::printf("pipeline_cache %s\n", c.pipelines.path.c_str());
     vkGetDeviceQueue(c.dev, c.qfam, 0, &c.queue);
     VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pci.queueFamilyIndex = c.qfam;
@@ -1050,6 +1053,7 @@ int main(int argc, char** argv) {
     }
     vkDestroySampler(c.dev, sampler, nullptr);
     vkDestroyCommandPool(c.dev, c.pool, nullptr);
+    c.pipelines.destroy(c.dev);
     vkDestroyDevice(c.dev, nullptr);
     vkDestroyInstance(c.inst, nullptr);
     std::printf("%s (%d failures)\n", failures ? "FAIL" : "OK", failures);

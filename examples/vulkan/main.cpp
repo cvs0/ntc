@@ -98,6 +98,31 @@ static float max_abs(const std::vector<float>& a, const std::vector<float>& b) {
     return m;
 }
 
+// Peak-1 PSNR. A uniform error of 0.0125 is 38 dB. A wrong network is under 20.
+static double psnr_peak1(const std::vector<float>& gpu, const std::vector<float>& cpu) {
+    const size_t n = std::min(gpu.size(), cpu.size());
+    if (!n) return 0.0;
+    double se = 0.0;
+    for (size_t i = 0; i < n; ++i) {
+        const double d = static_cast<double>(gpu[i]) - static_cast<double>(cpu[i]);
+        se += d * d;
+    }
+    const double mse = se / static_cast<double>(n);
+    if (mse <= 1e-20) return 100.0;
+    return std::min(100.0, 10.0 * std::log10(1.0 / mse));
+}
+
+// fp16 MAC rounds the product and the sum to 10 mantissa bits. An int8
+// weight is exact in fp16. At magnitude 128 the ulp is 0.0625, and the
+// learned scale brings the layer back near 1, leaving a remainder of a
+// few hundredths on a wide layer. The 2K cloud files measured 0.0033 to
+// 0.0125. A uniform 0.0125 is 38 dB. Pass at max abs 0.02 and at least
+// 35 dB. act_int8 is an int8 requant and keeps the wider abs bound.
+static bool fp16_matches(float err, double psnr, bool act_int8) {
+    if (act_int8) return err <= 0.25f;
+    return err <= 0.02f && psnr >= 35.0;
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::cerr << "usage: ntc_vk file.ntc shader_dir [--device index|name] [--bench outdir]\n"
@@ -468,7 +493,7 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        auto run_extra = [&](const std::string& path, const char* label, float tol) {
+        auto run_extra = [&](const std::string& path, const char* label, float tol, double min_psnr = 0.0) {
             std::ifstream probe(path);
             if (!probe) return;
             VkShaderModule extra = shader_mod(dev, path);
@@ -494,10 +519,13 @@ int main(int argc, char** argv) {
             std::vector<float> got(cpu.size());
             std::memcpy(got.data(), outb.mapped, static_cast<size_t>(out_bytes));
             const float e = max_abs(cpu, got);
-            std::cout << label << " " << e << "\n";
+            const double p = psnr_peak1(got, cpu);
+            std::cout << label << " " << e;
+            if (min_psnr > 0.0) std::cout << " psnr " << p;
+            std::cout << "\n";
             vkDestroyPipeline(dev, px, nullptr);
             vkDestroyShaderModule(dev, extra, nullptr);
-            if (e > tol) {
+            if (e > tol || (min_psnr > 0.0 && p < min_psnr)) {
                 std::cerr << label << " mismatch\n";
                 throw std::runtime_error(label);
             }
@@ -529,14 +557,19 @@ int main(int argc, char** argv) {
                 CHECK(vkQueueWaitIdle(queue));
                 std::vector<float> g16(cpu.size());
                 std::memcpy(g16.data(), outb.mapped, static_cast<size_t>(out_bytes));
-                std::cout << "fp16_max_abs " << max_abs(cpu, g16) << "\n";
+                const float e16 = max_abs(cpu, g16);
+                const double psnr16 = psnr_peak1(g16, cpu);
+                std::cout << "fp16_max_abs " << e16 << " fp16_psnr " << psnr16 << "\n";
                 vkDestroyPipeline(dev, p16, nullptr);
                 vkDestroyShaderModule(dev, m16, nullptr);
-                // fp16 dots are not bit-exact. The staged fp16 path must stay in
-                // the same band as the unstaged fp16 path. The 256 metal latent
-                // measured 0.00293 on both.
-                const float fp16_tol = ts.act_int8() ? 0.25f : 5e-3f;
-                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs", fp16_tol);
+                if (!fp16_matches(e16, psnr16, ts.act_int8())) {
+                    std::cerr << "fp16 mismatch\n";
+                    throw std::runtime_error("fp16");
+                }
+                // The staged fp16 path is the same dots with the weights in
+                // shared memory. It has to land in the same band.
+                run_extra(dir + "/ntc_decompress_fp16_stage.comp.spv", "fp16_stage_max_abs",
+                          ts.act_int8() ? 0.25f : 0.02f, ts.act_int8() ? 0.0 : 35.0);
                 }
             }
         }
