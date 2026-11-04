@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import bench.train_max_v2 as v2
 from bench.train_max_v2 import (
     CLOUD_BPP,
@@ -304,6 +306,68 @@ def test_spawn_passes_backfill(monkeypatch, tmp_path: Path):
     args.backfill = True
     v2._spawn_workers(args)
     assert all("--backfill" in cmd for cmd in calls)
+
+
+def test_run4_quick_is_four_jobs():
+    jobs = v2.filter_jobs(
+        v2.build_cloud_jobs(Path("data/materials"), "cloudfast"),
+        "MetalPlates013,Tiles135D",
+        "5,10",
+    )
+    assert {job["name"] for job in jobs} == {
+        "cloud_MetalPlates013_2K_b5",
+        "cloud_MetalPlates013_2K_b10",
+        "cloud_Tiles135D_2K_b5",
+        "cloud_Tiles135D_2K_b10",
+    }
+    by_name = {job["name"]: job for job in jobs}
+    assert v2.planned_steps(by_name["cloud_MetalPlates013_2K_b5"]) == 4000
+    assert v2.planned_steps(by_name["cloud_Tiles135D_2K_b10"]) == 8000
+    for job in jobs:
+        assert job["prune_keep"] == 1.0
+        assert job["vq_latents"] is False
+    report = v2.run4_quick_report()
+    assert report["jobs"] == 4
+    assert report["steps"] == 24000
+    assert report["wall_hours"] == pytest.approx(24000 * v2.CLOUD_SEED_FACTOR / v2.B300_STEPS_PER_S / 3600.0)
+    assert 1.5 < report["wall_hours"] < 2.2
+    assert "--only MetalPlates013,Tiles135D" in report["command"]
+    assert "results/run4_quick" in report["command"]
+
+
+def test_quick_dry_run_spawns_two_workers(tmp_path: Path):
+    result = _dry_run(tmp_path, "--only", "MetalPlates013,Tiles135D", "--bpp", "5,10")
+    assert result.returncode == 0, result.stderr
+    assert "would spawn 2 chain workers" in result.stdout
+    for name in (
+        "cloud_MetalPlates013_2K_b5",
+        "cloud_MetalPlates013_2K_b10",
+        "cloud_Tiles135D_2K_b5",
+        "cloud_Tiles135D_2K_b10",
+    ):
+        assert name in result.stdout
+    assert "Bark001" not in result.stdout
+    assert "b20" not in result.stdout
+
+
+def test_spawn_forwards_only_and_bpp(monkeypatch, tmp_path: Path):
+    calls = []
+
+    class _Proc:
+        def wait(self):
+            return 0
+
+    monkeypatch.setattr(v2.subprocess, "Popen", lambda cmd, **_k: calls.append(list(cmd)) or _Proc())
+    args = argparse.Namespace(
+        workers=1, out=tmp_path, materials=tmp_path, probe_steps=800, stale_lock_s=10,
+        batch_pixels=None, dry_run=False, pack=True, profile="cloudfast", chains=True,
+        stagger_s=0.0, max_gpu=True, backfill=False,
+        only="MetalPlates013,Tiles135D", bpp="5,10",
+    )
+    v2._spawn_workers(args)
+    cmd = calls[0]
+    assert cmd[cmd.index("--only") + 1] == "MetalPlates013,Tiles135D"
+    assert cmd[cmd.index("--bpp") + 1] == "5,10"
 
 
 def test_completion_marker(tmp_path: Path):

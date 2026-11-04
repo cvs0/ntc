@@ -76,6 +76,16 @@ The launch estimate uses the measured B300 rate, **4.5 steps/s** (the run sat be
 
 Held out of the cloud lists: Leather011, LeafSet017, Gravel022.
 
+## Run 4 quick
+
+MetalPlates013 and Tiles135D at b5 and b10, four jobs, same cloud flags (`prune_keep` 1, `vq_latents` off). b5 is 4000 steps from scratch. b10 is 8000 steps and warm-starts from that b5 file. Two workers share one card.
+
+```bash
+sh bench/launch_run4_quick.sh
+```
+
+At 4.5 steps/s that is **1.85 h** wall. At 4 steps/s about 2.1 h, and at 5 steps/s about 1.7 h. The guard passed when each `finish` line has `psnr_u8` within 0.5 dB of `loop` and the log has no `ABORT` line. A miss writes `results/run4_quick/STOP_EXPORT_GAP` and stops the other jobs.
+
 ## Profile a step
 
 ```bash
