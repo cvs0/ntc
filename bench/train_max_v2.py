@@ -104,6 +104,14 @@ def below_init(trained: object, init: object) -> bool:
     return float(trained) < float(init)
 
 
+class ExportGap(RuntimeError):
+    """The saved file is more than half a dB under the end-of-training PSNR."""
+
+
+def export_stopped(out: Path) -> bool:
+    return (out / EXPORT_GAP_STOP).is_file()
+
+
 def score_gap_blocks_collapse(loop: object, trained: object, init: object) -> bool:
     """True when the live forward still beats the init and the file does not.
 
@@ -663,6 +671,10 @@ CLOUD_BATCH = 2 * 1024 * 1024
 # figure is high if the 5090 is faster and low if the larger batch is slower.
 # The seed pool is three wide for 500 steps and one wide after two halvings.
 CLOUD_STEPS_PER_S = 20.0
+# One B300 at the 2,097,152 cloud batch, measured during run 3. Extra
+# workers share the card, so this is the machine rate and the wall clock.
+B300_STEPS_PER_S = 4.5
+EXPORT_GAP_STOP = "STOP_EXPORT_GAP"
 CLOUD_SEED_FACTOR = 1.25
 # Short cloud run: four train materials, five labels. 5 sits between 2.5
 # and 10 so the curve has a point near BC1 and BC7 without the full ladder.
@@ -814,23 +826,26 @@ def planned_steps(job: dict) -> int:
 def run3_report() -> dict:
     """GPU-hour budget and the command for the next B300 run.
 
-    The step rate is the 5070 laptop budget in ``CLOUD_STEPS_PER_S``, not a
-    measurement on a B300. Labels at 10 bpp and above train ``full_steps``.
-    Four chain workers is what ``--max-gpu`` starts for ``cloudfast``.
+    The step rate is the measured B300 rate in ``B300_STEPS_PER_S``. Workers
+    share one card, so wall hours equal that GPU-hour figure. Labels at 10
+    bpp and above train ``full_steps``. ``--max-gpu`` starts one chain
+    worker per ``cloudfast`` material.
     """
     jobs = build_cloud_jobs(Path("data/materials"), "cloudfast")
-    hours = cloud_queue_gpu_hours(jobs)
+    steps = sum(planned_steps(job) for job in jobs)
+    hours = steps * CLOUD_SEED_FACTOR / B300_STEPS_PER_S / 3600.0
     command = (
         "NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 "
         "python bench/train_max_v2.py --profile cloudfast "
-        "--materials data/materials --out results/run3 --max-gpu --exit-when-done"
+        "--materials data/materials --out results/run4 --max-gpu --exit-when-done"
     )
     report = {
         "profile": "cloudfast",
         "jobs": len(jobs),
         "gpu_hours": hours,
-        "steps_per_s_budget": CLOUD_STEPS_PER_S,
-        "wall_hours_at_4_workers": hours / float(len(CLOUD_FAST_TRAIN)),
+        "steps_per_s_budget": B300_STEPS_PER_S,
+        "wall_hours_one_gpu": hours,
+        "wall_hours_at_4_workers": hours,
         "schedule": "warmup_cosine",
         "lr_scale_rule": "sqrt",
         "lr_batch_ref": 256 * 1024,
@@ -843,10 +858,10 @@ def run3_report() -> dict:
         "rd_alloc": True,
         "render_loss": True,
         "bc_residual": True,
-        "vq_latents": True,
+        "vq_latents": False,
         "tile_head": True,
         "shared_decoder": True,
-        "prune_keep": 0.5,
+        "prune_keep": 1.0,
         "matryoshka": True,
         "device_pipeline": True,
         "command": command,
@@ -854,8 +869,8 @@ def run3_report() -> dict:
     }
     print(
         f"run3 {report['jobs']} jobs, {report['gpu_hours']:.2f} GPU-hours "
-        f"at {CLOUD_STEPS_PER_S:.0f} steps/s, about {report['wall_hours_at_4_workers']:.2f} h wall "
-        f"on {len(CLOUD_FAST_TRAIN)} workers",
+        f"at {B300_STEPS_PER_S:.1f} steps/s on one B300, about {hours:.2f} h wall "
+        f"for {len(jobs)} jobs",
         flush=True,
     )
     print(command, flush=True)
@@ -1221,6 +1236,8 @@ def _wait_dense_gpu(out: Path, stale_s: float) -> None:
 
 
 def _run(job: dict, out: Path, precision: str, shard_label: str, stale_s: float) -> dict:
+    if export_stopped(out):
+        raise ExportGap(f"stopped before {job['name']}")
     dest = out / f"{job['name']}.json"
     ntc_path = out / f"{job['name']}.ntc"
     ckpt = out / f"{job['name']}.pt"
@@ -1446,6 +1463,33 @@ def _run_claimed(
         print("corrupt", job["name"], bad, flush=True)
         _print_finish(job, row, wall, shard_label)
         return row
+    from ntc.train_fast import EXPORT_MATCH_DB
+
+    loop_psnr = row.get("psnr_u8_loop")
+    file_psnr = row.get("psnr_u8")
+    if (
+        isinstance(loop_psnr, (int, float))
+        and isinstance(file_psnr, (int, float))
+        and math.isfinite(float(loop_psnr))
+        and math.isfinite(float(file_psnr))
+        and float(loop_psnr) - float(file_psnr) > EXPORT_MATCH_DB
+    ):
+        gap = float(loop_psnr) - float(file_psnr)
+        row["done"] = False
+        row["score_gap"] = True
+        row["error"] = (
+            f"saved psnr_u8 {float(file_psnr):.2f} is {gap:.2f} dB under "
+            f"end-of-training PSNR {float(loop_psnr):.2f}"
+        )
+        dest.write_text(json.dumps(row, indent=2))
+        (out / EXPORT_GAP_STOP).write_text(row["error"] + "\n")
+        print(
+            f"ABORT {job['name']} {row['error']}. "
+            f"Stopping so the rest of the queue does not run.",
+            flush=True,
+        )
+        _print_finish(job, row, wall, shard_label)
+        raise ExportGap(row["error"])
     trained = row.get("psnr_u8_trained")
     init = row.get("psnr_u8_init")
     loop = row.get("psnr_u8_loop")
@@ -1616,13 +1660,16 @@ def _print_finish(job: dict, row: dict, wall: float, shard_label: str) -> None:
     sps_txt = f"{sps:.2f}" if isinstance(sps, (int, float)) else "na"
     psnr = row.get("psnr_u8")
     psnr_txt = f"{float(psnr):.4f}" if isinstance(psnr, (int, float)) else "na"
+    loop = row.get("psnr_u8_loop")
+    loop_txt = f"{float(loop):.4f}" if isinstance(loop, (int, float)) else "na"
     bpp = row.get("total_bpp")
     bpp_txt = f"{float(bpp):.4f}" if isinstance(bpp, (int, float)) else "na"
     print(
         f"{time.strftime('%Y-%m-%d %H:%M:%S')} finish {job['name']} wall {float(shown):.1f}s "
         f"worker {shard_label or '0/1'} pid {os.getpid()} "
         f"steps/s {sps_txt} steps_ran {row.get('steps_ran')} ckpt {row.get('checkpoint')} "
-        f"psnr {psnr_txt} init {row.get('psnr_u8_init')} trained {row.get('psnr_u8_trained')} "
+        f"psnr_u8 {psnr_txt} loop {loop_txt} init {row.get('psnr_u8_init')} "
+        f"trained {row.get('psnr_u8_trained')} "
         f"total_bpp {bpp_txt} stopped {row.get('stopped_early')} "
         f"rate_miss {row.get('rate_miss')} attempts {row.get('rate_attempts')}",
         flush=True,
@@ -1689,10 +1736,10 @@ def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list
                 "rd_alloc": True,
                 "render_loss": True,
                 "bc_residual": True,
-                "vq_latents": True,
+                "vq_latents": False,
                 "tile_head": True,
                 "shared_decoder": True,
-                "prune_keep": 0.5,
+                "prune_keep": 1.0,
                 "matryoshka": True,
                 "min_latent_bits": 4,
                 "batch_mip": "flat",
@@ -1969,9 +2016,14 @@ def _chain_loop(
         try:
             print("chain", lock, " ".join(job["name"] for job in chain), flush=True)
             for job in chain:
+                if export_stopped(out):
+                    raise ExportGap("export gap stop")
                 try:
                     _run(job, out, precision, label, stale_s)
                     _force_terminal(out, job)
+                except ExportGap:
+                    print("abort", job["name"], flush=True)
+                    raise
                 except Exception as exc:
                     traceback.print_exc()
                     dest = out / f"{job['name']}.json"
@@ -2117,10 +2169,25 @@ def _spawn_workers(args: argparse.Namespace) -> int:
         else:
             procs.append(subprocess.Popen(cmd))
     rc = 0
-    for proc in procs:
-        code = proc.wait()
-        if code:
-            rc = code
+    alive = list(procs)
+    while alive:
+        finished = [proc for proc in alive if proc.poll() is not None]
+        for proc in finished:
+            alive.remove(proc)
+            code = proc.returncode
+            if code:
+                rc = code
+        if rc and alive:
+            for proc in alive:
+                proc.terminate()
+            for proc in alive:
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            break
+        if alive:
+            time.sleep(2)
     return rc
 
 
@@ -2150,6 +2217,8 @@ def claim_next(jobs: list[dict], out: Path, stale_s: float, pack: bool, skip: se
     Returns the jobs this process now holds. Empty when every remaining job
     is finished, already erred with a missing material, or locked by a live pid.
     """
+    if export_stopped(out):
+        return []
     blocked = skip or set()
     units = work_units(jobs, pack)
     # Heaviest first. Equal cost keeps the lower bitrate first so a higher
@@ -2193,6 +2262,10 @@ def _queue_loop(jobs: list[dict], out: Path, precision: str, stale_s: float, pac
         claimed = claim_next(jobs, out, stale_s, pack, skip=failed)
         if not claimed:
             return
+        if export_stopped(out):
+            for job in claimed:
+                release_job(out, job["name"])
+            raise ExportGap("export gap stop")
         try:
             if len(claimed) == 1:
                 job = claimed[0]
@@ -2220,6 +2293,9 @@ def _queue_loop(jobs: list[dict], out: Path, precision: str, stale_s: float, pac
                         settled = False
                 if not settled:
                     failed.add(job["name"])
+        except ExportGap:
+            print("abort", " ".join(job["name"] for job in claimed), flush=True)
+            raise
         except Exception as exc:
             traceback.print_exc()
             for job in claimed:

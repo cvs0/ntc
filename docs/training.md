@@ -30,17 +30,17 @@ bf16 and fp16 autocast wrap the GEMM. Latents, master weights, and the loss stay
 
 A result json with a non-finite score, a collapse of more than 8 dB under an init above 20 dB, or a file that does not decode is an error. The queue does not train that label again. `INCOMPLETE` is replaced by `ALL_DONE` only when every planned json is terminal.
 
-## Quality flags used by run 3
+## Quality flags
 
-| Flag | Default | Run 3 | Effect |
+| Flag | Default | Cloud | Effect |
 | --- | --- | --- | --- |
 | `render_loss` | off | on | Adds a Lambert shade MSE when albedo and a normal are in the file. The export records `flip_approx` (luma and chroma). NVIDIA FLIP is used only when that package imports. |
-| `bc_residual` | off | on | The MLP trains on the residual above a quarter-resolution box base. The base is added back before the reported PSNR. |
-| `vq_latents` | off | on | At export, each latent vector is snapped to a 16-entry codebook. The file stores the dense snapped codes. `vq_index_bpp` in `src/ntc/plan_rest.py` is the alternate index rate. The result json records the flag, not that rate. |
-| `tile_head` | off | on | Records the fraction of 8x8 tiles whose quarter-res base is within 0.5 dB of the full reconstruction. |
+| `bc_residual` | off | on | The MLP trains on the residual above a quarter-resolution box base. The logged PSNR and the saved PSNR both add that base back before the compare. |
+| `vq_latents` | off | off | A 16-entry snap at export dropped the file by more than 0.5 dB on a short CPU stand-in, and run 3's saved scores did not rise with bitrate. The flag still exists. The export keeps the trained codes when the snap would miss by more than 0.5 dB. |
+| `tile_head` | off | on | Records the fraction of 8x8 tiles whose quarter-res base is within 0.5 dB of the full reconstruction. It does not change the file. |
 | `shared_decoder` | off | on | Packed jobs already share one MLP across materials. A single-material chain records the flag and still trains its own MLP. |
-| `prune_keep` | 1 | 0.5 | At export, keeps that fraction of the largest weights. |
-| `matryoshka` | off | on | Zeros hidden units past 16 for the whole run, so a coarse prefix is what the step trains. The width does not change per step, because a CUDA graph would bake the first mask. |
+| `prune_keep` | 1 | 1 | Run 3 used 0.5 and the file fell about 13 dB under the loop on a stand-in that had beaten its init. The export now refuses a prune that misses the trained file by more than 0.5 dB. |
+| `matryoshka` | off | on | Zeros hidden units past 16 for the whole run. The export writes those rows and the next layer's columns as zeros, so the file matches the mask. |
 | `ema_decay` | 0 | 0.999 | The exported weights are the EMA. |
 | `mlp_int8_tail` | 0 | 0.90 | The last 10 percent of steps straight-through quantize layer inputs to int8, and the file stores the scales. |
 
@@ -60,17 +60,19 @@ Labels at 10 bpp and above train 8000 steps. Lower labels train 4000, warm-start
 sh bench/launch_run3.sh
 ```
 
-That prints the budget and starts:
+That prints the budget and starts `results/run4`:
 
 ```bash
 NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 \
   python bench/train_max_v2.py --profile cloudfast \
-  --materials data/materials --out results/run3 --max-gpu --exit-when-done
+  --materials data/materials --out results/run4 --max-gpu --exit-when-done
 ```
 
-`--max-gpu` starts one chain worker per material when the GPU reports at least 80 GB. Four workers is the `cloudfast` width.
+`--max-gpu` starts one chain worker per material when the GPU reports at least 80 GB. Four workers is the `cloudfast` width. They share one card, so they do not multiply the step rate.
 
-The budget is **2.22 GPU-hours**, about **0.56 h** of wall time on four workers. The rate in that budget is 20 steps/s, taken from a 5070 laptop at a 1M batch and applied to this 2M batch. It is not a B300 measurement. Early stop can only shorten a run. The extra quality flags above are inside that same budget. They were not remeasured as a separate hour figure.
+Run 3 on a B300 (main `a7221a7`) logged about 36 dB during training and saved 19 to 29 dB. The live line was the residual forward, and the file then applied a 50 percent prune, a 16-code snap, and the unmasked Matryoshka tail. A finished checkpoint was also deleted when the next attempt used a smaller grid. Those exports are rejected or baked now, and a job whose saved `psnr_u8` is more than 0.5 dB under `psnr_u8_loop` aborts the queue.
+
+The launch estimate uses the measured B300 rate, **4.5 steps/s** (the run sat between 4 and 5). Workers share one card, so the wall clock is the full queue at that rate: **9.88 h** for 20 jobs before early stop. At 4 steps/s that is about 11 h, and at 5 steps/s about 9 h. The old 20 steps/s figure (2.22 GPU-hours, 0.56 h wall) was the 5070 laptop budget and is not the B300. `python bench/repro_export_gap.py` is the short CPU toggle of each flag.
 
 Held out of the cloud lists: Leather011, LeafSet017, Gravel022.
 

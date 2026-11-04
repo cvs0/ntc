@@ -243,6 +243,10 @@ MLP_ADAM_BETAS = (0.9, 0.999)
 # 3 to 6 percent over. The loop aims the codes at
 # ``target * (1 - RATE_MARGIN) - overhead`` and the export trims any rest.
 RATE_MARGIN = 0.005
+# A saved file more than this far under the end-of-training PSNR is rejected.
+# Run 3 shipped a 50 percent prune and a 16-code snap that the step never
+# trained, and the json then sat 7 to 17 dB under the live log.
+EXPORT_MATCH_DB = 0.5
 # Loss-side buffers that follow the stack through ``slice_seeds``.
 RATE_BUFFERS = ("file_rate_scale", "rate_target_bpp", "rate_weight_mult")
 # Bounds of the eval controller (``_steer_rate``).
@@ -813,6 +817,17 @@ class StackedTrain(nn.Module):
                 out.register_buffer(name, src_buf.detach().clone())
         if hasattr(self, "rate_budget_bpp"):
             out.rate_budget_bpp = self.rate_budget_bpp
+        # A seed-pool slice used to drop the prefix, so the rest of the run
+        # trained the tail and the export then zeroed it.
+        out.prefix_keep = int(getattr(self, "prefix_keep", 0) or 0)
+        base = getattr(self, "_image_base", None)
+        if base is not None:
+            out._image_base = base
+        out.int8_act = bool(getattr(self, "int8_act", False))
+        out.int8_export = bool(getattr(self, "int8_export", False))
+        scales = getattr(self, "int8_scales", None)
+        if scales is not None:
+            out.int8_scales = scales.detach().clone()
         with torch.no_grad():
             for dst, src in zip(out.latents, self.latents, strict=True):
                 dst.copy_(src.index_select(0, index))
@@ -1202,6 +1217,41 @@ def refill_sample_indices(
             buf.copy_(drawn)
         else:
             torch.randint(0, count, (budget,), dtype=buf.dtype, device=buf.device, out=buf)
+
+
+def resume_action(finished: bool, grids_match: bool) -> str:
+    """What a resume checkpoint should do.
+
+    ``export`` loads a finished run on the same lattice and does not train.
+    ``scratch`` is a different lattice: leave the file on disk and start over.
+    ``resume`` continues the same lattice.
+    """
+    if not grids_match:
+        return "scratch"
+    if finished:
+        return "export"
+    return "resume"
+
+
+def _bake_prefix(net: NtcNet, keep: int) -> None:
+    """Zero the hidden tail the step already masks, so the file matches it.
+
+    The mask lives on the training forward only. A decoder that reads the
+    stored tail uses the untouched init rows, which is the run 3 file drop.
+    """
+    keep = int(keep)
+    if keep <= 0 or not net.linears:
+        return
+    with torch.no_grad():
+        first = net.linears[0]
+        if int(first.weight.shape[0]) > keep:
+            first.weight[keep:].zero_()
+            if first.bias is not None:
+                first.bias[keep:].zero_()
+        if len(net.linears) > 1:
+            nxt = net.linears[1]
+            if int(nxt.weight.shape[1]) > keep:
+                nxt.weight[:, keep:].zero_()
 
 
 def _apply_ship_flags(net: NtcNet, cfg: TrainConfig) -> None:
@@ -2244,6 +2294,12 @@ def _psnr_per_seed(
     _s, _c, height, width = images.shape
     uv = _mesh_uv(height, width, device)
     pred = stacked.predict(uv, 0, 1).float()
+    # bc_residual trains in residual units. The number that is saved is the
+    # image after the quarter-res base is added back, so the log uses that too.
+    base = getattr(stacked, "_image_base", None)
+    if base is not None:
+        flat = base.reshape(1, height * width, base.shape[-1]).to(dtype=pred.dtype)
+        pred = (flat + (pred - 0.5) * 2.0).clamp(0, 1)
     tgt = images.permute(0, 2, 3, 1).reshape(images.shape[0], height * width, images.shape[1])
     q = torch.round(pred.clamp(0, 1) * 255.0) / 255.0
     tq = torch.round(tgt.clamp(0, 1) * 255.0) / 255.0
@@ -2821,7 +2877,10 @@ def encode_arrays_fast(
             grids = ranked[0][1]
     else:
         grids = cfg.grids
-    if cfg.rd_alloc and grids:
+    # A caller that already chose the lattice, including train_max, is not
+    # rebalanced again. A second pass moved another 4 channels and the
+    # resume no longer matched the checkpoint.
+    if cfg.rd_alloc and grids and cfg.grids is None:
         from ntc.grids import grid_weights, rd_rebalance
 
         raw_target = float(cfg.target_bpp)
@@ -2853,18 +2912,13 @@ def encode_arrays_fast(
     if cfg.resume:
         preview = torch.load(cfg.resume, map_location="cpu", weights_only=False)
         finished = int(preview.get("step", -1)) + 1 >= int(cfg.steps)
-        mismatch = not _state_matches_grids(preview.get("model", {}), grids)
-        if finished or mismatch:
-            why = "checkpoint already finished" if finished else "resume grid mismatch"
-            print(f"{why}, training from scratch", cfg.resume, flush=True)
-            if finished:
-                try:
-                    from pathlib import Path as _Path
-
-                    _Path(cfg.resume).unlink()
-                except OSError:
-                    pass
+        match = _state_matches_grids(preview.get("model", {}), grids)
+        action = resume_action(finished, match)
+        if action == "scratch":
+            print(f"resume grid mismatch, training from scratch {cfg.resume}", flush=True)
             cfg = replace(cfg, resume="")
+        elif action == "export":
+            print(f"checkpoint already finished, exporting it {cfg.resume}", flush=True)
     seeds = [cfg.seed + i for i in range(max(1, cfg.seed_pool if cfg.steps > 0 else 1))]
     if cfg.resume:
         seeds = [cfg.seed]
@@ -2981,7 +3035,14 @@ def encode_arrays_fast(
     }
     stopped_early = False
     best_val = -1e9
-    images_bank = target.unsqueeze(0).expand(stacked.n_seeds, -1, -1, -1).contiguous()
+    if bc_base_hwc is not None:
+        stacked._image_base = torch.from_numpy(np.ascontiguousarray(bc_base_hwc)).to(
+            device=device, dtype=torch.float32
+        )
+    # Score the original image. The loss still reads ``target``, which is the
+    # residual when that flag is on.
+    orig = torch.from_numpy(np.ascontiguousarray(images, dtype=np.float32)).to(device)
+    images_bank = orig.unsqueeze(0).expand(stacked.n_seeds, -1, -1, -1).contiguous()
     rewind = None
     if stacked.n_seeds == 1 and not pooled and cfg.steps >= 4 and not cfg.resume:
         rewind = {
@@ -3147,10 +3208,21 @@ def encode_arrays_fast(
     from ntc.decode_ref import decode_mip as _decode
 
     ref = np.transpose(images, (1, 2, 0))
+    ship_rejected = False
+    destructive_ship = float(cfg.prune_keep) < 1.0 or bool(cfg.vq_latents)
 
-    def _export_current(which: str | None = None) -> tuple[bytes, np.ndarray, float]:
+    def _as_image(decoded: np.ndarray) -> np.ndarray:
+        if bc_base_hwc is None:
+            return decoded
+        from ntc.plan_rest import restore_residual
+
+        return restore_residual(bc_base_hwc, decoded)
+
+    def _export_current(which: str | None = None, ship: bool = False) -> tuple[bytes, np.ndarray, float]:
         stacked.write_seed(winner, export_net)
-        _apply_ship_flags(export_net, cfg)
+        _bake_prefix(export_net, int(getattr(stacked, "prefix_keep", 0) or 0))
+        if ship:
+            _apply_ship_flags(export_net, cfg)
         exported = export_network(
             export_net,
             semantics,
@@ -3161,8 +3233,24 @@ def encode_arrays_fast(
             latent_coder=which if which is not None else coder,
         )
         parsed = parse_texture_set(exported)
-        decoded = _decode(parsed, 0)
-        return exported, decoded, psnr_u8(decoded, ref)
+        image = _as_image(_decode(parsed, 0))
+        return exported, image, psnr_u8(image, ref)
+
+    def _export_scored(which: str | None = None) -> tuple[bytes, np.ndarray, float]:
+        nonlocal ship_rejected
+        plain_blob, plain_recon, plain_psnr = _export_current(which, ship=False)
+        if not destructive_ship:
+            return plain_blob, plain_recon, plain_psnr
+        ship_blob, ship_recon, ship_psnr = _export_current(which, ship=True)
+        if float(ship_psnr) + EXPORT_MATCH_DB >= float(plain_psnr):
+            return ship_blob, ship_recon, ship_psnr
+        ship_rejected = True
+        print(
+            f"ship flags dropped PSNR {float(ship_psnr):.2f} under trained {float(plain_psnr):.2f}, "
+            f"keeping the trained weights",
+            flush=True,
+        )
+        return plain_blob, plain_recon, plain_psnr
 
     rate_limit = float(cfg.target_bpp)
 
@@ -3183,13 +3271,13 @@ def encode_arrays_fast(
     # loop score was highest. On b10 that loop score was 12.67 while the
     # file was 33.07, so the loop ranking is not the file. Keep whichever
     # of the two decodes higher. A warmup dip must not replace a later file.
-    blob, recon, trained_psnr = _export_current()
+    blob, recon, trained_psnr = _export_scored()
     loop_score = float(scores[winner])
     # A compressed payload that does not round-trip scores far from the live
     # forward. Raw is the same codes without the coder. Keep it when it is
     # the closer of the two decodes.
     if coder != "raw" and abs(loop_score - float(trained_psnr)) > 1.0:
-        blob_r, recon_r, raw_psnr = _export_current("raw")
+        blob_r, recon_r, raw_psnr = _export_scored("raw")
         if abs(loop_score - float(raw_psnr)) + 0.05 < abs(loop_score - float(trained_psnr)):
             blob, recon, trained_psnr = blob_r, recon_r, raw_psnr
             coder = "raw"
@@ -3198,7 +3286,7 @@ def encode_arrays_fast(
         with torch.no_grad():
             for param, src in zip(stacked.parameters(), best_state, strict=True):
                 param.copy_(src)
-        blob_b, recon_b, psnr_b = _export_current()
+        blob_b, recon_b, psnr_b = _export_scored()
         if _prefer_export(blob_b, psnr_b, blob, trained_psnr):
             blob, recon, trained_psnr = blob_b, recon_b, psnr_b
         else:
@@ -3216,7 +3304,7 @@ def encode_arrays_fast(
         blob_i = export_network(
             init_net, semantics, width, height, num_mips, latent_deflate=cfg.latent_deflate, latent_coder=coder
         )
-        recon_i = _decode(parse_texture_set(blob_i), 0)
+        recon_i = _as_image(_decode(parse_texture_set(blob_i), 0))
         init_psnr = psnr_u8(recon_i, ref)
         # PavingStones b2.5 logged 25.26 dB and the file scored 10.32, under
         # the 23.04 init. Replacing the weights with the init deleted the fit.
@@ -3244,7 +3332,7 @@ def encode_arrays_fast(
             return data, _blob_bpp(data)
 
         blob_t, bpp_t, snapped = trim_latents_to_rate(src_net, _export_bpp, rate_limit)
-        recon_t = _decode(parse_texture_set(blob_t), 0)
+        recon_t = _as_image(_decode(parse_texture_set(blob_t), 0))
         psnr_t = float(psnr_u8(recon_t, ref))
         rate_trim = {
             "before_bpp": before_bpp,
@@ -3275,10 +3363,6 @@ def encode_arrays_fast(
                 f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
                 flush=True,
             )
-    if bc_base_hwc is not None:
-        from ntc.plan_rest import restore_residual
-
-        recon = restore_residual(bc_base_hwc, recon)
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
         "psnr_u8": psnr_u8(recon, ref),
     }
@@ -3349,7 +3433,8 @@ def encode_arrays_fast(
         "psnr_u8_init": init_psnr,
         "psnr_u8_trained": trained_psnr,
         "psnr_u8_loop": float(scores[winner]),
-        "score_gap": abs(float(scores[winner]) - float(trained_psnr)) > 1.0,
+        "score_gap": float(scores[winner]) - float(metrics["psnr_u8"]) > EXPORT_MATCH_DB,
+        "ship_rejected": ship_rejected,
         "stopped_early": stopped_early,
         # The loop score is a live quantized forward. The file score is the
         # decoded 8-bit image. On b10 those two were 12.67 and 33.07. Report
@@ -3599,6 +3684,7 @@ def encode_bank(
     info = _run_loop(
         stacked, opt, mips, cfg, semantics, cfg.steps, 0, None, device.type, use_graph=False,
     )
+    _ema_copy_to(stacked)
     scores = _psnr_per_seed(stacked, bank, device)
     channels, height, width = shape
     num_mips = min(8, int(math.floor(math.log2(max(width, height)))) + 1)
@@ -3609,6 +3695,7 @@ def encode_bank(
         winner = max(idxs, key=lambda k: scores[k])
         net = _build_nets(targets[winner], replace(cfg, pca_init=False), grids, [seed_ids[winner]], device)[0]
         stacked.write_seed(winner, net)
+        _bake_prefix(net, int(getattr(stacked, "prefix_keep", 0) or 0))
         blob = export_network(
             net, semantics, width, height, num_mips,
             latent_deflate=cfg.latent_deflate, latent_coder=coder,
@@ -3617,6 +3704,20 @@ def encode_bank(
         recon = decode_mip(ts, 0)
         ref = np.transpose(image, (1, 2, 0))
         file_psnr = psnr_u8(recon, ref)
+        if float(cfg.prune_keep) < 1.0 or bool(cfg.vq_latents):
+            held = {key: value.detach().cpu().clone() for key, value in net.state_dict().items()}
+            _apply_ship_flags(net, cfg)
+            blob_s = export_network(
+                net, semantics, width, height, num_mips,
+                latent_deflate=cfg.latent_deflate, latent_coder=coder,
+            )
+            recon_s = decode_mip(parse_texture_set(blob_s), 0)
+            psnr_s = psnr_u8(recon_s, ref)
+            if float(psnr_s) + EXPORT_MATCH_DB >= float(file_psnr):
+                blob, recon, file_psnr = blob_s, recon_s, psnr_s
+                ts = parse_texture_set(blob)
+            else:
+                net.load_state_dict(held)
         metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {"psnr_u8": file_psnr}
         stats = {
             "fast": True,
@@ -3634,6 +3735,8 @@ def encode_bank(
             "stopped_early": False,
             "psnr_u8_init": None,
             "psnr_u8_trained": float(scores[winner]),
+            "psnr_u8_loop": float(scores[winner]),
+            "score_gap": float(scores[winner]) - float(file_psnr) > EXPORT_MATCH_DB,
             "best_val_psnr": None,
             "grids": [list(g) for g in grids],
             "latent_coder": coder,

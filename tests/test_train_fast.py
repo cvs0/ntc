@@ -698,7 +698,11 @@ def test_one_inf_gradient_is_skipped_and_the_run_stays_finite(monkeypatch):
     assert np.isfinite(stats["psnr_u8_trained"])
 
 
-def test_finished_checkpoint_starts_fresh(tmp_path: Path):
+def test_finished_checkpoint_is_exported(tmp_path: Path):
+    """A finished checkpoint on the same lattice is exported and kept.
+
+    Deleting it and training again is what restarted run 3 from scratch.
+    """
     net = _net()
     path = tmp_path / "done.pt"
     torch.save({"model": net.state_dict(), "step": 9}, path)
@@ -723,9 +727,50 @@ def test_finished_checkpoint_starts_fresh(tmp_path: Path):
             resume=str(path),
         ),
     )
-    assert not path.is_file()
-    assert stats["steps_ran"] == 2
-    assert np.isfinite(stats["psnr_u8_init"])
+    assert path.is_file()
+    assert stats["steps_ran"] == 10
+    assert np.isfinite(stats["metrics"]["psnr_u8"])
+
+
+def test_baked_prefix_matches_the_masked_forward():
+    """The stored tail used to move the decode by tenths, off the masked step."""
+    from ntc.container import parse_texture_set
+    from ntc.decode_ref import decode_mip
+    from ntc.train_fast import _bake_prefix
+
+    torch.manual_seed(1)
+    kw = dict(
+        image_channels=3,
+        grids=[(4, 4, 4, 4)],
+        hidden=(32,),
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        weight_bits=8,
+        group_size=0,
+        quant_proxy="ste",
+        activation_requant=False,
+        qat_latents=True,
+        qat_weights=True,
+    )
+    net = NtcNet(**kw)
+    stacked = StackedTrain([net])
+    stacked.prefix_keep = 16
+    uv = _mesh_uv(8, 8, torch.device("cpu"))
+    with torch.no_grad():
+        pred = stacked.predict(uv, 0, 1)[0]
+    export = NtcNet(**kw)
+    stacked.write_seed(0, export)
+    with torch.no_grad():
+        raw = export(uv, 0, 1)
+    assert float((raw - pred).abs().max()) > 0.1
+    _bake_prefix(export, 16)
+    with torch.no_grad():
+        got = export(uv, 0, 1)
+    assert float((got - pred).abs().max()) < 1e-3
+    blob = export_network(export, [0, 1, 2], 8, 8, 1, latent_deflate=False, latent_coder="raw")
+    decoded = decode_mip(parse_texture_set(blob), 0)
+    assert float(np.max(np.abs(decoded - pred.reshape(8, 8, 3).detach().numpy()))) < 1e-3
 
 
 def test_rewind_once_when_psnr_drops_below_init():
@@ -783,6 +828,74 @@ def test_w8_shaped_runs_do_not_ship_a_collapse():
         )
         assert stats["psnr_u8_trained"] >= stats["psnr_u8_init"] - 1.0
         assert isinstance(stats["lr_rewinds"], int)
+
+
+def test_run3_flags_keep_the_saved_psnr_with_the_loop():
+    """Prune, VQ, the residual, and the prefix must not sink the file.
+
+    Run 3 logged about 36 dB and saved 19 to 29. This stand-in turns every
+    one of those flags on. The saved psnr_u8 has to stay within 0.5 dB of
+    the end-of-training score.
+    """
+    from bench.repro_export_gap import measure
+
+    row = measure(
+        "run3",
+        prune_keep=0.5,
+        vq_latents=True,
+        shared_decoder=True,
+        tile_head=True,
+        bc_residual=True,
+        matryoshka=True,
+        mlp_int8_tail=0.5,
+        ema_decay=0.5,
+        render_loss=True,
+        rd_alloc=True,
+    )
+    assert row["gap"] <= 0.5
+
+
+def test_mismatched_finished_checkpoint_is_not_deleted(tmp_path):
+    """A finished checkpoint on another lattice is left on disk.
+
+    Run 3 printed "checkpoint already finished, training from scratch" and
+    deleted the file when the next attempt used a smaller grid.
+    """
+    import torch
+
+    from ntc.train_fast import resume_action
+
+    assert resume_action(True, False) == "scratch"
+    assert resume_action(True, True) == "export"
+    assert resume_action(False, True) == "resume"
+    old = tmp_path / "old.pt"
+    torch.save({"step": 5, "model": {"latents.0": torch.zeros(2, 4, 4)}}, old)
+    img = np.zeros((3, 8, 8), np.float32)
+    img[0] = 0.4
+    encode_arrays_fast(
+        img,
+        [0, 1, 2],
+        TrainConfig(
+            steps=2,
+            hidden=(8,),
+            grids=[(8, 8, 4, 4)],
+            fast=True,
+            adaptive_pool=1,
+            seed_pool=1,
+            with_ssim=False,
+            log_every=10**9,
+            mip_levels=1,
+            seed=1,
+            compile_step="off",
+            cuda_graph="off",
+            precision="fp32",
+            device="cpu",
+            resume=str(old),
+            ckpt=str(tmp_path / "new.pt"),
+        ),
+    )
+    assert old.is_file()
+    assert old.stat().st_size > 0
 
 
 def test_quant_schedule_file_stays_near_the_loop():
