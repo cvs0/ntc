@@ -823,6 +823,43 @@ def planned_steps(job: dict) -> int:
     return steps
 
 
+def run4_quick_report() -> dict:
+    """Four-job slice of the cloud ladder: two materials at b5 and b10.
+
+    b5 keeps the chain budget of 4000 steps. b10 is at or above 10 bpp, so
+    it trains the full 8000. The hour figure is one B300 at
+    ``B300_STEPS_PER_S``. Two workers share that card.
+    """
+    jobs = filter_jobs(
+        build_cloud_jobs(Path("data/materials"), "cloudfast"),
+        "MetalPlates013,Tiles135D",
+        "5,10",
+    )
+    steps = sum(planned_steps(job) for job in jobs)
+    hours = steps * CLOUD_SEED_FACTOR / B300_STEPS_PER_S / 3600.0
+    command = (
+        "NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 "
+        "python bench/train_max_v2.py --profile cloudfast "
+        "--materials data/materials --out results/run4_quick "
+        "--only MetalPlates013,Tiles135D --bpp 5,10 --max-gpu --exit-when-done"
+    )
+    print(
+        f"run4 quick {len(jobs)} jobs, {steps} steps, {hours:.2f} h wall "
+        f"at {B300_STEPS_PER_S:.1f} steps/s on one B300",
+        flush=True,
+    )
+    print(command, flush=True)
+    return {
+        "jobs": len(jobs),
+        "names": [job["name"] for job in jobs],
+        "steps": steps,
+        "wall_hours": hours,
+        "command": command,
+        "prune_keep": jobs[0]["prune_keep"] if jobs else None,
+        "vq_latents": jobs[0]["vq_latents"] if jobs else None,
+    }
+
+
 def run3_report() -> dict:
     """GPU-hour budget and the command for the next B300 run.
 
@@ -2044,12 +2081,47 @@ DONE_MARKER = "ALL_DONE"
 INCOMPLETE_MARKER = "INCOMPLETE"
 
 
+def filter_jobs(jobs: list[dict], only: str = "", bpp: str = "", strict: bool = True) -> list[dict]:
+    """Keep jobs whose material is in ``only`` and whose label is in ``bpp``.
+
+    Either string empty means no cut on that axis. Names may be
+    ``MetalPlates013`` or ``MetalPlates013_2K``. Labels are the bpp tags,
+    such as ``5,10``.
+    """
+    names = {part.strip().removesuffix("_2K") for part in str(only).split(",") if part.strip()}
+    rates: set[float] = set()
+    for part in str(bpp).split(","):
+        part = part.strip()
+        if part:
+            rates.add(round(float(part), 4))
+    chosen = []
+    for job in jobs:
+        material = Path(str(job.get("material") or "")).name.removesuffix("_2K")
+        if names and material not in names:
+            continue
+        if rates and round(float(job.get("bpp") or 0), 4) not in rates:
+            continue
+        chosen.append(job)
+    if strict and (names or rates) and not chosen:
+        raise SystemExit(f"no jobs match only={only!r} bpp={bpp!r}")
+    return chosen
+
+
+def jobs_for_args(args: argparse.Namespace, backfill: bool = False) -> list[dict]:
+    """Profile jobs, optional backfill, then ``--only`` and ``--bpp``."""
+    jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
+    if backfill and getattr(args, "backfill", False) and args.profile == "cloudfast":
+        jobs = jobs + cloud_backfill_jobs(args.materials)
+    return filter_jobs(
+        jobs,
+        str(getattr(args, "only", "") or ""),
+        str(getattr(args, "bpp", "") or ""),
+    )
+
+
 def planned_jobs(args: argparse.Namespace) -> list[dict]:
     """Every label this run means to train: the profile, plus backfill if on."""
-    jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
-    if getattr(args, "backfill", False) and args.profile == "cloudfast":
-        jobs = jobs + cloud_backfill_jobs(args.materials)
-    return jobs
+    return jobs_for_args(args, backfill=True)
 
 
 def completion_summary(out: Path, jobs: list[dict]) -> dict:
@@ -2157,6 +2229,12 @@ def _spawn_workers(args: argparse.Namespace) -> int:
             cmd.extend(["--batch-pixels", str(args.batch_pixels)])
         if not args.pack:
             cmd.append("--no-pack")
+        only = str(getattr(args, "only", "") or "")
+        bpp = str(getattr(args, "bpp", "") or "")
+        if only:
+            cmd.extend(["--only", only])
+        if bpp:
+            cmd.extend(["--bpp", bpp])
         if args.dry_run:
             cmd.append("--dry-run")
         if chains:
@@ -2556,6 +2634,17 @@ def main() -> None:
         f"done). Also NTC_EXIT_WHEN_DONE=1.",
     )
     p.add_argument("--batch-pixels", type=int, default=None, help="Override the pixel batch on 256 jobs. LR scales by batch/(256*256).")
+    p.add_argument(
+        "--only",
+        default=os.environ.get("NTC_ONLY", ""),
+        help="Comma-separated material names to keep, such as MetalPlates013,Tiles135D. "
+        "Empty keeps the profile list. Also NTC_ONLY.",
+    )
+    p.add_argument(
+        "--bpp",
+        default=os.environ.get("NTC_BPP", ""),
+        help="Comma-separated rate labels to keep, such as 5,10. Empty keeps the ladder. Also NTC_BPP.",
+    )
     p.add_argument("--pack", action=argparse.BooleanOptionalAction, default=True, help="Stack jobs that share grid shape, size, and step count.")
     p.add_argument("--stale-lock-s", type=float, default=86400.0)
     args = p.parse_args()
@@ -2571,15 +2660,16 @@ def main() -> None:
         args.workers = int(args.dense_workers)
         args.chains = True
     if args.max_gpu and args.profile == "cloudfast" and not (args.workers or args.chain_queue or args.shard or args.queue):
-        args.workers = len(CLOUD_FAST_TRAIN)
+        preview = jobs_for_args(args)
+        materials = {str(job["material"]) for job in preview}
+        args.workers = len(materials) or len(CLOUD_FAST_TRAIN)
         args.chains = True
     if args.max_gpu and not (args.dry_run or args.chain_queue):
         total = _gpu_total_gb()
         if total < DENSE_WORKERS_MIN_VRAM_GB and not args.dense_workers:
             print(f"gpu {total:.0f} GB is under {DENSE_WORKERS_MIN_VRAM_GB:.0f} GB: --max-gpu is off", flush=True)
             args.max_gpu = False
-            if args.chains and args.workers == len(CLOUD_FAST_TRAIN):
-                args.chains = False
+            args.chains = False
     if args.max_gpu:
         os.environ["NTC_MAX_GPU"] = "1"
     if args.chain_queue and (args.queue or args.shard or args.workers):
@@ -2593,7 +2683,7 @@ def main() -> None:
     if args.workers:
         if args.workers < 1:
             raise SystemExit("--workers must be >= 1")
-        jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
+        jobs = jobs_for_args(args)
         if not args.chains and int(args.workers) > 1 and not args.dry_run:
             total = _gpu_total_gb()
             if total >= DENSE_WORKERS_MIN_VRAM_GB:
@@ -2616,12 +2706,18 @@ def main() -> None:
                         flush=True,
                     )
             if args.backfill and args.profile == "cloudfast":
-                for chain in material_chains(cloud_backfill_jobs(args.materials)):
+                extra = filter_jobs(
+                    cloud_backfill_jobs(args.materials),
+                    str(args.only or ""),
+                    str(args.bpp or ""),
+                    strict=False,
+                )
+                for chain in material_chains(extra):
                     print(f"plan backfill {_chain_lock(chain)}", flush=True)
             print(f"would spawn {args.workers} chain workers", flush=True)
             return
         if args.dry_run:
-            jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
+            jobs = jobs_for_args(args)
             for job in sorted(jobs, key=job_cost, reverse=True):
                 print(
                     f"plan queue cost {job_cost(job):.0f} {job['name']} batch {job['batch_pixels']} lr_ref {job['lr_batch_ref']}",
@@ -2668,7 +2764,7 @@ def main() -> None:
     info = device_report(device)
     (args.out / "device.json").write_text(json.dumps(info, indent=2))
     print(json.dumps({"shard": shard_label or "0/1", "pid": os.getpid(), **info}), flush=True)
-    jobs = build_jobs(args.materials, args.batch_pixels, args.profile)
+    jobs = jobs_for_args(args)
     if args.dry_run:
         if args.queue:
             for job in sorted(jobs, key=job_cost, reverse=True):
@@ -2691,7 +2787,12 @@ def main() -> None:
     if args.chain_queue:
         backfill = None
         if args.backfill and args.profile == "cloudfast":
-            backfill = cloud_backfill_jobs(args.materials)
+            backfill = filter_jobs(
+                cloud_backfill_jobs(args.materials),
+                str(args.only or ""),
+                str(args.bpp or ""),
+                strict=False,
+            )
         _chain_loop(
             jobs,
             args.out,
