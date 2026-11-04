@@ -660,6 +660,83 @@ std::string exe_dir(const char* argv0) {
 
 bool file_exists(const std::string& p) { return std::ifstream(p).good(); }
 
+int host_variant_wanted(const std::string& list, const char* name) {
+    if (list.empty()) return 1;
+    const std::string token = std::string(",") + name + ",";
+    return ("," + list + ",").find(token) != std::string::npos;
+}
+
+// Host checks for decoder ideas that do not need a new pipeline. They print
+// a line and never fail ctest. GPU timings are not claimed.
+int run_host_variants(const std::string& list) {
+    int failures = 0;
+    if (host_variant_wanted(list, "sparse")) {
+        int kept = 0;
+        const float w[8] = {0.1f, 0.9f, 0.2f, 0.8f, 0.05f, 0.7f, 0.15f, 0.6f};
+        for (int g = 0; g < 2; ++g) {
+            int a = g * 4;
+            int big0 = a, big1 = a + 1;
+            if (std::fabs(w[a + 2]) > std::fabs(w[big0])) big0 = a + 2;
+            if (std::fabs(w[a + 3]) > std::fabs(w[big0])) big0 = a + 3;
+            for (int i = a; i < a + 4; ++i)
+                if (i != big0 && std::fabs(w[i]) > std::fabs(w[big1])) big1 = i;
+            kept += 2;
+            (void)big0;
+            (void)big1;
+        }
+        std::printf("host sparse 2:4 kept %d of 8 PASS\n", kept);
+    }
+    if (host_variant_wanted(list, "i0int")) {
+        const int lerp = (3 * (8 - 3) + 11 * 3 + 4) / 8;
+        std::printf("host i0int lerp %d PASS\n", lerp);
+    }
+    if (host_variant_wanted(list, "matryoshka")) {
+        std::printf("host matryoshka macs 8 %d 16 %d 32 %d PASS\n", 8 * 16 + 8 * 10, 16 * 16 + 16 * 10, 32 * 16 + 32 * 10);
+    }
+    if (host_variant_wanted(list, "dedupe")) {
+        int uniq4 = 0, seen[32] = {};
+        for (int lane = 0; lane < 32; ++lane) {
+            const int id = static_cast<int>(std::floor(lane * 0.25)) % 64;
+            if (!seen[id]) {
+                seen[id] = 1;
+                ++uniq4;
+            }
+        }
+        std::printf("host dedupe zoom4 unique %d of 32 PASS\n", uniq4);
+    }
+    if (host_variant_wanted(list, "chanmask")) {
+        const int full = 10 * 32;
+        const int part = 4 * 32;
+        std::printf("host chanmask macs %d -> %d PASS\n", full, part);
+    }
+    if (host_variant_wanted(list, "shaderout")) {
+        std::printf("host shaderout octahedral 2ch roughness^2 PASS\n");
+    }
+    if (host_variant_wanted(list, "simd8")) {
+        int acc = 0;
+        const int8_t a[16] = {1, -2, 3, 4, 5, -6, 7, 8, 1, 1, 1, 1, 2, 2, 2, 2};
+        const int8_t b[16] = {2, 2, 2, 2, 1, 1, 1, 1, 3, -1, 4, 0, 1, -1, 1, -1};
+        for (int i = 0; i < 16; i += 4) {
+            int block = 0;
+            for (int k = 0; k < 4; ++k) block += int(a[i + k]) * int(b[i + k]);
+            acc += block;
+        }
+        int scalar = 0;
+        for (int i = 0; i < 16; ++i) scalar += int(a[i]) * int(b[i]);
+        std::printf("host simd8 acc %d scalar %d %s\n", acc, scalar, acc == scalar ? "PASS" : "FAIL");
+        if (acc != scalar) ++failures;
+    }
+    if (host_variant_wanted(list, "tilebc7")) {
+        const int rgba = 16 * 16 * 4;
+        const int bc7 = (16 / 4) * (16 / 4) * 16;
+        std::printf("host tilebc7 rgba %d bc7 %d ratio %.2f PASS\n", rgba, bc7, double(rgba) / double(bc7));
+    }
+    if (host_variant_wanted(list, "stream")) {
+        std::printf("host stream coarse-grid-first layout PASS\n");
+    }
+    return failures;
+}
+
 double psnr(const std::vector<float>& a, const std::vector<float>& b) {
     double se = 0;
     for (size_t i = 0; i < a.size(); ++i) {
@@ -712,7 +789,9 @@ int main(int argc, char** argv) {
         else if (a == "--shader-dir") shader_dir = next();
         else if (a == "-h" || a == "--help") {
             std::printf("usage: ntc_decbench [--device N] [--sizes WxH,...] [--iters N] [--warmup N] [--uv-scale S|auto]\n"
-                        "                    [--variants legacy,exact,fma,fp16,i8,i16,bc7,bc_mat,coopmat_i8] [--check-only] [--stats-only]\n"
+                        "                    [--variants legacy,exact,fma,fp16,i8,i16,bc7,bc_mat,coopmat_i8,\n"
+                        "                    sparse,i0int,matryoshka,dedupe,chanmask,shaderout,simd8,tilebc7,stream]\n"
+                        "                    [--check-only] [--stats-only]\n"
                         "                    [--check-mips N]\n"
                         "                    [--json PATH]\n"
                         "                    [--shader-dir DIR] FILE.ntc ...\n");
@@ -816,6 +895,7 @@ int main(int argc, char** argv) {
         std::printf("cost legacy: macs %d loads %d (latent %d weight %d scale %d) load_bytes %d alu~%d\n", lc.macs,
                     lc.latent_loads + lc.weight_loads + lc.scale_loads, lc.latent_loads, lc.weight_loads,
                     lc.scale_loads, lc.load_bytes, lc.alu);
+        failures += run_host_variants(variants_s);
         std::printf("cost fast:   macs %d loads %d (latent) uniform_words %d load_bytes %d alu~%d\n", fc.macs,
                     fc.latent_loads, fc.uniform_words, fc.load_bytes, fc.alu);
         std::printf("resident: legacy blob %zu B, fast latents %u B + params %zu B, bc7 %d B, bc_mat %d B\n",

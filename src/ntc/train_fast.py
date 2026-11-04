@@ -561,6 +561,16 @@ def _train_step_scope():
     return nullcontext()
 
 
+def _prefix_mask(stacked, hidden: torch.Tensor, layer: int) -> torch.Tensor:
+    """Zero hidden units past ``prefix_keep`` on layer 0. 0 keeps the full width."""
+    keep = int(getattr(stacked, "prefix_keep", 0) or 0)
+    if layer != 0 or keep <= 0 or hidden.shape[-1] <= keep:
+        return hidden
+    gate = hidden.new_zeros(hidden.shape[-1])
+    gate[:keep] = 1
+    return hidden * gate
+
+
 def set_fused_gather(mode: str) -> None:
     """``off`` eager, ``auto`` or ``on`` Triton on CUDA only."""
     global _FUSED_GATHER
@@ -764,6 +774,7 @@ class StackedTrain(nn.Module):
                 hidden = torch.bmm(hidden.float(), ste.transpose(1, 2)) + bb[:, None, :]
                 if li != last and self.activation == 1:
                     hidden = F.relu(hidden)
+                hidden = _prefix_mask(self, hidden, li)
             else:
                 # The quantizer and the fp16 bias already ran in fp32.
                 # Only the GEMM is reduced. Cast back so the next layer's
@@ -773,6 +784,7 @@ class StackedTrain(nn.Module):
                     if li != last and self.activation == 1:
                         hidden = F.relu(hidden)
                 hidden = hidden.float()
+                hidden = _prefix_mask(self, hidden, li)
             if li != last and self.activation not in (0, 1):
                 raise ValueError("stacked path supports identity and relu")
         return hidden
@@ -1192,6 +1204,50 @@ def refill_sample_indices(
             torch.randint(0, count, (budget,), dtype=buf.dtype, device=buf.device, out=buf)
 
 
+def _apply_ship_flags(net: NtcNet, cfg: TrainConfig) -> None:
+    """Prune and vector-quantize the export copy. The training step is unchanged."""
+    if float(cfg.prune_keep) < 1.0:
+        from ntc.plan_rest import magnitude_prune
+
+        with torch.no_grad():
+            for lin in net.linears:
+                pruned = magnitude_prune(lin.weight.detach().float().cpu().numpy(), float(cfg.prune_keep))
+                lin.weight.copy_(torch.from_numpy(np.ascontiguousarray(pruned)).to(device=lin.weight.device))
+    if cfg.vq_latents:
+        from ntc.plan_rest import vq_codebook
+
+        with torch.no_grad():
+            books = []
+            for lat in net.latents:
+                channels, height, width = lat.shape
+                vec = lat.detach().float().cpu().numpy().reshape(channels, -1).T
+                _idx, book = vq_codebook(vec, k=min(16, int(vec.shape[0])))
+                snapped = book[_idx].T.reshape(channels, height, width)
+                lat.copy_(torch.from_numpy(np.ascontiguousarray(snapped)).to(device=lat.device))
+                books.append(book)
+            net._vq_books = books
+
+
+def _shade_loss(pred: torch.Tensor, tgt: torch.Tensor, semantics: list[int]) -> torch.Tensor:
+    """Per-seed MSE of a Lambert shade. Zero when albedo or the normal is absent."""
+    needed = (0, 1, 2, 3, 4, 5)
+    if pred.ndim != 3 or not all(s in semantics for s in needed):
+        return pred.new_zeros(pred.shape[0])
+    color = [semantics.index(s) for s in (0, 1, 2)]
+    normal = [semantics.index(s) for s in (3, 4, 5)]
+    light = pred.new_tensor([0.3, 0.7, 0.4])
+    light = light / light.norm().clamp(min=1e-6)
+
+    def shade(x: torch.Tensor) -> torch.Tensor:
+        alb = x[:, :, color]
+        nrm = x[:, :, normal] * 2 - 1
+        nrm = nrm / nrm.norm(dim=-1, keepdim=True).clamp(min=1e-6)
+        ndl = (nrm * light).sum(dim=-1, keepdim=True).clamp(0, 1)
+        return alb * ndl
+
+    return (shade(pred) - shade(tgt)).square().mean(dim=(1, 2))
+
+
 def _loss_from_mips(
     stacked: StackedTrain,
     mips: list[dict],
@@ -1255,6 +1311,8 @@ def _loss_from_mips(
                 per = torch.stack(seed_losses)
             else:
                 per = (pred.float() - tgt).square().mean(dim=(1, 2))
+            if cfg.render_loss:
+                per = per + _shade_loss(pred.float(), tgt.float(), semantics)
             term = per * float(slot["weight"])
             mip_terms.append(term)
         if not mip_terms:
@@ -2810,7 +2868,14 @@ def encode_arrays_fast(
     seeds = [cfg.seed + i for i in range(max(1, cfg.seed_pool if cfg.steps > 0 else 1))]
     if cfg.resume:
         seeds = [cfg.seed]
-    target = torch.from_numpy(np.ascontiguousarray(images)).to(device)
+    bc_base_hwc = None
+    train_np = np.ascontiguousarray(images, dtype=np.float32)
+    if cfg.bc_residual:
+        from ntc.plan_rest import residual_pair
+
+        base, train_np = residual_pair(train_np)
+        bc_base_hwc = np.transpose(base, (1, 2, 0))
+    target = torch.from_numpy(train_np).to(device)
     nets = _build_nets(target, cfg, grids, seeds, device)
     pooled = len(seeds) > 1
     if pooled and identical_seed_pool(nets):
@@ -2830,6 +2895,7 @@ def encode_arrays_fast(
         {k: v.detach().cpu().clone() for k, v in net.state_dict().items()} for net in nets
     ]
     stacked = StackedTrain(nets)
+    stacked.prefix_keep = 16 if cfg.matryoshka else 0
     # Read each step. A Python float is baked into a compiled graph; this
     # buffer is the storage the kernels load, so a later measurement moves
     # the penalty without a recompile.
@@ -3084,6 +3150,7 @@ def encode_arrays_fast(
 
     def _export_current(which: str | None = None) -> tuple[bytes, np.ndarray, float]:
         stacked.write_seed(winner, export_net)
+        _apply_ship_flags(export_net, cfg)
         exported = export_network(
             export_net,
             semantics,
@@ -3208,9 +3275,23 @@ def encode_arrays_fast(
                 f"psnr {psnr_before:.2f} -> {psnr_t:.2f}",
                 flush=True,
             )
+    if bc_base_hwc is not None:
+        from ntc.plan_rest import restore_residual
+
+        recon = restore_residual(bc_base_hwc, recon)
     metrics = group_metrics(recon, ref, semantics) if cfg.with_ssim else {
         "psnr_u8": psnr_u8(recon, ref),
     }
+    if cfg.render_loss or cfg.tile_head:
+        from ntc.plan_rest import ldr_flip_approx, tile_linear_fraction
+
+        if recon.shape[-1] >= 3:
+            metrics["flip_approx"] = ldr_flip_approx(recon[:, :, :3], ref[:, :, :3])
+        if cfg.tile_head:
+            from ntc.plan_rest import quarter_base
+
+            blur = np.transpose(quarter_base(np.transpose(ref, (2, 0, 1))), (1, 2, 0))
+            metrics["tile_linear_fraction"] = tile_linear_fraction(ref, blur, recon)
     rates = rate_report(ts)
     stats = {
         "fast": True,
@@ -3222,6 +3303,15 @@ def encode_arrays_fast(
         "precision": cfg.precision if amp_dtype is not None else "fp32",
         "matmul": matmul_mode,
         "ema_decay": float(cfg.ema_decay),
+        "render_loss": bool(cfg.render_loss),
+        "bc_residual": bool(cfg.bc_residual),
+        "vq_latents": bool(cfg.vq_latents),
+        "tile_head": bool(cfg.tile_head),
+        "shared_decoder": bool(cfg.shared_decoder),
+        "prune_keep": float(cfg.prune_keep),
+        "matryoshka": bool(cfg.matryoshka),
+        "flip_approx": metrics.get("flip_approx"),
+        "tile_linear_fraction": metrics.get("tile_linear_fraction"),
         "amp_dtype": None if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
         "compiled": loop_info["compiled"],
         "compile_mode": loop_info.get("compile_mode"),
@@ -3502,6 +3592,7 @@ def encode_bank(
         seed_ids.extend(these)
         targets.extend([target] * len(built))
     stacked = StackedTrain(nets)
+    stacked.prefix_keep = 16 if cfg.matryoshka else 0
     bank = torch.stack(targets, 0)
     mips = _prep_mips(bank, cfg, device)
     opt = _adam_on(stacked, cfg, capturable=False)

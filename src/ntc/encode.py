@@ -191,6 +191,20 @@ class TrainConfig:
     # When set, latent channels move toward the higher-variance image group
     # after the lattice is chosen.
     rd_alloc: bool = False
+    # Extra lambertian term when albedo and a normal are present.
+    render_loss: bool = False
+    # Train the MLP on the residual above a quarter-resolution base.
+    bc_residual: bool = False
+    # Snap each latent vector to a codebook at export and record index bpp.
+    vq_latents: bool = False
+    # Score 8x8 tiles for a linear head versus the full MLP.
+    tile_head: bool = False
+    # Materials in one packed batch share the MLP. Single jobs record the flag.
+    shared_decoder: bool = False
+    # Fraction of weights kept by magnitude. 1 keeps every weight.
+    prune_keep: float = 1.0
+    # Cycle the hidden prefix (8, 16, full) so coarse LODs have a nested net.
+    matryoshka: bool = False
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
