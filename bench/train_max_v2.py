@@ -2169,12 +2169,23 @@ def _spawn_workers(args: argparse.Namespace) -> int:
         else:
             procs.append(subprocess.Popen(cmd))
     rc = 0
+    # Older tests stand in a process that only implements wait.
+    if procs and not hasattr(procs[0], "poll"):
+        for proc in procs:
+            code = proc.wait()
+            if code:
+                rc = code
+        return rc
     alive = list(procs)
     while alive:
-        finished = [proc for proc in alive if proc.poll() is not None]
-        for proc in finished:
+        finished = []
+        for proc in alive:
+            code = proc.poll()
+            if code is None:
+                continue
+            finished.append((proc, proc.returncode if proc.returncode is not None else code))
+        for proc, code in finished:
             alive.remove(proc)
-            code = proc.returncode
             if code:
                 rc = code
         if rc and alive:
