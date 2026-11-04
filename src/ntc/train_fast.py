@@ -86,6 +86,114 @@ def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
     return float(lr) * (float(batch_pixels) / float(ref_pixels))
 
 
+def batch_lr_scale(batch_pixels: int, ref_pixels: int, rule: str) -> float:
+    """Multiplier for the learning rate. ``off`` is 1. ``sqrt`` is milder than linear."""
+    if rule == "off" or ref_pixels <= 0 or batch_pixels <= 0:
+        return 1.0
+    ratio = float(batch_pixels) / float(ref_pixels)
+    if rule == "sqrt":
+        return math.sqrt(ratio)
+    if rule == "linear":
+        return ratio
+    raise ValueError(rule)
+
+
+def size_batch_for_vram(requested: int, grids: list, total_bytes: int, image_pixels: int) -> int:
+    """Fit a batch to ``total_bytes``. Unknown memory keeps ``requested``.
+
+    A card under 10 GB can only shrink. A larger card may grow, at most 4x
+    the request and at most one image.
+    """
+    requested = int(requested)
+    if requested <= 0 or int(total_bytes) <= 0 or not grids:
+        return requested
+    channels = max(1, sum(int(g[2]) for g in grids))
+    params = sum(int(g[0]) * int(g[1]) * int(g[2]) for g in grids)
+    fixed = params * 20
+    reserve = int(1.2 * (1 << 30))
+    room = int(total_bytes) - reserve - fixed
+    per = channels * 48
+    fitted = 65536 if room <= per else int(room // per)
+    cap = min(max(int(image_pixels), 1), max(requested * 4, requested))
+    fitted = max(65536, min(fitted, cap))
+    if int(total_bytes) < 10 * (1 << 30):
+        return min(requested, fitted)
+    return max(min(requested, cap), min(fitted, cap))
+
+
+def plateau_limits(patience: int, min_delta: float, early_stop: int) -> tuple[int, float]:
+    """Patience and dB delta. A zero patience keeps ``early_stop`` and 0.01 dB."""
+    if int(patience) > 0:
+        delta = float(min_delta) if float(min_delta) > 0 else 0.01
+        return int(patience), delta
+    return int(early_stop), 0.01
+
+
+def beats_plateau(score: float, best: float, min_delta: float) -> bool:
+    """True when ``score`` clears the best by at least ``min_delta`` dB."""
+    return math.isfinite(score) and math.isfinite(best) and float(score) > float(best) + float(min_delta)
+
+
+def gather_backend(device_type: str, fused_gather: str) -> str:
+    """Triton gather on CUDA when asked. Everything else is eager."""
+    if fused_gather in ("auto", "on") and device_type == "cuda":
+        return "triton"
+    return "eager"
+
+
+def mlp_backend(device_type: str, compile_step: str, fused_mlp: str) -> str:
+    """Inductor when compile is on, cuBLAS for an eager CUDA MLP, else eager."""
+    if fused_mlp == "off":
+        return "eager"
+    compiling = compile_step == "on" or (compile_step == "auto" and device_type == "cuda")
+    if compiling:
+        return "inductor"
+    if device_type == "cuda":
+        return "cublas"
+    return "eager"
+
+
+def pipeline_plan(device_type: str, device_pipeline: bool) -> dict:
+    """Resident sampling draws indices on the training device."""
+    resident = bool(device_pipeline)
+    host = (not resident) and device_type in ("cuda", "mps")
+    return {"resident": resident, "host_roundtrip": host, "device": device_type}
+
+
+def overhaul_plan(device_type: str, cfg: TrainConfig) -> dict:
+    """What a step will use on ``device_type``. CPU and MPS do not capture a graph."""
+    compile_on = cfg.compile_step == "on" or (cfg.compile_step == "auto" and device_type == "cuda")
+    _compile, manual = portable_step_plan(
+        cfg.compile_step, cfg.cuda_graph, cfg.schedule, hip=False, win32=False
+    )
+    if device_type != "cuda":
+        manual = False
+        if cfg.compile_step == "auto":
+            compile_on = False
+    compiled_graph = bool(compile_on and device_type == "cuda" and cfg.cuda_graph != "off")
+    if compiled_graph:
+        graph_kind = "inductor"
+    elif manual:
+        graph_kind = "manual"
+    else:
+        graph_kind = "off"
+    return {
+        "compile": "inductor" if compile_on else "eager",
+        "cuda_graph": graph_kind != "off",
+        "cuda_graph_kind": graph_kind,
+        "gather": gather_backend(device_type, cfg.fused_gather),
+        "mlp": mlp_backend(device_type, cfg.compile_step, cfg.fused_mlp),
+        "schedule": cfg.schedule,
+        "lr_rule": cfg.lr_scale_rule,
+        "device_pipeline": bool(cfg.device_pipeline),
+        "host_roundtrip": pipeline_plan(device_type, cfg.device_pipeline)["host_roundtrip"],
+        "plateau_patience": int(cfg.plateau_patience),
+        "plateau_min_delta": float(cfg.plateau_min_delta),
+        "rd_alloc": bool(cfg.rd_alloc),
+        "auto_batch": cfg.auto_batch,
+    }
+
+
 # Early-stop patience does not increment while the live score is still
 # within this many dB of the init. The queue does not use it to reject a
 # finished file: PavingStones b2.5 gained 2.7 dB, plateaued, and was a real
@@ -440,6 +548,27 @@ class _BilinearDeterministic(torch.autograd.Function):
         return grad.view(seeds, channels, height, width), None
 
 
+_FUSED_GATHER = "off"
+_STEP_PROFILE = False
+
+
+def _train_step_scope():
+    """Marks one full step while ``bench/profile_train_step.py`` is recording."""
+    if _STEP_PROFILE:
+        return torch.profiler.record_function("ntc_train_step")
+    from contextlib import nullcontext
+
+    return nullcontext()
+
+
+def set_fused_gather(mode: str) -> None:
+    """``off`` eager, ``auto`` or ``on`` Triton on CUDA only."""
+    global _FUSED_GATHER
+    if mode not in ("off", "auto", "on"):
+        raise ValueError(mode)
+    _FUSED_GATHER = mode
+
+
 def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     """``codes`` ``[S,C,H,W]``, ``uv`` ``[N,2]`` in ``[0,1]``. Returns ``[S,N,C]``.
 
@@ -450,7 +579,10 @@ def bilinear_batched(codes: torch.Tensor, uv: torch.Tensor) -> torch.Tensor:
     # Inside torch.compile the eager gather below is what Inductor fuses.
     # Tracing the Triton path there puts a user kernel and its global
     # on/off flags into the graph, so only eager calls try it.
-    if codes.is_cuda and not codes.requires_grad and not torch.compiler.is_compiling():
+    if (
+        gather_backend(codes.device.type, _FUSED_GATHER) == "triton"
+        and not torch.compiler.is_compiling()
+    ):
         from ntc.triton_bilinear import try_triton_bilinear
 
         fused = try_triton_bilinear(codes, uv)
@@ -916,7 +1048,13 @@ def _clamp_latents(stacked: StackedTrain) -> None:
 
 
 def _step_lr(cfg: TrainConfig, step: int) -> float:
-    if cfg.schedule == "onecycle":
+    schedule = cfg.schedule
+    warm = int(cfg.warmup_steps or 0)
+    if schedule == "warmup_cosine":
+        if warm <= 0:
+            warm = max(1, int(round(int(cfg.steps) * 0.05)))
+        schedule = "cosine"
+    if schedule == "onecycle":
         peak = cfg.lr * max(float(cfg.onecycle_peak), 1.0)
         t = step / max(cfg.steps - 1, 1)
         if t < 0.3:
@@ -924,15 +1062,14 @@ def _step_lr(cfg: TrainConfig, step: int) -> float:
         u = (t - 0.3) / 0.7
         cos = 0.5 * (1.0 + math.cos(math.pi * u))
         return max(peak * cos, cfg.lr * 0.05)
-    if cfg.warmup_steps <= 0 and cfg.schedule == "cosine":
+    if warm <= 0 and schedule == "cosine":
         cos = 0.5 * (1.0 + math.cos(math.pi * step / max(cfg.steps, 1)))
         return max(cfg.lr * cos, cfg.lr * 0.05)
-    warm = max(cfg.warmup_steps, 0)
     if step < warm:
         return cfg.lr * float(step + 1) / float(max(warm, 1))
     span = max(cfg.steps - warm, 1)
     t = min(1.0, float(step - warm) / float(span))
-    if cfg.schedule == "step":
+    if schedule == "step":
         lr = cfg.lr
         if t >= 0.5:
             lr *= 0.5
@@ -948,6 +1085,7 @@ def static_sample_indices(
     batch_pixels: int,
     batch_mip: str,
     device: torch.device,
+    resident: bool = True,
 ) -> list[torch.Tensor | None]:
     """Long buffers the CUDA graph reads. Filled outside capture.
 
@@ -965,7 +1103,7 @@ def static_sample_indices(
             slots.append(buf)
         else:
             slots.append(None)
-    refill_sample_indices(slots, mips, batch_pixels, batch_mip)
+    refill_sample_indices(slots, mips, batch_pixels, batch_mip, resident=resident)
     return slots
 
 
@@ -991,7 +1129,13 @@ def crop_plan(height: int, width: int, budget: int) -> tuple[int, int, int]:
     return side, n_crops, scatter
 
 
-def crop_indices(height: int, width: int, budget: int, device: torch.device) -> torch.Tensor:
+def crop_indices(
+    height: int,
+    width: int,
+    budget: int,
+    device: torch.device,
+    resident: bool = True,
+) -> torch.Tensor:
     """``budget`` linear indices. Crops first, then the scattered tail."""
     budget = int(budget)
     if budget <= 0:
@@ -1001,24 +1145,28 @@ def crop_indices(height: int, width: int, budget: int, device: torch.device) -> 
     base = rest // n_crops
     extra = rest - base * n_crops
     chunks = []
-    y0 = torch.randint(0, int(height) - side + 1, (n_crops,))
-    x0 = torch.randint(0, int(width) - side + 1, (n_crops,))
+    draw = device if resident else torch.device("cpu")
+    y0 = torch.randint(0, int(height) - side + 1, (n_crops,), device=draw)
+    x0 = torch.randint(0, int(width) - side + 1, (n_crops,), device=draw)
     for i in range(n_crops):
         n = base + (1 if i < extra else 0)
         if n <= 0:
             continue
-        ly = torch.randint(0, side, (n,))
-        lx = torch.randint(0, side, (n,))
+        ly = torch.randint(0, side, (n,), device=draw)
+        lx = torch.randint(0, side, (n,), device=draw)
         chunks.append((y0[i] + ly) * int(width) + (x0[i] + lx))
     if scatter:
-        sy = torch.randint(0, int(height), (scatter,))
-        sx = torch.randint(0, int(width), (scatter,))
+        sy = torch.randint(0, int(height), (scatter,), device=draw)
+        sx = torch.randint(0, int(width), (scatter,), device=draw)
         chunks.append(sy * int(width) + sx)
-    idx = torch.cat(chunks) if chunks else torch.zeros(budget, dtype=torch.long)
+    idx = torch.cat(chunks) if chunks else torch.zeros(budget, dtype=torch.long, device=draw)
     if idx.numel() < budget:
-        pad = torch.randint(0, int(height) * int(width), (budget - int(idx.numel()),))
+        pad = torch.randint(0, int(height) * int(width), (budget - int(idx.numel()),), device=draw)
         idx = torch.cat([idx, pad])
-    return idx[:budget].to(device=device, dtype=torch.long)
+    idx = idx[:budget]
+    if idx.device != device:
+        idx = idx.to(device=device)
+    return idx.to(dtype=torch.long)
 
 
 def refill_sample_indices(
@@ -1026,6 +1174,7 @@ def refill_sample_indices(
     mips: list[dict],
     batch_pixels: int,
     batch_mip: str,
+    resident: bool = True,
 ) -> None:
     for mip, (buf, slot) in enumerate(zip(slots, mips, strict=True)):
         if buf is None:
@@ -1035,7 +1184,9 @@ def refill_sample_indices(
         if budget != int(buf.numel()):
             raise RuntimeError("sample buffer does not match the mip budget")
         if batch_mip == "crop":
-            drawn = crop_indices(int(slot["height"]), int(slot["width"]), budget, buf.device)
+            drawn = crop_indices(
+                int(slot["height"]), int(slot["width"]), budget, buf.device, resident=resident
+            )
             buf.copy_(drawn)
         else:
             torch.randint(0, count, (budget,), dtype=buf.dtype, device=buf.device, out=buf)
@@ -1068,7 +1219,13 @@ def _loss_from_mips(
                 if provided is not None:
                     idx = provided
                 elif cfg.batch_mip == "crop":
-                    idx = crop_indices(int(slot["height"]), int(slot["width"]), budget, uv.device)
+                    idx = crop_indices(
+                        int(slot["height"]),
+                        int(slot["width"]),
+                        budget,
+                        uv.device,
+                        resident=bool(cfg.device_pipeline),
+                    )
                 elif cfg.importance and mip == 0:
                     from ntc.train_steps import importance_index
 
@@ -1228,6 +1385,12 @@ def portable_step_plan(
         return compile_step, False
     if cuda_graph == "on":
         return compile_step, True
+    # Compile auto uses reduce-overhead, which is itself a CUDA graph, so a
+    # second manual capture is not started. With compile off, the manual
+    # graph covers warmup and cosine because the learning rate is filled
+    # before each replay. CPU and MPS never reach this with a CUDA device.
+    if compile_step == "off":
+        return compile_step, schedule in ("constant", "cosine", "warmup_cosine", "onecycle", "step")
     return compile_step, schedule == "constant"
 
 
@@ -1745,10 +1908,11 @@ def _run_loop(
     ``log_every`` steps does, on purpose.
     """
     _ema_prepare(stacked, cfg)
+    set_fused_gather(str(getattr(cfg, "fused_gather", "off")))
     batch = int(cfg.batch_pixels or 0)
     lr_scale = 1.0
     if cfg.lr_batch_ref and batch:
-        lr_scale = scaled_lr(1.0, batch, cfg.lr_batch_ref)
+        lr_scale = batch_lr_scale(batch, cfg.lr_batch_ref, str(getattr(cfg, "lr_scale_rule", "linear")))
     params = [p for group in opt.param_groups for p in group["params"]]
     skip_count = torch.zeros((), device=stacked.latents[0].device, dtype=torch.int32)
     graph = None
@@ -1757,7 +1921,7 @@ def _run_loop(
     graph_idx = None
     if use_graph and device_type == "cuda":
         graph_idx = static_sample_indices(
-            mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+            mips, batch, str(cfg.batch_mip), stacked.latents[0].device, resident=bool(cfg.device_pipeline)
         )
 
     def _group_lr(step: int) -> None:
@@ -1831,7 +1995,7 @@ def _run_loop(
         _cover_mip_recompiles(int(cfg.mip_levels))
         if graph_idx is None and batch:
             graph_idx = static_sample_indices(
-                mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+                mips, batch, str(cfg.batch_mip), stacked.latents[0].device, resident=bool(cfg.device_pipeline)
             )
         _mark_sample_shapes(mips, graph_idx)
         for compile_mode in attempts:
@@ -1867,7 +2031,7 @@ def _run_loop(
                     _sync_int8_tail(stacked, cfg, step)
                     opt.zero_grad(set_to_none=True)
                     if graph_idx is not None:
-                        refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+                        refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip), resident=bool(cfg.device_pipeline))
                     per = compiled_loss(
                         stacked, mips, cfg, semantics, amp_dtype, batch, step, graph_idx
                     )
@@ -1897,12 +2061,12 @@ def _run_loop(
         try:
             if graph_idx is None:
                 graph_idx = static_sample_indices(
-                    mips, batch, str(cfg.batch_mip), stacked.latents[0].device
+                    mips, batch, str(cfg.batch_mip), stacked.latents[0].device, resident=bool(cfg.device_pipeline)
                 )
 
             def _warm_graph() -> None:
                 for warm in range(3):
-                    refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+                    refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip), resident=bool(cfg.device_pipeline))
                     one_step(start_step + warm, replay=True)
 
             # Warm up on a side stream so the capture stream does not replay
@@ -1916,7 +2080,7 @@ def _run_loop(
             with torch.cuda.stream(side):
                 _warm_graph()
             torch.cuda.current_stream().wait_stream(side)
-            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip), resident=bool(cfg.device_pipeline))
             graph = torch.cuda.CUDAGraph()
             # Leave the learning rate out of the capture. Replay fills the
             # same device tensor first, then the captured Adam reads it.
@@ -1932,7 +2096,7 @@ def _run_loop(
         if graph is not None:
             for _ in range(warmup):
                 _group_lr(start_step)
-                refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
+                refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip), resident=bool(cfg.device_pipeline))
                 graph.replay()
         else:
             for step in range(start_step, start_step + warmup):
@@ -1974,8 +2138,9 @@ def _run_loop(
             # Sample indices and the learning-rate tensor are written before
             # replay. The captured kernels only read them.
             _group_lr(step)
-            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
-            graph.replay()
+            refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip), resident=bool(cfg.device_pipeline))
+            with _train_step_scope():
+                graph.replay()
             _maybe_ckpt(step)
             _sync_quant_schedule(stacked, cfg, step)
             _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
@@ -1984,7 +2149,8 @@ def _run_loop(
         _ = static_loss
     else:
         for step in range(start_step, start_step + steps):
-            loss = one_step(step, replay=False)
+            with _train_step_scope():
+                loss = one_step(step, replay=False)
             _maybe_ckpt(step)
             _log_progress(cfg, step + 1, total_steps, loss, t0, start_step, stacked, progress_images)
             _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
@@ -2597,11 +2763,23 @@ def encode_arrays_fast(
             grids = ranked[0][1]
     else:
         grids = cfg.grids
+    if cfg.rd_alloc and grids:
+        from ntc.grids import grid_weights, rd_rebalance
+
+        raw_target = float(cfg.target_bpp)
+        if cfg.rate == "latent" and 0 < float(cfg.latent_rate_scale) < 1:
+            raw_target = raw_target / float(cfg.latent_rate_scale)
+        grids = rd_rebalance(
+            grids, grid_weights(images, len(grids)), width, height, raw_target
+        )
 
     batch_pixels, batch_mip = fullres_batch_floor(
         height, width, grids, int(cfg.batch_pixels or 0), str(cfg.batch_mip)
     )
     capped = cap_batch_for_vram(int(batch_pixels), grids, device)
+    if str(getattr(cfg, "auto_batch", "off")) == "vram" and device.type == "cuda":
+        total = int(torch.cuda.get_device_properties(device).total_memory)
+        capped = size_batch_for_vram(int(capped), grids, total, int(height) * int(width))
     if capped != int(batch_pixels):
         print(f"vram cap {batch_pixels} -> {capped}", flush=True)
         batch_pixels = capped
@@ -2792,7 +2970,8 @@ def encode_arrays_fast(
             }
         )
     best_state = None
-    if done_steps < cfg.steps and cfg.eval_every and cfg.early_stop and stacked.n_seeds == 1:
+    stop_ready = int(cfg.early_stop) > 0 or int(cfg.plateau_patience) > 0
+    if done_steps < cfg.steps and cfg.eval_every and stop_ready and stacked.n_seeds == 1:
         stall = 0
         init_score = _psnr_per_seed(stacked, images_bank, device)[0]
         while done_steps < cfg.steps:
@@ -2806,7 +2985,8 @@ def encode_arrays_fast(
             loop_info = _merge_info(loop_info, info)
             done_steps += span
             score = _psnr_per_seed(stacked, images_bank, device)[0]
-            if math.isfinite(score) and score > best_val + 0.01:
+            patience, delta = plateau_limits(int(cfg.plateau_patience), float(cfg.plateau_min_delta), int(cfg.early_stop))
+            if beats_plateau(score, best_val, delta):
                 best_val = score
                 stall = 0
                 best_state = [p.detach().clone() for p in stacked.parameters()]
@@ -2817,7 +2997,7 @@ def encode_arrays_fast(
                 stall = 0
             else:
                 stall += 1
-                if stall >= cfg.early_stop:
+                if stall >= patience:
                     stopped_early = True
                     break
     elif done_steps < cfg.steps and (cfg.stop_psnr > 0 or cfg.plateau_stop):
@@ -2847,7 +3027,11 @@ def encode_arrays_fast(
             if cfg.stop_psnr > 0 and score >= cfg.stop_psnr:
                 hit_target = True
                 break
-            if cfg.plateau_stop and score < prev_score + 0.02:
+            _patience, delta = plateau_limits(
+                int(cfg.plateau_patience), float(cfg.plateau_min_delta), 3
+            )
+            band = delta if float(cfg.plateau_min_delta) > 0 else 0.02
+            if cfg.plateau_stop and score < prev_score + band:
                 plateau_hits += 1
                 if plateau_hits >= 3:
                     stopped_early = True
@@ -3057,7 +3241,9 @@ def encode_arrays_fast(
         "importance": cfg.importance,
         "plateau_stop": cfg.plateau_stop,
         "host_syncs_per_step": 0,
-        "lr_scale": scaled_lr(1.0, int(cfg.batch_pixels or 0), int(cfg.lr_batch_ref or 0))
+        "lr_scale": batch_lr_scale(
+            int(cfg.batch_pixels or 0), int(cfg.lr_batch_ref or 0), str(cfg.lr_scale_rule)
+        )
         if cfg.lr_batch_ref and cfg.batch_pixels
         else 1.0,
         "batch_pixels": int(cfg.batch_pixels or 0),

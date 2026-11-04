@@ -831,7 +831,19 @@ def run3_report() -> dict:
         "gpu_hours": hours,
         "steps_per_s_budget": CLOUD_STEPS_PER_S,
         "wall_hours_at_4_workers": hours / float(len(CLOUD_FAST_TRAIN)),
+        "schedule": "warmup_cosine",
+        "lr_scale_rule": "sqrt",
+        "lr_batch_ref": 256 * 1024,
+        "fused_gather": "auto",
+        "fused_mlp": "auto",
+        "cuda_graph": "inductor on CUDA, off on CPU and MPS",
+        "auto_batch": "vram",
+        "plateau_patience": 8,
+        "plateau_min_delta": 0.05,
+        "rd_alloc": True,
+        "device_pipeline": True,
         "command": command,
+        "profile_command": "python bench/profile_train_step.py",
     }
     print(
         f"run3 {report['jobs']} jobs, {report['gpu_hours']:.2f} GPU-hours "
@@ -840,6 +852,7 @@ def run3_report() -> dict:
         flush=True,
     )
     print(command, flush=True)
+    print(report["profile_command"], flush=True)
     return report
 
 
@@ -1285,6 +1298,19 @@ def _run_claimed(
         finally:
             release_job(out, GPU_DENSE_LOCK)
     job = apply_rate_neighbor(job, out)
+    if job.get("rd_alloc") and job.get("grids"):
+        from ntc.grids import grid_weights, rd_rebalance
+
+        scale = float(job.get("latent_rate_scale") or 1.0)
+        raw = float(job["bpp"])
+        if str(job.get("rate") or "") == "latent" and 0 < scale < 1:
+            raw = raw / scale
+        weights = grid_weights(images, len(job["grids"]))
+        job["plane_energy"] = [round(float(w), 6) for w in weights]
+        job["grids"] = [
+            list(g)
+            for g in rd_rebalance(job["grids"], weights, int(job["size"]), int(job["size"]), raw)
+        ]
     cfg = TrainConfig(
         steps=int(job["steps"]),
         target_bpp=float(job["bpp"]),
@@ -1313,6 +1339,14 @@ def _run_claimed(
         ema_decay=float(job.get("ema_decay", 0.0) or 0.0),
         mlp_int8_tail=float(job.get("mlp_int8_tail", 0.0) or 0.0),
         ckpt_every=int(job.get("ckpt_every", 0) or 0),
+        fused_gather=str(job.get("fused_gather", "off")),
+        fused_mlp=str(job.get("fused_mlp", "off")),
+        lr_scale_rule=str(job.get("lr_scale_rule", "linear")),
+        auto_batch=str(job.get("auto_batch", "off")),
+        device_pipeline=bool(job.get("device_pipeline", False)),
+        plateau_patience=int(job.get("plateau_patience", 0) or 0),
+        plateau_min_delta=float(job.get("plateau_min_delta", 0.0) or 0.0),
+        rd_alloc=bool(job.get("rd_alloc", False)),
         resume=str(ckpt) if ckpt.is_file() else "",
         ckpt=str(ckpt),
         log_every=100,
@@ -1620,9 +1654,11 @@ def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list
                 "bpp": float(bpp),
                 "seed": 0,
                 "warmup": 800 if int(steps) >= CLOUD_FULL_STEPS else 400,
-                "schedule": "cosine",
+                "schedule": "warmup_cosine",
                 "eval_every": 500,
                 "early_stop": 16,
+                "plateau_patience": 8,
+                "plateau_min_delta": 0.05,
                 "batch_pixels": CLOUD_BATCH,
                 "mip_levels": 12,
                 "adaptive_pool": 1,
@@ -1630,7 +1666,13 @@ def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list
                 "rate": "latent",
                 "seed_pool": 3,
                 "halve_steps": 500,
-                "lr_batch_ref": 0,
+                "lr_batch_ref": 256 * 1024,
+                "lr_scale_rule": "sqrt",
+                "auto_batch": "vram",
+                "fused_gather": "auto",
+                "fused_mlp": "auto",
+                "device_pipeline": True,
+                "rd_alloc": True,
                 "min_latent_bits": 4,
                 "batch_mip": "flat",
                 "latent_rate_scale": 0.0,

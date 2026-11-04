@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import itertools
 
+import numpy as np
+
 from ntc.container import pe_feature_count
 from ntc.quant import weight_group_count
 
@@ -36,6 +38,53 @@ def latent_payload_bits(grids: list[tuple[int, int, int, int]]) -> int:
         bits += stride * gh * ch * 8
         bits += ch * 16  # fp16 scale
     return bits
+
+
+def grid_weights(images, n_grids: int) -> list[float]:
+    """One non-negative weight per latent grid, from image-channel variance.
+
+    Channels are split in order across the grids. A flat channel weighs less
+    than a channel that actually changes, which is the signal the bit move uses.
+    """
+    arr = np.asarray(images, dtype=np.float64)
+    if arr.ndim != 3:
+        raise ValueError(arr.shape)
+    var = arr.reshape(arr.shape[0], -1).var(axis=1)
+    if n_grids <= 1:
+        return [float(var.mean()) if var.size else 0.0]
+    parts = np.array_split(var, int(n_grids))
+    return [float(part.mean()) if part.size else 0.0 for part in parts]
+
+
+def rd_rebalance(
+    grids,
+    weights,
+    width: int,
+    height: int,
+    target_bpp: float,
+) -> list[tuple[int, int, int, int]]:
+    """Move 4 channels at a time from a low-weight grid onto a high-weight one.
+
+    Spatial size and bit depth stay put. A move that would pass 1.15x the
+    larger of the target and the current rate is skipped. Grids keep at
+    least 2 channels.
+    """
+    out = [list(g) for g in grids]
+    if len(out) < 2 or not weights or len(weights) != len(out):
+        return [tuple(g) for g in out]
+    cap = max(float(target_bpp), _grids_bpp(out, width, height)) * 1.15
+    for _ in range(4):
+        low = min(range(len(out)), key=lambda i: (float(weights[i]), int(out[i][2])))
+        high = max(range(len(out)), key=lambda i: (float(weights[i]), -int(out[i][2])))
+        if low == high or int(out[low][2]) - 4 < 2 or int(out[high][2]) + 4 > 16:
+            break
+        trial = [list(g) for g in out]
+        trial[low][2] = int(trial[low][2]) - 4
+        trial[high][2] = int(trial[high][2]) + 4
+        if _grids_bpp(trial, width, height) > cap:
+            break
+        out = trial
+    return [tuple(g) for g in out]
 
 
 def _grids_bpp(grids, width: int, height: int) -> float:

@@ -773,7 +773,7 @@ NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 \
 
 Training changes in that run: resolution growth on the b10 and b20 warm start, EMA 0.999 exported at the end, an int8 straight-through tail for the last 10 percent of steps (the file stores the scales), TF32 when the probe picks bf16 or fp16, checkpoints written off the step thread every 500 steps, and a result check that marks a non-finite score or a bad file as an error so it is not trained again. The queue claims a cheaper label of the same material before the expensive one when that cheaper label is not already locked. `INCOMPLETE` is still replaced by `ALL_DONE` only when every planned json is terminal.
 
-On this CPU, drawing the 2,097,152 sample indices for one cloud batch took 10.2 ms with an allocate-and-copy and 6.4 ms in place (1.59x). That is the index refill, not a full 2K step. A 16x16 smoke of 4 steps with the EMA and the int8 tail ran at 228 steps/s and wrote `FLAG_ACT_INT8` scales. It is not a B300 step time.
+On this CPU, drawing the 2,097,152 sample indices for one cloud batch took 10.2 ms with an allocate-and-copy and 6.4 ms in place (1.59x). That is the index refill, not a full 2K step. `python bench/profile_train_step.py --device cpu --steps 4` times a 32x32 step (sample, forward, backward, Adam). Two runs were 3.27 ms and 3.46 ms eager, then 3.75 ms and 3.22 ms with the run 3 switches. That ratio is inside the noise of a 3 ms step. On the second run the profiler's own time was about 0.02 ms sampling, 0.21 ms forward, 0.35 ms backward, and 0.18 ms Adam. Compile, the CUDA graph, and the Triton gather stay off on CPU, so the 2.22 GPU-hour budget is unchanged. The same script accepts `--device mps` and `--device cuda`.
 
 ## Rate curves
 

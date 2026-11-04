@@ -169,6 +169,28 @@ class TrainConfig:
     # 0 writes the resume checkpoint once, at the end. Above 0, the fast
     # path also writes it every this many steps on a side thread.
     ckpt_every: int = 0
+    # "off" keeps the eager gather. "auto" and "on" try the Triton gather
+    # on CUDA, including the backward. MPS and CPU stay on the eager gather.
+    fused_gather: str = "off"
+    # "off" leaves the MLP as a plain bmm. "auto" uses the compiled MLP when
+    # compile is on, cuBLAS on CUDA eager, and the eager bmm on MPS and CPU.
+    fused_mlp: str = "off"
+    # "linear" is batch/ref. "sqrt" is the square root of that. "off" leaves
+    # the learning rate alone even when lr_batch_ref is set.
+    lr_scale_rule: str = "linear"
+    # "off" keeps the requested batch. "vram" grows it on a large CUDA card
+    # and shrinks it on a small one. CPU and MPS keep the request.
+    auto_batch: str = "off"
+    # When set, crop and scatter indices are drawn on the training device.
+    # When clear, they are drawn on the CPU and copied.
+    device_pipeline: bool = False
+    # 0 keeps early_stop and a 0.01 dB delta. Above 0, this patience and
+    # plateau_min_delta decide the per-rate stop.
+    plateau_patience: int = 0
+    plateau_min_delta: float = 0.0
+    # When set, latent channels move toward the higher-variance image group
+    # after the lattice is chosen.
+    rd_alloc: bool = False
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:
