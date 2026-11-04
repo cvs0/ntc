@@ -61,11 +61,13 @@ struct Instance {
     std::string error;
 };
 
-// MoltenVK compiles MSL with Metal fast-math unless this is 0. fast-math
-// contracts a multiply and a following add even when SPIR-V marked them
-// NoContraction, so the exact variant disagreed with the CPU by a few ulps
-// (7e-9 on tiny.ntc, about 5e-7 on a 2K file). Other drivers ignore the
-// variable. Set it before the loader opens the ICD.
+// MoltenVK 1.4: 0 never compiles with Metal fast-math, 1 always does, 2
+// (the default) does unless the shader opts out through float controls.
+// 0 is set here, before the loader opens the ICD. On an M5 with MoltenVK
+// 1.4.2 it did not change the exact variant: SPIRV-Cross already emits
+// NoContraction as fma(x, y, 0) and fma(1, x, y), and Metal still rounds
+// one of those differently from the CPU. The decbench exact check allows
+// that on a portability device. Other drivers ignore the variable.
 inline void force_moltenvk_ieee() {
 #if defined(_WIN32)
     _putenv_s("MVK_CONFIG_FAST_MATH_ENABLED", "0");

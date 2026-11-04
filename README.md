@@ -251,7 +251,7 @@ Variants, all from `shaders/ntc_fast_bench.comp`:
 
 | variant | define | arithmetic | requirement | output vs CPU `decode_mip` |
 | --- | --- | --- | --- | --- |
-| exact | `NTC_FAST_EXACT` | fp32, `precise` mul and add, no contraction | none | bit-exact, 0 diff on all files |
+| exact | `NTC_FAST_EXACT` | fp32, `precise` mul and add, no contraction | none | 0 diff on native Vulkan. On a portability device (MoltenVK) max abs <= 1e-6: one rounding, measured 7.45e-9 on tiny.ntc and 4.8e-7 on 2K |
 | fma | default | fp32, contraction allowed | none | max_abs <= 2.4e-7, about 150 dB |
 | fp16 | `NTC_FAST_FP16` | `f16vec2` fma with fp16 sums, fp32 bias, scale and output | `shaderFloat16` | 75.5 to 80.7 dB at mip 0 |
 | i8 | `NTC_FAST_I8` | `dotPacked4x8EXT`, int32 sums. act_int8 files: file scale, signed codes. Otherwise per-vector max-abs scale: layer 0 16-bit codes (two dots), inputs after ReLU unsigned 8-bit, others signed 8-bit | `shaderIntegerDotProduct` | 61.8 to 69.4 dB at mip 0 on non-QAT files; layers with group size not a multiple of 4 stay fp32 |
@@ -295,7 +295,7 @@ Legacy over fast is 5.6x to 11x on this CPU device. lavapipe has no int-dot acce
 `examples/decbench/decbench.cpp`, target `ntc_decbench`. One compute dispatch per pixel of the target size, `uv_scale` chosen so the texture is magnified to the target, timestamps around each dispatch, device-local buffers, rgba8 storage output (4 B per pixel written by every variant, including BC).
 
 - Variants: `legacy` (`ntc_decode.glsl` via `ntc_legacy_bench.comp`), `exact`, `fma`, `fp16`, `i8`, `i16`, `bc7` (one BC7 texture), `bc_mat` (BC7 albedo + BC5 normal + BC7 orm, the BC side of a 9-channel material). BC textures are random mode-6 and BC5 blocks at the NTC texture size, sampled with hardware bilinear at level 0.
-- Before timing, every variant is checked against `ntc::decode_mip` at texel centers for mips 0 to `--check-mips`. exact must be 0 diff. legacy and fma must be within 1e-4 times max(1, |ref|). fp16, i8 and i16 report PSNR only. Any failure exits 1.
+- Before timing, every variant is checked against `ntc::decode_mip` at texel centers for mips 0 to `--check-mips`. exact must be 0 diff on a native Vulkan device. On a portability device the same check passes at max abs <= 1e-6, because MoltenVK 1.4.2 with `MVK_CONFIG_FAST_MATH_ENABLED=0` (0 means never fast-math, 1 always, 2 the default unless the shader opts out) still rounds one mul or add differently from the CPU. legacy and fma must be within 1e-4 times max(1, |ref|). fp16, i8 and i16 report PSNR only. Any failure exits 1.
 - Columns: `median_ms`, `p95_ms`, `ns/sample` (median over pixels), `Gsample/s`, `model_GB/s` (cost-model load bytes plus 4 B written, BC counts 16 B per texture), `vs_bcmat` (median over bc_mat median; under 1 is faster than BC). `stats` prints register, spill and scratch statistics from `VK_KHR_pipeline_executable_properties` when the driver exposes it.
 - Exit 3 when there is no Vulkan 1.3 device; ctest `decbench_check` reports that as skipped.
 - `bench/make_bench_ntc.py` writes synthetic containers: `ship256`, `b10_2k`, `b15_2k`, `wide_2k`, `big_4k`.
@@ -322,8 +322,10 @@ bench/decbench.sh
 # VK_KHR_portability_subset on the device. ntc_gl is not built (no EGL).
 # fp16, int8 dot, BC, and cooperative matrix run only when the device
 # reports them. The fp32 path is the one that must match the CPU decoder
-# within 1e-3. The hosts set MVK_CONFIG_FAST_MATH_ENABLED=0 so the exact
-# variant's separate mul and add are not contracted. fp16 is checked at
+# within 1e-3. The hosts set MVK_CONFIG_FAST_MATH_ENABLED=0. On MoltenVK
+# 1.4.2 that does not make the exact variant bit-identical: the remaining
+# miss is one rounding (7.45e-9 on tiny.ntc, 4.8e-7 on 2K), and decbench
+# accepts max abs <= 1e-6 on a portability device only. fp16 is checked at
 # max abs 0.02 and at least 35 dB against that fp32 image: an int8 weight
 # times a unit feature sits near magnitude 128, where the fp16 ulp is
 # 0.0625, and the 2K files measured 0.0033 to 0.0125 after the scale.
