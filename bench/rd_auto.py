@@ -69,10 +69,26 @@ def _row(images, sems, cfg) -> dict:
         "tile_unique_bytes_per_texel": tile["bytes_per_texel_unique"],
         "tile_upper_bytes_per_texel": tile["bytes_per_texel_upper"],
         "seconds_train": stats["seconds_train"],
+        "latent_deflate": stats.get("latent_deflate"),
+        "latent_stored_bytes": stats.get("latent_stored_bytes"),
+        "latent_plain_bytes": stats.get("latent_plain_bytes"),
+        "mip_loss": stats.get("mip_loss"),
+        "mip_levels": stats.get("mip_levels"),
+        "mip0_psnr": m.get("psnr_u8"),
+        "mip1_psnr": (stats.get("mip_metrics") or {}).get("m1", {}).get("psnr_u8"),
         "mip2_psnr": (stats.get("mip_metrics") or {}).get("m2", {}).get("psnr_u8"),
         "mip_bytes": derived_mip_bytes(ts),
         "probe": stats["probe"],
     }
+
+
+def _frozen(**kwargs):
+    """The curve in ``results/rd_auto_256.json`` predates deflate and footprint loss."""
+    kwargs.setdefault("latent_deflate", False)
+    kwargs.setdefault("mip_levels", 1)
+    kwargs.setdefault("mip_loss", "geom")
+    kwargs.setdefault("log_every", 10**9)
+    return TrainConfig(**kwargs)
 
 
 def main() -> None:
@@ -99,7 +115,7 @@ def main() -> None:
             "metal_plate",
             images,
             sems,
-            TrainConfig(steps=40, target_bpp=float(bpp), log_every=10**9),
+            _frozen(steps=40, target_bpp=float(bpp), log_every=10**9),
             f"auto_h32_s40_b{bpp}",
         )
     winner = rows[-1]
@@ -108,7 +124,7 @@ def main() -> None:
         "metal_plate",
         images,
         sems,
-        TrainConfig(
+        _frozen(
             steps=80,
             target_bpp=16.0,
             grids=grids,
@@ -122,7 +138,7 @@ def main() -> None:
         "metal_plate",
         images,
         sems,
-        TrainConfig(
+        _frozen(
             steps=40,
             target_bpp=16.0,
             grids=grids,
@@ -138,7 +154,7 @@ def main() -> None:
         "metal_plate",
         images,
         sems,
-        TrainConfig(
+        _frozen(
             steps=40,
             target_bpp=16.0,
             hidden=(),
@@ -154,7 +170,7 @@ def main() -> None:
             "PavingStones070",
             pav,
             psem,
-            TrainConfig(steps=40, target_bpp=float(bpp), log_every=10**9),
+            _frozen(steps=40, target_bpp=float(bpp), log_every=10**9),
             f"paving_auto_h32_s40_b{bpp}",
         )
 

@@ -1,0 +1,35 @@
+#version 450
+// Four bilinear taps. The arithmetic is gather_taps in src/ntc/vk_train/reference.py.
+layout(local_size_x = 64) in;
+layout(std430, set = 0, binding = 0) readonly buffer Codes { float codes[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Uv { float uv[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Out { float outv[]; };
+layout(push_constant) uniform Grid { uint width; uint height; uint channels; uint n; } g;
+
+float tap(uint c, int x, int y) {
+    int xx = x % int(g.width);
+    if (xx < 0) xx += int(g.width);
+    int yy = y % int(g.height);
+    if (yy < 0) yy += int(g.height);
+    return codes[(c * g.height + uint(yy)) * g.width + uint(xx)];
+}
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= g.n) return;
+    float x = uv[i * 2u] * float(g.width) - 0.5;
+    float y = uv[i * 2u + 1u] * float(g.height) - 0.5;
+    int x0 = int(floor(x));
+    int y0 = int(floor(y));
+    float tx = x - float(x0);
+    float ty = y - float(y0);
+    for (uint c = 0u; c < g.channels; ++c) {
+        float c00 = tap(c, x0, y0);
+        float c01 = tap(c, x0 + 1, y0);
+        float c10 = tap(c, x0, y0 + 1);
+        float c11 = tap(c, x0 + 1, y0 + 1);
+        float a = c00 + (c01 - c00) * tx;
+        float b = c10 + (c11 - c10) * tx;
+        outv[i * g.channels + c] = a + (b - a) * ty;
+    }
+}

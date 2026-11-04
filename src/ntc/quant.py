@@ -24,6 +24,17 @@ import torch
 
 QMAX = {8: 127, 4: 7, 2: 1}
 
+# fp16 finite range. A value outside this becomes inf, and inf times a
+# zero code is NaN in the dequant. The smallest positive normal is 2^-14.
+FP16_MAX = 65504.0
+FP16_MIN_POS = 2.0**-14
+
+
+def _autocast_off(device_type: str):
+    """fp32 scope. A compiled bf16 region must not rerun the scale math."""
+    kind = device_type if device_type in ("cuda", "cpu", "mps") else "cpu"
+    return torch.autocast(device_type=kind, enabled=False)
+
 
 def latent_mid(bits: int) -> float:
     return float((1 << bits) - 1) / 2.0
@@ -71,22 +82,30 @@ def quantize_weight(
     if bits not in QMAX:
         raise ValueError(f"unsupported weight bits {bits}")
     qmax = QMAX[bits]
-    out, inn = weight.shape
-    gs = inn if group_size <= 0 or group_size >= inn else group_size
-    pad = (gs - (inn % gs)) % gs
-    if pad:
-        padded = torch.nn.functional.pad(weight, (0, pad))
-    else:
-        padded = weight
-    groups = padded.view(out, -1, gs)
-    amax = groups.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)
-    scale = amax / float(qmax)
-    scale = scale.half().float()
-    q = torch.round(groups / scale).clamp(-qmax, qmax)
-    deq = (q * scale).reshape(out, -1)[:, :inn]
-    ste = weight + (deq - weight).detach()
-    codes = q.reshape(out, -1)[:, :inn].detach().to(torch.int64)
-    return ste, codes, scale.squeeze(-1).detach()
+    # The old floor was amax >= 1e-8, so the pre-round scale was about
+    # 1e-10. fp16 flushes that to 0. Every zero tap in the group is then
+    # 0/0, and that NaN is what the bf16 GEMM trains. A scale above 65504
+    # is stored as inf, and inf times a zero code is NaN in the decoder.
+    # Clamp into the fp16 normal range in fp32, then round.
+    kind = weight.device.type if weight.device.type in ("cuda", "cpu", "mps") else "cpu"
+    with _autocast_off(kind):
+        weight = weight.float()
+        out, inn = weight.shape
+        gs = inn if group_size <= 0 or group_size >= inn else group_size
+        pad = (gs - (inn % gs)) % gs
+        if pad:
+            padded = torch.nn.functional.pad(weight, (0, pad))
+        else:
+            padded = weight
+        groups = padded.view(out, -1, gs)
+        amax = groups.abs().amax(dim=-1, keepdim=True)
+        scale = (amax / float(qmax)).clamp(min=FP16_MIN_POS, max=FP16_MAX)
+        scale = scale.half().float()
+        q = torch.round(groups / scale).clamp(-qmax, qmax)
+        deq = (q * scale).reshape(out, -1)[:, :inn]
+        ste = weight + (deq - weight).detach()
+        codes = q.reshape(out, -1)[:, :inn].detach().to(torch.int64)
+        return ste, codes, scale.squeeze(-1).detach()
 
 
 def inv_exp_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -95,7 +114,14 @@ def inv_exp_scale(scale: torch.Tensor) -> torch.Tensor:
 
 
 def fp16_round(t: torch.Tensor) -> torch.Tensor:
-    return t.half().float()
+    """Round to fp16 without producing inf.
+
+    ``.half()`` of a finite value past 65504 is inf. The decoder then
+    evaluates ``inf * 0`` on a zero code and the texel is NaN.
+    """
+    kind = t.device.type if t.device.type in ("cuda", "cpu", "mps") else "cpu"
+    with _autocast_off(kind):
+        return t.float().clamp(-FP16_MAX, FP16_MAX).half().float()
 
 
 def weight_group_count(in_features: int, group_size: int) -> int:

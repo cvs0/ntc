@@ -4,7 +4,13 @@
 #include <cstdint>
 #include <cstring>
 
+// The SSE path is the x86 reference. ARM and other hosts use std::fma and
+// a C add. Those match IEEE round-to-nearest-even but not the x86 NaN
+// payload rule, and this codec is not on the decode path.
+#if defined(__SSE2__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
+#define EXPCODE_X86_SSE 1
+#endif
 
 namespace expcode {
 
@@ -44,7 +50,7 @@ inline uint8_t bf16_sign_mant(uint16_t bits) {
 // libm fma and vfmaddps can return different NaN payloads, so every GEMV
 // path, including scalar tails, has to use the same operation.
 inline float exact_fma(float a, float b, float c) {
-#if defined(__FMA__)
+#if defined(EXPCODE_X86_SSE) && defined(__FMA__)
     return _mm_cvtss_f32(_mm_fmadd_ss(_mm_set_ss(a), _mm_set_ss(b), _mm_set_ss(c)));
 #else
     return std::fma(a, b, c);
@@ -56,7 +62,7 @@ inline float exact_fma(float a, float b, float c) {
 // compiler swap operands, which changes that payload. The GEMV horizontal
 // sum has to be the same instruction on every path.
 inline float exact_add(float a, float b) {
-#if defined(__SSE2__)
+#if defined(EXPCODE_X86_SSE) && (defined(__GNUC__) || defined(__clang__))
     asm("vaddss %1, %0, %0" : "+x"(a) : "x"(b));
     return a;
 #else
@@ -82,10 +88,14 @@ inline bool float_bits_equal(float a, float b) {
 // GEMV bit-exactness assumes IEEE-754 binary32 with denormals preserved
 // and round-to-nearest-even. FTZ or DAZ would flush BF16 subnormals.
 inline void set_ieee_fp_env() {
+#if defined(EXPCODE_X86_SSE)
     unsigned csr = _mm_getcsr();
     csr &= ~0x8040u;    // DAZ (bit 6), FTZ (bit 15)
     csr &= ~(3u << 13); // RC = round to nearest even
     _mm_setcsr(csr);
+#else
+    // Leave the process environment. std::fma follows the host rounding mode.
+#endif
 }
 
 } // namespace expcode

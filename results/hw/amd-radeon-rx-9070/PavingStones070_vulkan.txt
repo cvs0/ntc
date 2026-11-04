@@ -1,0 +1,34 @@
+device_count 2
+device_list 0 name AMD Radeon RX 9070 vendor 0x1002 device 0x7550 type 2
+device_list 1 name AMD Radeon(TM) Graphics vendor 0x1002 device 0x164e type 1
+device_index 0
+device_name AMD Radeon RX 9070
+vendor_id 0x1002
+device_id 0x7550
+driver_raw 8389024
+api_version 1.4.359
+subgroup_size 64
+timestamp_period_ns 10
+device AMD Radeon RX 9070 vendor 0x1002 type 2 api 1.4 driver 8389024 subgroup 64 float16 1 int8 1 coopmat 1 cpu 0
+compute_max_abs 2.38419e-07
+timestamp_ms 0.12568
+stage_max_abs 2.38419e-07
+fp16_max_abs 0.00124192
+fp16_stage_max_abs 0.00124192
+bench load_fp32 median_ms 0.15912 p95_ms 0.16284 texels_s 5.49145e+08 gb_s 19.7692
+bench load_fp16 median_ms 0.16344 p95_ms 0.16724 texels_s 5.3463e+08 gb_s 19.2467
+bench sample_native_fp32 median_ms 0.11876 p95_ms 0.12088 texels_s 5.51836e+08 gb_s 19.8661
+bench sample_1920x1080_fp32 median_ms 2.87604 p95_ms 2.88848 texels_s 7.20991e+08 gb_s 25.9557
+bench sample_3840x2160_fp32 median_ms 11.2672 p95_ms 11.277 texels_s 7.36152e+08 gb_s 26.5015
+wrote results\hw_encode\PavingStones070_vulkan/vk_ntc_fp32.f32 256 256 9
+wrote results\hw_encode\PavingStones070_vulkan/vk_lit_fp32.f32
+bench bc7_1920x1080 median_ms 0.94236 p95_ms 0.94404 texels_s 2.20043e+09 gb_s 35.2069
+bench bc7_3840x2160 median_ms 4.42512 p95_ms 4.42796 texels_s 1.87439e+09 gb_s 29.9902
+wrote results\hw_encode\PavingStones070_vulkan/bc7.f32 256 256
+bench bc1_1920x1080 median_ms 0.94208 p95_ms 0.9454 texels_s 2.20109e+09 gb_s 35.2174
+bench bc1_3840x2160 median_ms 4.42532 p95_ms 4.42736 texels_s 1.87431e+09 gb_s 29.9889
+wrote results\hw_encode\PavingStones070_vulkan/bc1.f32 256 256
+bench bc5_1920x1080 median_ms 0.94268 p95_ms 0.94464 texels_s 2.19969e+09 gb_s 35.195
+bench bc5_3840x2160 median_ms 4.42532 p95_ms 4.42784 texels_s 1.87431e+09 gb_s 29.9889
+wrote results\hw_encode\PavingStones070_vulkan/bc5.f32 256 256
+ok

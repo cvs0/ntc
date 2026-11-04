@@ -1,0 +1,215 @@
+{
+  "measured_on_this_process": true,
+  "gpu_result": false,
+  "size": 32,
+  "steps": 8,
+  "seeds": 4,
+  "target_psnr_u8": 17.709236370144154,
+  "target_definition": "8-bit PSNR of the eager encode_arrays run at --steps",
+  "old_one_model": {
+    "wall_s": 0.031062575999385444,
+    "psnr_u8": 17.709236370144154,
+    "seconds_train": 0.016974264002783457,
+    "steps_per_s": 471.3017305898006
+  },
+  "new_one_model": {
+    "wall_s": 0.02687420200163615,
+    "psnr_u8": 17.709236370144154,
+    "seconds_train": 0.015430441999342293,
+    "steps_per_s": 518.4556605922884,
+    "compiled": false,
+    "compile_error": null,
+    "cuda_graph": false,
+    "cuda_graph_error": null,
+    "precision": "fp32"
+  },
+  "old_seed_pool": {
+    "wall_s": 0.12198795400036033,
+    "psnr_u8": 17.76909720436765,
+    "seeds": 4
+  },
+  "new_seed_pool": {
+    "wall_s": 0.035019689003092935,
+    "psnr_u8": 17.710572115484887,
+    "halving": [
+      {
+        "step": 0,
+        "alive": [
+          0,
+          1,
+          2,
+          3
+        ]
+      },
+      {
+        "step": 2,
+        "alive": [
+          0,
+          2
+        ],
+        "psnr_u8": [
+          17.55689670540476,
+          17.52617253764889
+        ]
+      },
+      {
+        "step": 4,
+        "alive": [
+          0
+        ],
+        "psnr_u8": [
+          17.641443715494894
+        ]
+      }
+    ],
+    "winner_seed": 0
+  },
+  "time_to_target_psnr_old_s": 0.031062575999385444,
+  "time_to_target_psnr_new_s": 0.02687420200163615,
+  "speedup_time_to_target": 1.1558511020157658,
+  "speedup_one_model_wall": 1.1558511020157658,
+  "speedup_seed_pool_wall": 3.4834105462668834,
+  "new_psnr_when_target_recorded": 17.709236370144154,
+  "profile": {
+    "device": {
+      "device": "cpu",
+      "torch": "2.14.1+cpu",
+      "hip": null,
+      "cuda": null,
+      "backend": "cpu",
+      "name": "cpu"
+    },
+    "steps": 3,
+    "warmup_steps": 1,
+    "wall_s": 0.019664914998429595,
+    "steps_per_s": 152.5559607168185,
+    "self_cpu_s": 0.006244558,
+    "self_cuda_s": null,
+    "gpu_idle_fraction": null,
+    "gpu_idle_reason": "no cuda device. GPU idle fraction is measured by this function on the RX 9070.",
+    "launch_cpu_fraction": 0.0,
+    "top_ops": [
+      {
+        "name": "aten::_to_copy",
+        "self_cpu_us": 695.568999999994,
+        "self_device_us": 0.0,
+        "count": 357
+      },
+      {
+        "name": "aten::index",
+        "self_cpu_us": 581.4820000000022,
+        "self_device_us": 0.0,
+        "count": 42
+      },
+      {
+        "name": "Optimizer.step#Adam.step",
+        "self_cpu_us": 482.9690000000023,
+        "self_device_us": 0.0,
+        "count": 3
+      },
+      {
+        "name": "aten::mul",
+        "self_cpu_us": 310.0269999999998,
+        "self_device_us": 0.0,
+        "count": 177
+      },
+      {
+        "name": "aten::copy_",
+        "self_cpu_us": 201.0870000000084,
+        "self_device_us": 0.0,
+        "count": 399
+      },
+      {
+        "name": "aten::sum",
+        "self_cpu_us": 184.2329999999979,
+        "self_device_us": 0.0,
+        "count": 33
+      },
+      {
+        "name": "aten::add",
+        "self_cpu_us": 172.9199999999962,
+        "self_device_us": 0.0,
+        "count": 138
+      },
+      {
+        "name": "aten::sub",
+        "self_cpu_us": 158.58400000000165,
+        "self_device_us": 0.0,
+        "count": 99
+      },
+      {
+        "name": "aten::empty_strided",
+        "self_cpu_us": 139.36100000000647,
+        "self_device_us": 0.0,
+        "count": 360
+      },
+      {
+        "name": "aten::addmm",
+        "self_cpu_us": 139.31300000000238,
+        "self_device_us": 0.0,
+        "count": 12
+      },
+      {
+        "name": "aten::div",
+        "self_cpu_us": 137.83200000001057,
+        "self_device_us": 0.0,
+        "count": 63
+      },
+      {
+        "name": "aten::_index_put_impl_",
+        "self_cpu_us": 129.79599999999937,
+        "self_device_us": 0.0,
+        "count": 24
+      }
+    ],
+    "recommend_fused_gather": null,
+    "recommend_fused_gather_reason": "fused gather stays off until a CUDA profile names that op",
+    "triton": "not_installed",
+    "historical_host_syncs": [
+      "clip_grad_norm_ reads the global norm on the host every step",
+      "uv and each mip target are rebuilt every step",
+      "seeds in a pool are separate encode_arrays calls"
+    ]
+  },
+  "precision_probe": null,
+  "rx9070_c33648b": {
+    "per_1000_steps_s": 30.0,
+    "s20000_wall_s": 648.0,
+    "fp32_400_s": 17.0,
+    "bf16_400_s": 12.0,
+    "precision_chosen_by_equal_steps": "fp32",
+    "partial_psnr_bpp": [
+      [
+        "metal_g16_s20000",
+        39.4655,
+        11.7025
+      ],
+      [
+        "paving_g16_s20000",
+        34.4812,
+        11.8823
+      ],
+      [
+        "metal_b6_s10000",
+        33.6462,
+        5.363
+      ],
+      [
+        "paving_b6",
+        29.6474,
+        4.9972
+      ],
+      [
+        "metal_b4",
+        29.7362,
+        3.098
+      ],
+      [
+        "paving_b4",
+        29.232,
+        3.4713
+      ]
+    ]
+  },
+  "note": "speedup_time_to_target is old wall divided by the fast wall needed to reach the eager PSNR. A null value means the fast run had not reached that PSNR by 4x the step count. gpu_idle_fraction is null without CUDA. The 3x bar is this script on the RX 9070 at --size 256 --g16 --steps 200."
+}

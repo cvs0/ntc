@@ -1,0 +1,121 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 2, local_size_z = 1) in;
+#define NTC_NO_OUT 1
+#include "ntc_decode.glsl"
+
+// One workgroup, 32 invocations, one BC7 mode-6 block. Matches pack_bc7_mode6_block.
+layout(set = 0, binding = 3) buffer Req { uint req[]; };
+layout(set = 0, binding = 4) buffer Blocks { uint blocks[]; };
+
+shared uint pix[16];
+
+const uint W4[16] = uint[](0u, 4u, 9u, 13u, 17u, 21u, 26u, 30u, 34u, 38u, 43u, 47u, 51u, 55u, 60u, 64u);
+
+void put_bits(inout uvec4 words, inout int pos, uint value, int nbits) {
+    for (int i = 0; i < nbits; ++i) {
+        if (((value >> uint(i)) & 1u) != 0u) {
+            int bit = pos + i;
+            words[bit / 32] |= 1u << uint(bit % 32);
+        }
+    }
+    pos += nbits;
+}
+
+void main() {
+    uint block = gl_WorkGroupID.x;
+    if (req[block] == 0u) return;
+    uint blocks_x = g_pc.x;
+    uint bx = block % blocks_x;
+    uint by = block / blocks_x;
+    if (gl_LocalInvocationID.y == 0u) {
+        uint lx = gl_LocalInvocationID.x;
+        uint x = bx * 4u + (lx & 3u);
+        uint y = by * 4u + (lx >> 2u);
+        uint packed = 0u;
+        if (x < g_pc.z && y < g_pc.w) {
+            vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(float(g_pc.z), float(g_pc.w));
+            ntc_eval(uv, 0);
+            uint r = uint(clamp(int(round(g_y[0] * 255.0)), 0, 255));
+            uint g = g_desc[0].z > 1u ? uint(clamp(int(round(g_y[1] * 255.0)), 0, 255)) : 0u;
+            uint b = g_desc[0].z > 2u ? uint(clamp(int(round(g_y[2] * 255.0)), 0, 255)) : 0u;
+            uint a = g_desc[0].z > 3u ? uint(clamp(int(round(g_y[3] * 255.0)), 0, 255)) : 255u;
+            packed = r | (g << 8u) | (b << 16u) | (a << 24u);
+        }
+        pix[lx] = packed;
+    }
+    barrier();
+    if (gl_LocalInvocationID.x != 0u || gl_LocalInvocationID.y != 0u) return;
+    uint lo_c[4];
+    uint hi_c[4];
+    for (int ch = 0; ch < 4; ++ch) {
+        lo_c[ch] = 255u;
+        hi_c[ch] = 0u;
+    }
+    for (int i = 0; i < 16; ++i) {
+        for (int ch = 0; ch < 4; ++ch) {
+            uint v = (pix[i] >> uint(ch * 8)) & 255u;
+            if (v < lo_c[ch]) lo_c[ch] = v;
+            if (v > hi_c[ch]) hi_c[ch] = v;
+        }
+    }
+    uint p0 = lo_c[0] & 1u;
+    uint p1 = hi_c[0] & 1u;
+    uint e0[4];
+    uint e1[4];
+    uint r0[4];
+    uint r1[4];
+    for (int ch = 0; ch < 4; ++ch) {
+        e0[ch] = lo_c[ch] >> 1u;
+        e1[ch] = hi_c[ch] >> 1u;
+        r0[ch] = (e0[ch] << 1u) | p0;
+        r1[ch] = (e1[ch] << 1u) | p1;
+    }
+    uint index[16];
+    for (int i = 0; i < 16; ++i) {
+        uint best = 0u;
+        uint bestd = 0xffffffffu;
+        for (uint k = 0u; k < 16u; ++k) {
+            uint d = 0u;
+            uint w = W4[k];
+            uint iw = 64u - w;
+            for (int ch = 0; ch < 4; ++ch) {
+                uint pal = (r0[ch] * iw + r1[ch] * w + 32u) >> 6u;
+                uint v = (pix[i] >> uint(ch * 8)) & 255u;
+                int diff = int(v) - int(pal);
+                d += uint(diff * diff);
+            }
+            if (d < bestd) {
+                bestd = d;
+                best = k;
+            }
+        }
+        index[i] = best;
+    }
+    if (index[0] >= 8u) {
+        for (int i = 0; i < 16; ++i) index[i] = 15u - index[i];
+        for (int ch = 0; ch < 4; ++ch) {
+            uint t = e0[ch];
+            e0[ch] = e1[ch];
+            e1[ch] = t;
+        }
+        uint t = p0;
+        p0 = p1;
+        p1 = t;
+    }
+    uvec4 words = uvec4(0u);
+    int pos = 0;
+    put_bits(words, pos, 1u << 6u, 7);
+    for (int ch = 0; ch < 4; ++ch) {
+        put_bits(words, pos, e0[ch], 7);
+        put_bits(words, pos, e1[ch], 7);
+    }
+    put_bits(words, pos, p0, 1);
+    put_bits(words, pos, p1, 1);
+    put_bits(words, pos, index[0], 3);
+    for (int i = 1; i < 16; ++i) put_bits(words, pos, index[i], 4);
+    blocks[block * 4u] = words.x;
+    blocks[block * 4u + 1u] = words.y;
+    blocks[block * 4u + 2u] = words.z;
+    blocks[block * 4u + 3u] = words.w;
+}

@@ -1,0 +1,14 @@
+{
+  "panels": [
+    "albedo",
+    "normal",
+    "orm"
+  ],
+  "written": [
+    "metal_plate_vulkan_albedo.png",
+    "metal_plate_vulkan_normal.png",
+    "metal_plate_vulkan_orm.png",
+    "metal_plate_vulkan_lit.png",
+    "metal_plate_vulkan_bc7.png"
+  ]
+}

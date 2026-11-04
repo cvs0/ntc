@@ -12,7 +12,7 @@ jobs:
       - name: packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ glslang-tools \
+          sudo apt-get install -y cmake ninja-build g++ glslang-tools spirv-tools \
             libvulkan-dev libegl1-mesa-dev libgl1-mesa-dev \
             mesa-vulkan-drivers libgl1-mesa-dri
       - uses: actions/setup-python@v5
@@ -28,8 +28,18 @@ jobs:
         run: PYTHONPATH=src pytest -q
       - name: cmake
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
-          cmake --build build
+          set -o pipefail
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug \
+            -DCMAKE_CXX_FLAGS="-Wall -Wextra -Werror -Wno-unused-parameter -Wno-missing-field-initializers -fsanitize=address,undefined -fno-omit-frame-pointer" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build 2>&1 | tee build.log
+          if grep -E "WARNING:" build.log; then exit 1; fi
+          find build/shaders -name '*.spv' -print0 | xargs -0 -r -n 1 spirv-val
+          if grep -q NTC_HAVE_DOT4 build/shaders/ntc_dot_config.glsl; then
+            spirv-dis build/shaders/ntc_sample_i8.comp.spv | grep -q OpSDot
+          else
+            echo "glslang has no GL_EXT_integer_dot_product; int8 dot stays four multiplies"
+          fi
           ctest --test-dir build --output-on-failure
       - name: shader hosts
         env:
@@ -38,3 +48,70 @@ jobs:
         run: |
           ./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
           ./build/ntc_gl tests/fixtures/tiny.ntc shaders
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: configure and compile
+        run: |
+          cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+          cmake --build build --config Release --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
+          ctest --test-dir build -C Release -R test_ntc --output-on-failure
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: packages
+        run: |
+          export HOMEBREW_NO_AUTO_UPDATE=1
+          brew install cmake ninja glslang molten-vk vulkan-loader vulkan-headers vulkan-tools
+          # MoltenVK 1.4 installs the ICD under Homebrew's etc, which is not
+          # inside the opt prefix that find used to search.
+          PREFIX="$(brew --prefix)"
+          ICD=""
+          for cand in \
+            "$PREFIX/etc/vulkan/icd.d/MoltenVK_icd.json" \
+            "$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" \
+            "$(brew --prefix molten-vk)/share/vulkan/icd.d/MoltenVK_icd.json"
+          do
+            if [ -f "$cand" ]; then ICD="$cand"; break; fi
+          done
+          if [ -z "$ICD" ]; then
+            ICD="$(find "$(brew --prefix molten-vk)" "$PREFIX/etc/vulkan" "$(brew --prefix vulkan-loader)" -name 'MoltenVK_icd.json' 2>/dev/null | head -1)"
+          fi
+          test -n "$ICD"
+          test -f "$ICD"
+          echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$ICD" >> "$GITHUB_ENV"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: python
+        run: |
+          pip install torch numpy pillow pytest ruff
+      - name: pytest
+        run: PYTHONPATH=src pytest -q
+      - name: cmake
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+          ./build/ntc_vk tests/fixtures/tiny.ntc build/shaders
+          ./build/ntc_decbench --check-only --sizes 64x64 --shader-dir build/shaders tests/fixtures/tiny.ntc tests/fixtures/ctx.ntc
+
+  windows-clang:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ilammy/msvc-dev-cmd@v1
+      - name: ntc_gl with clang++
+        shell: pwsh
+        run: |
+          clang++ --version
+          cmake -S . -B build-clang -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build-clang --target ntc ntc_decode test_ntc expcode_bytes ntc_gl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

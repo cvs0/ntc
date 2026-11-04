@@ -1,0 +1,8 @@
+{
+  "device": "cuda",
+  "torch": "2.9.1+rocm7.2.1",
+  "hip": "7.2.53211-158bd99533",
+  "cuda": null,
+  "backend": "rocm",
+  "name": "AMD Radeon RX 9070"
+}

@@ -1,0 +1,20 @@
+#version 450
+// The interpreter in ntc_decode.glsl at the same output cost as
+// ntc_fast_bench.comp mode 1: one rgba8 word per sample.
+// g_pc.x = uv_scale.x * 65536, g_pc.y = uv_scale.y * 65536, g_pc.zw = size.
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+#define NTC_NO_OUT
+#include "ntc_decode.glsl"
+layout(std430, set = 0, binding = 2) writeonly buffer LegOut { uint leg_out[]; };
+
+void main() {
+    uvec2 id = gl_GlobalInvocationID.xy;
+    if (id.x >= g_pc.z || id.y >= g_pc.w) return;
+    vec2 uv = (vec2(id) + 0.5) / vec2(g_pc.zw) * (vec2(g_pc.xy) * (1.0 / 65536.0));
+    ntc_eval(uv, 0);
+    uint ch = g_desc[0].z;
+    vec4 v = vec4(0.0);
+    for (uint c = 0u; c < ch; ++c) v[c & 3u] += g_y[c];
+    leg_out[id.y * g_pc.z + id.x] = packUnorm4x8(v * 0.25);
+}

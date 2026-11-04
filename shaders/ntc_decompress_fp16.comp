@@ -2,6 +2,7 @@
 #extension GL_GOOGLE_include_directive : require
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
 #define NTC_FP16 1
+#define NTC_FP16_EXT_DONE 1
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 #include "ntc_decode.glsl"
 

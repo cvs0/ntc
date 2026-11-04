@@ -1,0 +1,23 @@
+gl vendor ATI Technologies Inc. renderer AMD Radeon RX 9070 version 4.6.0 Core Profile Context 26.10.1.261008
+gl_subgroup 64
+gl_software 0
+gl_compute_max_abs 1.19209e-07
+gl_fragment_max_abs 8.9407e-08
+bench load_fp32 median_ms 0.14068 p95_ms 0.14336 texels_s 6.21126e+08 gb_s 22.3605
+bench load_fp16 skipped no_gl_fp16
+wrote results\hw_encode\metal_plate_opengl/gl_ntc_fp32.f32 256 256 9
+bench sample_native_fp32 median_ms 0.1086 p95_ms 0.11048 texels_s 6.03462e+08 gb_s 21.7246
+bench sample_1920x1080_fp32 median_ms 2.86812 p95_ms 2.87412 texels_s 7.22982e+08 gb_s 26.0274
+bench sample_3840x2160_fp32 median_ms 11.3399 p95_ms 11.3606 texels_s 7.31436e+08 gb_s 26.3317
+bench lit_native_fp32 median_ms 0.09148 p95_ms 0.09324 texels_s 7.16397e+08 gb_s 8.59676
+wrote results\hw_encode\metal_plate_opengl/gl_lit_fp32.f32
+bench bc7_1920x1080 median_ms 0.94904 p95_ms 0.9528 texels_s 2.18494e+09 gb_s 34.9591
+bench bc7_3840x2160 median_ms 4.43472 p95_ms 4.4374 texels_s 1.87033e+09 gb_s 29.9253
+wrote results\hw_encode\metal_plate_opengl/bc7.f32 256 256
+bench bc1_1920x1080 median_ms 0.94692 p95_ms 0.95224 texels_s 2.18984e+09 gb_s 35.0374
+bench bc1_3840x2160 median_ms 4.4348 p95_ms 4.44084 texels_s 1.8703e+09 gb_s 29.9248
+wrote results\hw_encode\metal_plate_opengl/bc1.f32 256 256
+bench bc5_1920x1080 median_ms 0.94708 p95_ms 0.95128 texels_s 2.18947e+09 gb_s 35.0315
+bench bc5_3840x2160 median_ms 4.43424 p95_ms 4.4372 texels_s 1.87053e+09 gb_s 29.9286
+wrote results\hw_encode\metal_plate_opengl/bc5.f32 256 256
+ok

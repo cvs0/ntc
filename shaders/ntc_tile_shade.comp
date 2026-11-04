@@ -1,0 +1,26 @@
+#version 450
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0) uniform sampler2D u_atlas;
+layout(set = 0, binding = 1) writeonly buffer Outc { float px[]; };
+layout(push_constant) uniform Pc { uvec4 g_pc; };
+
+// g_pc.x out width, g_pc.y out height.
+// g_pc.z: window width in px (low 16) and origin x (high 16).
+// g_pc.w: window height and origin y, same packing.
+void main() {
+    uint W = g_pc.x;
+    uint H = g_pc.y;
+    if (gl_GlobalInvocationID.x >= W || gl_GlobalInvocationID.y >= H) return;
+    float ow = float(g_pc.z & 0xFFFFu);
+    float oh = float(g_pc.w & 0xFFFFu);
+    float ox = float(g_pc.z >> 16);
+    float oy = float(g_pc.w >> 16);
+    vec2 uv = (vec2(ox, oy) + (vec2(gl_GlobalInvocationID.xy) + vec2(0.5)) / vec2(float(W), float(H)) * vec2(ow, oh)) /
+              vec2(textureSize(u_atlas, 0));
+    vec4 c = texture(u_atlas, uv);
+    uint idx = (gl_GlobalInvocationID.y * W + gl_GlobalInvocationID.x) * 4u;
+    px[idx] = c.r;
+    px[idx + 1u] = c.g;
+    px[idx + 2u] = c.b;
+    px[idx + 3u] = c.a;
+}

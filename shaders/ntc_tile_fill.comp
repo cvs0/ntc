@@ -1,0 +1,29 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+#define NTC_NO_OUT 1
+#include "ntc_decode.glsl"
+
+layout(set = 0, binding = 3) buffer Req { uint req[]; };
+layout(set = 0, binding = 4) buffer Res { uint resident[]; };
+layout(rgba8, set = 0, binding = 5) uniform writeonly image2D atlas;
+
+// One workgroup per tile. g_pc: tiles_x, tile_size, material_w, material_h.
+void main() {
+    uint tile = gl_WorkGroupID.x;
+    if (req[tile] == 0u || resident[tile] != 0u) return;
+    uint tiles_x = g_pc.x;
+    uint ts = g_pc.y;
+    uint tx = tile % tiles_x;
+    uint ty = tile / tiles_x;
+    uint x = tx * ts + gl_LocalInvocationID.x;
+    uint y = ty * ts + gl_LocalInvocationID.y;
+    if (x >= g_pc.z || y >= g_pc.w) return;
+    vec2 uv = (vec2(x, y) + vec2(0.5)) / vec2(float(g_pc.z), float(g_pc.w));
+    ntc_eval(uv, 0);
+    float r = g_y[0];
+    float g = g_desc[0].z > 1u ? g_y[1] : 0.0;
+    float b = g_desc[0].z > 2u ? g_y[2] : 0.0;
+    imageStore(atlas, ivec2(x, y), vec4(r, g, b, 1.0));
+    if (gl_LocalInvocationID.x == 0u && gl_LocalInvocationID.y == 0u) resident[tile] = 1u;
+}
