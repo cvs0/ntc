@@ -159,6 +159,16 @@ class TrainConfig:
     # Fraction of steps after which latents freeze. 0.95 is the historical
     # 5 percent MLP tail. The cloud profile uses 0.90.
     quant_freeze_at: float = 0.95
+    # 0 keeps the raw weights. Above 0, an EMA of every parameter is what
+    # the file exports. The fast path reads this. encode_arrays does not.
+    ema_decay: float = 0.0
+    # 0 leaves activations in fp32. Above 0, the last fraction of steps
+    # straight-through quantizes each layer input to int8 and the file
+    # stores those scales. The fast path reads this.
+    mlp_int8_tail: float = 0.0
+    # 0 writes the resume checkpoint once, at the end. Above 0, the fast
+    # path also writes it every this many steps on a side thread.
+    ckpt_every: int = 0
 
 
 def _color_mip(target: torch.Tensor, mip: int) -> torch.Tensor:

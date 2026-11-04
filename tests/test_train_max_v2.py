@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import bench.train_max_v2 as v2
@@ -121,6 +122,32 @@ def test_job_cost_and_cost_balanced_shards():
     assert sorted(owned) == list(range(len(jobs)))
 
 
+def _ntc_bytes(tag: int = 0) -> bytes:
+    from ntc.container import ChannelRec, build_texture_set
+
+    return build_texture_set(
+        width=4,
+        height=4,
+        num_mips=1,
+        activation=1,
+        pe_mode=0,
+        pe_octaves=0,
+        flags=0,
+        weight_bits=8,
+        group_size=0,
+        channels=[ChannelRec(0)],
+        grids=[{"codes": np.zeros((1, 4, 4), np.uint8), "bits": 4, "scale": np.array([0.2 + 0.01 * tag], np.float32)}],
+        layers=[
+            {
+                "codes": np.ones((1, 1), np.int16),
+                "bias": np.zeros(1, np.float32),
+                "scale": np.ones((1, 1), np.float32),
+                "group_size": 0,
+            }
+        ],
+    )
+
+
 def _tiny(name: str, steps: int, material: str) -> dict:
     return {
         "name": name,
@@ -139,9 +166,11 @@ def test_queue_claims_heaviest_then_another(tmp_path: Path):
     second = claim_next(jobs, tmp_path, 3600, pack=False)
     heaviest = max(job_cost(job) for job in jobs)
     assert job_cost(first[0]) == heaviest
-    assert job_cost(first[0]) > job_cost(second[0])
     assert [job["name"] for job in first] == ["wood_floor_1k_b16_s4000"]
-    assert [job["name"] for job in second] == ["metal_g16_s20000"]
+    # metal_g16 is heavier than this claim, and it waits until the cheaper
+    # metal labels are finished so the higher rate can warm-start.
+    assert [job["name"] for job in second] == ["sdk_MetalPlates013_2K_b2.5"]
+    assert job_cost(first[0]) > job_cost(second[0])
 
 
 def _packable(name: str, steps: int) -> dict:
@@ -406,8 +435,11 @@ def test_neighbor_warm_start_grows_the_lower_grid(tmp_path: Path):
         "grids": None,
     }
     got = apply_rate_neighbor(job, tmp_path)
-    assert got["grids"][0][2] > 4
-    assert got["grids"][0][:2] == [32, 32]
+    # b10 at scale 0.5 is 20 raw bpp. Resolution grows before channels,
+    # so the 32 lattice becomes full resolution instead of 16 channels.
+    assert got["grids"][0][:2] == [64, 64]
+    assert got["grids"][0][3] == 4
+    assert got["grids"][1][0] == 32
     assert got.get("warm_start") in (None, "")
 
 
@@ -419,7 +451,7 @@ def test_result_json_records_wall_and_bpp(tmp_path: Path, monkeypatch):
     out.mkdir()
 
     def _encode(*_args, **_kwargs):
-        return b"ntc", {
+        return _ntc_bytes(), {
             "metrics": {"psnr_u8": 31.0},
             "total_bpp": 0.995,
             "psnr_u8_init": 25.0,
@@ -473,7 +505,7 @@ def test_label_keeps_its_own_lattice_when_the_lower_one_caps(tmp_path: Path):
     }
     got = apply_rate_neighbor(job, tmp_path)
     assert got["grids"] == own
-    assert got.get("warm_start") in (None, "")
+    assert str(got.get("warm_start") or "").endswith("sdk_Metal_b5.pt")
     assert got["steps"] == 2000 and got["warmup"] == 800
 
 
@@ -507,7 +539,7 @@ def test_cloud_b10_trains_on_its_own_lattice(tmp_path: Path):
     }
     got = apply_rate_neighbor(job, tmp_path)
     assert got["grids"] == own
-    assert got.get("warm_start") in (None, "")
+    assert str(got.get("warm_start") or "").endswith("cloud_M_2K_b5.pt")
     assert got["steps"] == 2000
 
 
@@ -599,11 +631,15 @@ def test_rate_retry_stops_after_one_and_keeps_the_best_bytes(tmp_path: Path, mon
     out = tmp_path / "out"
     out.mkdir()
     calls = {"n": 0}
+    first = {}
 
     def _encode(*_args, **_kwargs):
         calls["n"] += 1
         bpp = 14.0 if calls["n"] == 1 else 28.0
-        return bytes([calls["n"]]), {
+        blob = _ntc_bytes(calls["n"])
+        if calls["n"] == 1:
+            first["blob"] = blob
+        return blob, {
             "metrics": {"psnr_u8": 30.0 if calls["n"] == 1 else 33.0},
             "total_bpp": bpp,
             "psnr_u8_init": 20.0,
@@ -643,7 +679,7 @@ def test_rate_retry_stops_after_one_and_keeps_the_best_bytes(tmp_path: Path, mon
     assert row["done"] is True
     assert row["rate_miss"] is True
     assert row["total_bpp"] == 14.0
-    assert (out / f"{job['name']}.ntc").read_bytes() == bytes([1])
+    assert (out / f"{job['name']}.ntc").read_bytes() == first["blob"]
     assert _job_blocked(out, job)
     assert claim_next([job], out, 3600, pack=False) == []
     assert v2.write_completion(out, [job])
@@ -651,3 +687,35 @@ def test_rate_retry_stops_after_one_and_keeps_the_best_bytes(tmp_path: Path, mon
     summary = json.loads((out / v2.DONE_MARKER).read_text())
     assert summary["pending"] == []
     assert summary["over_label"] == [job["name"]]
+
+
+def test_high_rate_grow_doubles_resolution_before_channels():
+    grown = grow_grids([(8, 8, 4, 4)], 16, 16, 12.0, prefer_resolution=True)
+    assert grown[0][0] == 16
+    assert grown[0][3] in (4, 8)
+    assert grown[0][2] >= 4
+
+
+def test_queue_claims_the_lower_rate_of_the_same_material_first(tmp_path: Path):
+    low = {"name": "mat_b1", "material": "mat", "size": 32, "steps": 10, "bpp": 1.0, "seed_pool": 1, "batch_pixels": 0, "grids": None}
+    high = {"name": "mat_b20", "material": "mat", "size": 32, "steps": 8000, "bpp": 20.0, "seed_pool": 1, "batch_pixels": 0, "grids": None}
+    claimed = claim_next([high, low], tmp_path, 3600, pack=False)
+    assert [job["name"] for job in claimed] == ["mat_b1"]
+
+
+def test_corrupt_psnr_is_rejected_without_a_file(tmp_path: Path):
+    from bench.train_max_v2 import validate_result
+
+    reason = validate_result({"psnr_u8": float("nan"), "total_bpp": 1.0, "target_bpp": 1.0}, None)
+    assert reason == "non-finite psnr"
+    assert validate_result({"psnr_u8": 30.0, "total_bpp": 1.2, "target_bpp": 1.0}, None) is None
+
+
+def test_run3_budget_is_finite():
+    from bench.train_max_v2 import run3_report
+
+    report = run3_report()
+    assert report["jobs"] == 20
+    assert report["gpu_hours"] > 1.0
+    assert "cloudfast" in report["command"]
+    assert "--max-gpu" in report["command"]

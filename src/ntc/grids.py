@@ -38,36 +38,77 @@ def latent_payload_bits(grids: list[tuple[int, int, int, int]]) -> int:
     return bits
 
 
+def _grids_bpp(grids, width: int, height: int) -> float:
+    pixels = float(max(int(width) * int(height), 1))
+    return latent_payload_bits([tuple(g) for g in grids]) / pixels
+
+
 def grow_grids(
     base: list[tuple[int, int, int, int]],
     width: int,
     height: int,
     target_bpp: float,
+    prefer_resolution: bool = False,
 ) -> list[tuple[int, int, int, int]]:
-    """Add channels on ``base`` until the packed latent rate meets ``target_bpp``.
+    """Grow ``base`` until the packed latent rate meets ``target_bpp``.
 
-    Spatial sizes and bit depth stay put, and new channels are appended on
-    each grid. A checkpoint of ``base`` can be copied into the prefix of
-    those channels. Channels stop at 16.
+    The default adds channels and leaves the lattice and the bit depth
+    alone. Channels stop at 16. ``prefer_resolution`` is the high-rate
+    path: double a grid's spatial size first, then add channels, then
+    promote 4-bit planes to 8-bit. A step that would pass 1.15x the
+    target is skipped unless the lattice is still under 0.8x, in which
+    case one step up to 1.5x is allowed so the label is not stuck at
+    half rate.
     """
     grids = [list(g) for g in base]
-    pixels = float(max(width * height, 1))
-
-    def bpp() -> float:
-        return latent_payload_bits([tuple(g) for g in grids]) / pixels
-
-    guard = 0
-    while bpp() < float(target_bpp) * 0.95 and guard < 8:
-        guard += 1
-        order = sorted(range(len(grids)), key=lambda i: grids[i][0] * grids[i][1], reverse=True)
-        grew = False
-        for index in order:
-            if int(grids[index][2]) + 4 <= 16:
-                grids[index][2] = int(grids[index][2]) + 4
-                grew = True
+    if not prefer_resolution:
+        guard = 0
+        while _grids_bpp(grids, width, height) < float(target_bpp) * 0.95 and guard < 8:
+            guard += 1
+            order = sorted(range(len(grids)), key=lambda i: grids[i][0] * grids[i][1], reverse=True)
+            grew = False
+            for index in order:
+                if int(grids[index][2]) + 4 <= 16:
+                    grids[index][2] = int(grids[index][2]) + 4
+                    grew = True
+                    break
+            if not grew:
                 break
-        if not grew:
+        return [tuple(g) for g in grids]
+
+    cap = float(target_bpp) * 1.15
+    escape = float(target_bpp) * 1.5
+    floor = float(target_bpp) * 0.8
+    guard = 0
+    while _grids_bpp(grids, width, height) < float(target_bpp) * 0.95 and guard < 24:
+        guard += 1
+        current = _grids_bpp(grids, width, height)
+        order = sorted(range(len(grids)), key=lambda i: grids[i][0] * grids[i][1], reverse=True)
+        found = []
+        for kind, rank in (("res", 0), ("ch", 1), ("bits", 2)):
+            for index in order:
+                trial = [list(g) for g in grids]
+                gw, gh, ch, bits = trial[index]
+                if kind == "res":
+                    if gw * 2 > int(width) or gh * 2 > int(height):
+                        continue
+                    trial[index][0] = gw * 2
+                    trial[index][1] = gh * 2
+                elif kind == "ch":
+                    if int(ch) + 4 > 16:
+                        continue
+                    trial[index][2] = int(ch) + 4
+                else:
+                    if int(bits) >= 8:
+                        continue
+                    trial[index][3] = 8
+                rate = _grids_bpp(trial, width, height)
+                if rate <= cap or (current < floor and rate <= escape):
+                    found.append((rank, abs(rate - float(target_bpp)), rate, trial))
+        if not found:
             break
+        found.sort(key=lambda item: (item[0], item[1], item[2]))
+        grids = found[0][3]
     return [tuple(g) for g in grids]
 
 

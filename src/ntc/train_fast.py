@@ -20,6 +20,7 @@ import hashlib
 import math
 import os
 import tempfile
+import threading
 import time
 from dataclasses import replace
 
@@ -43,6 +44,39 @@ from ntc.encode import (
 from ntc.metrics import group_metrics, psnr_u8
 from ntc.model import NtcNet, _soft_box, integer_box
 from ntc.quant import fp16_round, quantize_weight
+
+
+def _ste_int8(hidden: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """Straight-through int8 of ``hidden``. ``scale`` is one positive value.
+
+    The forward value is ``round(x / scale) * scale`` inside [-127, 127].
+    The backward gradient is the identity. The scale buffer tracks the
+    max-abs of the pre-quant tensor so the export matches the tail.
+    """
+    denom = scale.clamp(min=1e-4)
+    q = torch.round(hidden.detach() / denom).clamp(-127, 127)
+    out = hidden + (q * denom - hidden).detach()
+    if not torch.compiler.is_compiling():
+        with torch.no_grad():
+            observed = hidden.detach().abs().amax().clamp(min=1e-4) / 127.0
+            scale.mul_(0.9).add_(observed, alpha=0.1)
+    return out
+
+
+def configure_matmul(device: torch.device, precision: str) -> str:
+    """TF32 for bf16 and fp16 training. fp32 stays IEEE.
+
+    The reference decoder is fp32 and does not read this switch. Training
+    GEMMs in fp32 (the latent step, the fp32 master) pick up TF32 only
+    when the MLP is already running in a reduced precision.
+    """
+    if device.type != "cuda":
+        return "cpu"
+    reduced = precision in ("bf16", "fp16")
+    torch.backends.cuda.matmul.allow_tf32 = reduced
+    torch.backends.cudnn.allow_tf32 = reduced
+    torch.set_float32_matmul_precision("high" if reduced else "highest")
+    return "tf32" if reduced else "ieee"
 
 
 def scaled_lr(lr: float, batch_pixels: int, ref_pixels: int) -> float:
@@ -592,6 +626,8 @@ class StackedTrain(nn.Module):
             else:
                 ste = weight
             bb = fp16_round(bias)
+            if getattr(self, "int8_act", False):
+                hidden = _ste_int8(hidden, self.int8_scales[li])
             if amp_dtype is None:
                 hidden = torch.bmm(hidden.float(), ste.transpose(1, 2)) + bb[:, None, :]
                 if li != last and self.activation == 1:
@@ -686,6 +722,11 @@ class StackedTrain(nn.Module):
             for i, lin in enumerate(net.linears):
                 lin.weight.copy_(self.weights[i][index])
                 lin.bias.copy_(self.biases[i][index])
+            scales = getattr(self, "int8_scales", None)
+            if scales is not None and bool(getattr(self, "int8_export", False)):
+                net.act_int8 = True
+                vals = scales.detach().float().cpu().clamp(min=1e-4)
+                net.act_log_s = nn.Parameter(torch.log(vals))
 
 
 def _can_stack(cfg: TrainConfig) -> bool:
@@ -997,7 +1038,7 @@ def refill_sample_indices(
             drawn = crop_indices(int(slot["height"]), int(slot["width"]), budget, buf.device)
             buf.copy_(drawn)
         else:
-            buf.copy_(torch.randint(0, count, (budget,), device=buf.device))
+            torch.randint(0, count, (budget,), dtype=buf.dtype, device=buf.device, out=buf)
 
 
 def _loss_from_mips(
@@ -1703,6 +1744,7 @@ def _run_loop(
     The step itself does not call ``.item()``. A progress line every
     ``log_every`` steps does, on purpose.
     """
+    _ema_prepare(stacked, cfg)
     batch = int(cfg.batch_pixels or 0)
     lr_scale = 1.0
     if cfg.lr_batch_ref and batch:
@@ -1732,6 +1774,7 @@ def _run_loop(
             _group_lr(step)
         _sync_step_qat(stacked, cfg, step)
         _sync_quant_schedule(stacked, cfg, step)
+        _sync_int8_tail(stacked, cfg, step)
         if cfg.coarse_to_fine:
             from ntc.train_steps import coarse_lowpass
 
@@ -1757,6 +1800,7 @@ def _run_loop(
                 scaler.step(opt)
                 scaler.update()
                 _clamp_latents(stacked)
+                _ema_update(stacked)
                 return loss
         loss.backward()
         _drop_latent_grads(stacked, opt)
@@ -1767,6 +1811,7 @@ def _run_loop(
         _clip_no_sync(params, 1.0, skip_count)
         opt.step()
         _clamp_latents(stacked)
+        _ema_update(stacked)
         return loss
 
     if amp_dtype == torch.float16 and device_type == "cuda":
@@ -1819,6 +1864,7 @@ def _run_loop(
                     _group_lr(step)
                     _sync_step_qat(stacked, cfg, step)
                     _sync_quant_schedule(stacked, cfg, step)
+                    _sync_int8_tail(stacked, cfg, step)
                     opt.zero_grad(set_to_none=True)
                     if graph_idx is not None:
                         refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
@@ -1835,6 +1881,7 @@ def _run_loop(
                     _clip_no_sync(params, 1.0, skip_count)
                     opt.step()
                     _clamp_latents(stacked)
+                    _ema_update(stacked)
                     return loss
                 break
             except Exception as exc:
@@ -1895,6 +1942,12 @@ def _run_loop(
             torch.cuda.synchronize()
 
     total_steps = int(cfg.steps) if int(cfg.steps) > start_step else start_step + steps
+    ckpt_every = int(getattr(cfg, "ckpt_every", 0) or 0)
+
+    def _maybe_ckpt(step: int) -> None:
+        if ckpt_every > 0 and (step + 1) % ckpt_every == 0:
+            _save_resume_ckpt(stacked, opt, cfg, step)
+
     t0 = time.perf_counter()
     if graph is not None:
         phase = _quant_phase(cfg, start_step)
@@ -1902,10 +1955,17 @@ def _run_loop(
             # The capture baked the phase of ``start_step``. Replaying it
             # through the hard-code window keeps the noise kernels while the
             # log scores a different forward than the file.
-            if _quant_phase(cfg, step) != phase:
+            tail = float(getattr(cfg, "mlp_int8_tail", 0.0) or 0.0)
+            entered_tail = (
+                tail > 0
+                and (float(step + 1) / float(max(int(cfg.steps), 1))) >= tail
+                and not bool(getattr(stacked, "int8_act", False))
+            )
+            if _quant_phase(cfg, step) != phase or entered_tail:
                 graph = None
                 for eager_step in range(step, start_step + steps):
                     loss = one_step(eager_step, replay=False)
+                    _maybe_ckpt(eager_step)
                     _log_progress(
                         cfg, eager_step + 1, total_steps, loss, t0, start_step, stacked, progress_images
                     )
@@ -1916,6 +1976,7 @@ def _run_loop(
             _group_lr(step)
             refill_sample_indices(graph_idx, mips, batch, str(cfg.batch_mip))
             graph.replay()
+            _maybe_ckpt(step)
             _sync_quant_schedule(stacked, cfg, step)
             _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
             if static_loss is not None and step == start_step + steps - 1:
@@ -1924,6 +1985,7 @@ def _run_loop(
     else:
         for step in range(start_step, start_step + steps):
             loss = one_step(step, replay=False)
+            _maybe_ckpt(step)
             _log_progress(cfg, step + 1, total_steps, loss, t0, start_step, stacked, progress_images)
             _rewind_if_below_init(stacked, rewind, step + 1, int(cfg.steps), int(cfg.seed))
     if device_type == "cuda":
@@ -2080,6 +2142,67 @@ def _transfer_moments(src_param: nn.Parameter, src_opt: torch.optim.Optimizer, d
     dst_opt.state[dst_param] = copied
 
 
+_CKPT_LOCK = threading.Lock()
+_CKPT_THREAD: threading.Thread | None = None
+
+
+def flush_resume_ckpt() -> None:
+    """Wait for the side-thread checkpoint write, if one is running."""
+    global _CKPT_THREAD
+    with _CKPT_LOCK:
+        thread = _CKPT_THREAD
+        _CKPT_THREAD = None
+    if thread is not None:
+        thread.join()
+
+
+def _sync_int8_tail(stacked: StackedTrain, cfg: TrainConfig, step: int) -> None:
+    tail = float(getattr(cfg, "mlp_int8_tail", 0.0) or 0.0)
+    if tail <= 0 or int(cfg.steps) <= 0:
+        stacked.int8_act = False
+        return
+    if getattr(stacked, "int8_scales", None) is None:
+        stacked.int8_scales = torch.ones(len(stacked.weights), device=stacked.latents[0].device)
+    stacked.int8_act = (float(step + 1) / float(cfg.steps)) >= tail
+    if stacked.int8_act:
+        stacked.int8_export = True
+
+
+def _ema_prepare(stacked: StackedTrain, cfg: TrainConfig) -> None:
+    decay = float(getattr(cfg, "ema_decay", 0.0) or 0.0)
+    if decay <= 0:
+        return
+    params = list(stacked.parameters())
+    shadow = getattr(stacked, "_ema", None)
+    mismatch = (
+        shadow is None
+        or len(shadow) != len(params)
+        or any(slot.shape != param.shape for slot, param in zip(shadow, params))
+    )
+    if mismatch:
+        stacked._ema = [param.detach().clone() for param in params]
+    stacked._ema_decay = decay
+
+
+def _ema_update(stacked: StackedTrain) -> None:
+    shadow = getattr(stacked, "_ema", None)
+    if not shadow:
+        return
+    decay = float(stacked._ema_decay)
+    with torch.no_grad():
+        for slot, param in zip(shadow, stacked.parameters(), strict=True):
+            slot.mul_(decay).add_(param.detach(), alpha=1.0 - decay)
+
+
+def _ema_copy_to(stacked: StackedTrain) -> None:
+    shadow = getattr(stacked, "_ema", None)
+    if not shadow:
+        return
+    with torch.no_grad():
+        for slot, param in zip(shadow, stacked.parameters(), strict=True):
+            param.copy_(slot)
+
+
 def _save_resume_ckpt(stacked: StackedTrain, opt: torch.optim.Optimizer, cfg: TrainConfig, step: int) -> None:
     if not cfg.ckpt or stacked.n_seeds != 1:
         return
@@ -2095,7 +2218,34 @@ def _save_resume_ckpt(stacked: StackedTrain, opt: torch.optim.Optimizer, cfg: Tr
         pairs.append((stacked.biases[i], lin.bias))
     for src, dst in pairs:
         _transfer_moments(src, opt, dst, single, squeeze=True)
-    torch.save({"model": net.state_dict(), "opt": single.state_dict(), "step": step}, cfg.ckpt)
+    payload = {
+        "model": {key: value.detach().cpu() for key, value in net.state_dict().items()},
+        "opt": _cpu_tree(single.state_dict()),
+        "step": int(step),
+    }
+    path = cfg.ckpt
+
+    def _write() -> None:
+        torch.save(payload, path)
+
+    global _CKPT_THREAD
+    with _CKPT_LOCK:
+        if _CKPT_THREAD is not None:
+            _CKPT_THREAD.join()
+        _CKPT_THREAD = threading.Thread(target=_write, name="ntc-ckpt", daemon=True)
+        _CKPT_THREAD.start()
+
+
+def _cpu_tree(value):
+    if torch.is_tensor(value):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: _cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_cpu_tree(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_cpu_tree(item) for item in value)
+    return value
 
 
 def _load_resume_into_stack(stacked: StackedTrain, opt: torch.optim.Optimizer, ckpt: dict, cfg: TrainConfig, net: NtcNet) -> torch.optim.Optimizer:
@@ -2371,9 +2521,9 @@ def encode_arrays_fast(
         return blob, stats
 
     device = pick_device(cfg.device)
+    matmul_mode = "cpu"
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        matmul_mode = configure_matmul(device, cfg.precision)
     channels, height, width = images.shape
     hidden = list(cfg.hidden)
     pe_mode = _PE[cfg.pe]
@@ -2736,6 +2886,7 @@ def encode_arrays_fast(
         stacked.latent_proxy = "ste"
         stacked.quantize = True
         stacked.quantize_weights = True
+    _ema_copy_to(stacked)
     scores = _psnr_per_seed(stacked, images_bank if images_bank.shape[0] == stacked.n_seeds else target, device)
     winner = int(max(range(stacked.n_seeds), key=lambda i: scores[i]))
     # Export through the ordinary writer so the file matches the slow path.
@@ -2885,6 +3036,8 @@ def encode_arrays_fast(
         "seed": seeds[winner],
         "seed_pool": len(trace[0]["alive"]) if trace else 1,
         "precision": cfg.precision if amp_dtype is not None else "fp32",
+        "matmul": matmul_mode,
+        "ema_decay": float(cfg.ema_decay),
         "amp_dtype": None if amp_dtype is None else str(amp_dtype).replace("torch.", ""),
         "compiled": loop_info["compiled"],
         "compile_mode": loop_info.get("compile_mode"),
@@ -2948,6 +3101,7 @@ def encode_arrays_fast(
     _require_finite_stats(stats)
     if cfg.ckpt and stacked.n_seeds == 1:
         _save_resume_ckpt(stacked, opt, cfg, done_steps - 1)
+        flush_resume_ckpt()
     return blob, stats
 
 
@@ -3142,8 +3296,7 @@ def encode_bank(
         raise ValueError("encode_bank needs explicit grids")
     device = pick_device(cfg.device)
     if device.type == "cuda":
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
+        configure_matmul(device, cfg.precision)
     shape = images[0].shape
     if any(im.shape != shape for im in images):
         raise ValueError("packed materials must share C,H,W")

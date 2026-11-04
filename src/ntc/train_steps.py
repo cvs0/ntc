@@ -12,12 +12,33 @@ import torch.nn.functional as F
 from ntc.model import NtcNet, _soft_box
 
 
-def _transplant_checkpoint(net: NtcNet, state: dict) -> bool:
-    """Copy a trained net into ``net`` when the grids match spatially.
+def _resample_codes(src: torch.Tensor, height: int, width: int, bits: int) -> torch.Tensor:
+    """Bilinear resize of code planes. Values stay inside the dest bins.
 
-    Extra channels on ``net`` stay at the bin midpoint with a zero column in
-    the first layer, so the forward matches the checkpoint at step 0. Later
-    layers are copied when their shapes match.
+    A 4-bit field copied onto an 8-bit grid is scaled by 255/15 when every
+    source code sits in 0..15. Spatial upsample of a same-depth grid does
+    not take that branch.
+    """
+    planes = src.detach().float().unsqueeze(0)
+    if int(src.shape[1]) == int(height) and int(src.shape[2]) == int(width):
+        up = planes[0]
+    elif int(src.shape[1]) < int(height) or int(src.shape[2]) < int(width):
+        up = F.interpolate(planes, size=(int(height), int(width)), mode="bilinear", align_corners=False)[0]
+    else:
+        up = F.interpolate(planes, size=(int(height), int(width)), mode="area")[0]
+    peak = float(up.max()) if up.numel() else 0.0
+    if int(bits) >= 8 and peak <= 15.0 + 1e-3:
+        up = up * (float((1 << int(bits)) - 1) / 15.0)
+    return up.clamp(0, float((1 << int(bits)) - 1))
+
+
+def _transplant_checkpoint(net: NtcNet, state: dict) -> bool:
+    """Copy a trained net into ``net``.
+
+    Matching spatial shapes are copied. A finer or coarser lattice is
+    resampled in code space so a high-rate warm start keeps the neighbor's
+    field. Extra channels stay at the bin midpoint with a zero column in
+    the first layer. Later layers are copied when their shapes match.
     """
     src_ids = []
     for key in state:
@@ -26,11 +47,6 @@ def _transplant_checkpoint(net: NtcNet, state: dict) -> bool:
     src_ids.sort()
     if len(src_ids) != len(net.latents):
         return False
-    for index, src_i in enumerate(src_ids):
-        src = state[f"latents.{src_i}"]
-        lat = net.latents[index]
-        if tuple(src.shape[1:]) != tuple(lat.shape[1:]):
-            return False
     with torch.no_grad():
         src_off = 0
         dst_off = 0
@@ -43,7 +59,8 @@ def _transplant_checkpoint(net: NtcNet, state: dict) -> bool:
             src = state[f"latents.{src_i}"]
             lat = net.latents[index]
             take = min(int(src.shape[0]), int(lat.shape[0]))
-            lat[:take].copy_(src[:take].to(device=lat.device, dtype=lat.dtype))
+            resized = _resample_codes(src[:take], int(lat.shape[1]), int(lat.shape[2]), int(net.grid_bits[index]))
+            lat[:take].copy_(resized.to(device=lat.device, dtype=lat.dtype))
             bits = int(net.grid_bits[index])
             mid = float((1 << bits) - 1) / 2.0
             if take < int(lat.shape[0]):

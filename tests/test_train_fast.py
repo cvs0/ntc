@@ -1215,3 +1215,62 @@ def test_fit_latent_grids_measures_the_grid_it_keeps():
     assert abs(scale - measured) < 1e-6
     predicted = latent_payload_bits(grids) / float(n * n) * scale
     assert predicted <= 4.0 * 1.10 + 1e-6
+
+
+def test_resample_upsamples_codes_and_scales_4bit_onto_8bit():
+    from ntc.train_steps import _resample_codes
+
+    src = torch.arange(16, dtype=torch.float32).reshape(1, 4, 4)
+    up = _resample_codes(src, 8, 8, 4)
+    assert tuple(up.shape) == (1, 8, 8)
+    assert float(up.max()) <= 15.0
+    wide = _resample_codes(src, 4, 4, 8)
+    assert float(wide.max()) > 15.0
+    assert float(wide.max()) <= 255.0
+
+
+def test_ema_update_and_int8_ste_and_inplace_refill():
+    from ntc.train_fast import _ema_update, _ste_int8, refill_sample_indices
+
+    class Box(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.p = torch.nn.Parameter(torch.tensor([0.0]))
+
+    box = Box()
+    box._ema = [torch.tensor([1.0])]
+    box._ema_decay = 0.5
+    with torch.no_grad():
+        box.p.fill_(0.0)
+    _ema_update(box)
+    assert abs(float(box._ema[0]) - 0.5) < 1e-6
+
+    scale = torch.tensor(1.0)
+    value = torch.tensor([10.0], requires_grad=True)
+    out = _ste_int8(value, scale)
+    assert abs(float(out.detach()) - 10.0) < 1e-5
+    out.sum().backward()
+    assert abs(float(value.grad) - 1.0) < 1e-5
+
+    slots = [torch.empty(8, dtype=torch.long)]
+    mips = [{"uv": torch.zeros(16, 2), "height": 4, "width": 4}]
+    refill_sample_indices(slots, mips, 8, "flat")
+    assert int(slots[0].min()) >= 0
+    assert int(slots[0].max()) < 16
+
+
+def test_checkpoint_thread_is_joined(tmp_path: Path):
+    import threading
+
+    import ntc.train_fast as train_fast
+
+    path = tmp_path / "ckpt.bin"
+
+    def write() -> None:
+        path.write_bytes(b"ok")
+
+    train_fast._CKPT_THREAD = threading.Thread(target=write)
+    train_fast._CKPT_THREAD.start()
+    train_fast.flush_resume_ckpt()
+    assert path.read_bytes() == b"ok"
+    assert train_fast._CKPT_THREAD is None

@@ -275,39 +275,50 @@ def apply_rate_neighbor(job: dict, out: Path) -> dict:
     target = float(job["bpp"])
     if 0 < scale < 1:
         target = target / scale
-    # A calibrated grid on this label is replaced. Higher labels keep the
-    # lower neighbor's lattice and only add channels.
+    # From b10 up the lattice grows in resolution before it grows in
+    # channels, and 8-bit is allowed once both of those are exhausted.
     if is_cloud_profile(job.get("profile")):
         target = target * cloud_grid_headroom(float(job["bpp"]))
+    high = float(job["bpp"]) >= 10.0
     grown = grow_grids(
         [tuple(g) for g in lower["grids"]],
         int(job["size"]),
         int(job["size"]),
         target,
+        prefer_resolution=high,
     )
     calibrated = job.get("grids")
     headroom = cloud_grid_headroom(float(job["bpp"])) if is_cloud_profile(job.get("profile")) else 1.0
-    if calibrated and (headroom > 1.0 or not grown_reaches(grown, int(job["size"]), target)):
-        # The lower lattice tops out near 5 bpp at 16 channels. The label's
-        # own finer lattice reaches the rate, so it trains from scratch on
-        # the full step budget instead. From b10 up the grown chain also
-        # landed 8 to 19 percent under the label (Tiles b10 at 256: 32.48 dB
-        # at 8.83 bpp chained, 33.73 dB at 10.00 bpp on its own lattice).
+    size = int(job["size"])
+    chosen = [tuple(g) for g in grown]
+    keep_fitted = False
+    if calibrated:
+        fitted = [tuple(g) for g in calibrated]
+        fitted_ok = grown_reaches(fitted, size, target)
+        grown_ok = grown_reaches(grown, size, target)
+        # The label's own lattice wins when it already holds the rate.
+        # The grown neighbor is the fallback that reaches a rate the
+        # fitted lattice missed, and it is what a job with no lattice uses.
+        if fitted_ok or not grown_ok:
+            chosen = fitted
+            keep_fitted = True
+    if keep_fitted and (headroom > 1.0 or high):
         full = int(job.get("full_steps") or 0)
         if full > int(job["steps"]):
             job["steps"] = full
             job["warmup"] = int(job.get("full_warmup") or job.get("warmup") or 200)
         print(
-            f"own lattice {job['name']} {calibrated}, {lower['name']} grown {grown} "
-            f"is under {target:.2f} raw bpp",
+            f"own lattice {job['name']} {chosen}, {lower['name']} grown {grown} "
+            f"target {target:.2f} raw bpp",
             flush=True,
         )
-        return job
-    job["grids"] = [list(g) for g in grown]
+    job["grids"] = [list(g) for g in chosen]
     prior = out / f"{lower['name']}.pt"
     if prior.is_file() and lower.get("checkpoint") == "trained" and not job.get("warm_start"):
         job["warm_start"] = str(prior)
-    print(f"warm start {job['name']} from {lower['name']}", flush=True)
+        print(f"warm start {job['name']} from {lower['name']}", flush=True)
+    elif not keep_fitted:
+        print(f"warm start {job['name']} from {lower['name']}", flush=True)
     return job
 
 
@@ -800,6 +811,38 @@ def planned_steps(job: dict) -> int:
     return steps
 
 
+def run3_report() -> dict:
+    """GPU-hour budget and the command for the next B300 run.
+
+    The step rate is the 5070 laptop budget in ``CLOUD_STEPS_PER_S``, not a
+    measurement on a B300. Labels at 10 bpp and above train ``full_steps``.
+    Four chain workers is what ``--max-gpu`` starts for ``cloudfast``.
+    """
+    jobs = build_cloud_jobs(Path("data/materials"), "cloudfast")
+    hours = cloud_queue_gpu_hours(jobs)
+    command = (
+        "NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 "
+        "python bench/train_max_v2.py --profile cloudfast "
+        "--materials data/materials --out results/run3 --max-gpu --exit-when-done"
+    )
+    report = {
+        "profile": "cloudfast",
+        "jobs": len(jobs),
+        "gpu_hours": hours,
+        "steps_per_s_budget": CLOUD_STEPS_PER_S,
+        "wall_hours_at_4_workers": hours / float(len(CLOUD_FAST_TRAIN)),
+        "command": command,
+    }
+    print(
+        f"run3 {report['jobs']} jobs, {report['gpu_hours']:.2f} GPU-hours "
+        f"at {CLOUD_STEPS_PER_S:.0f} steps/s, about {report['wall_hours_at_4_workers']:.2f} h wall "
+        f"on {len(CLOUD_FAST_TRAIN)} workers",
+        flush=True,
+    )
+    print(command, flush=True)
+    return report
+
+
 def cloud_queue_gpu_hours(jobs: list[dict] | None = None) -> float:
     """GPU-hours for the cloud queue on the 30 steps/s budget.
 
@@ -920,6 +963,83 @@ def _job_blocked(out: Path, job: dict) -> bool:
     except (OSError, ValueError, json.JSONDecodeError):
         return False
     return _result_terminal(prev, Path(job["material"]))
+
+
+def _lower_rate_waiting(job: dict, jobs: list[dict], out: Path) -> bool:
+    """True when a cheaper label of this material is not finished and not locked.
+
+    The queue then claims that cheaper label first so the higher rate can
+    warm-start from it. A live lock on the cheaper label does not block the
+    higher one, or a worker would exit while the higher label was still pending.
+    """
+    material = str(job.get("material") or "")
+    bpp = float(job.get("bpp") or 0)
+    if bpp <= 0 or not material:
+        return False
+    for other in jobs:
+        if other is job or str(other.get("material") or "") != material:
+            continue
+        other_bpp = float(other.get("bpp") or 0)
+        if other_bpp <= 0 or other_bpp >= bpp - 1e-9:
+            continue
+        if _job_blocked(out, other):
+            continue
+        lock = out / "locks" / f"{other['name']}.lock"
+        if lock.exists() and not _lock_stale(lock, 86400.0):
+            continue
+        return True
+    return False
+
+
+def validate_result(row: dict, ntc_path: Path | None) -> str | None:
+    """A short reason when a finished row cannot be trusted, else None.
+
+    Non-finite scores, a missing or unreadable file, and a decode that is
+    not finite are recorded as errors. The queue treats an error as terminal
+    so the same label is not trained again.
+    """
+    psnr = row.get("psnr_u8")
+    if not isinstance(psnr, (int, float)) or not math.isfinite(float(psnr)):
+        return "non-finite psnr"
+    if not 1.0 <= float(psnr) <= 80.0:
+        return f"psnr {float(psnr):.3f} outside 1..80"
+    bpp = row.get("total_bpp")
+    if not isinstance(bpp, (int, float)) or not math.isfinite(float(bpp)) or float(bpp) <= 0:
+        return "non-finite bpp"
+    target = row.get("target_bpp")
+    if isinstance(target, (int, float)) and float(target) > 0:
+        ratio = float(bpp) / float(target)
+        if ratio < 0.05 or ratio > 3.0:
+            return f"bpp ratio {ratio:.3f} is not a usable file"
+    init = row.get("psnr_u8_init")
+    if (
+        isinstance(init, (int, float))
+        and math.isfinite(float(init))
+        and float(init) > 20.0
+        and float(psnr) + 8.0 < float(init)
+    ):
+        return f"psnr {float(psnr):.2f} collapsed below init {float(init):.2f}"
+    if ntc_path is None:
+        return None
+    path = Path(ntc_path)
+    if not path.is_file() or path.stat().st_size < 96:
+        return "missing ntc"
+    blob = path.read_bytes()
+    if int.from_bytes(blob[:4], "little") != 0x3143544E:
+        return "ntc magic"
+    try:
+        import numpy as np
+
+        from ntc.container import parse_texture_set
+        from ntc.decode_ref import decode_uv
+
+        ts = parse_texture_set(blob)
+        sample = decode_uv(ts, np.array([[0.5, 0.5]], np.float32), 0)
+    except Exception as exc:
+        return f"decode failed: {exc}"
+    if not np.isfinite(sample).all():
+        return "non-finite decode"
+    return None
 
 
 def _pid_alive(pid: int) -> bool:
@@ -1190,6 +1310,9 @@ def _run_claimed(
         latent_rate_scale=float(job.get("latent_rate_scale", 1.0)),
         entropy_rate=bool(job.get("entropy_rate", False)),
         quant_schedule=bool(job.get("quant_schedule", False)),
+        ema_decay=float(job.get("ema_decay", 0.0) or 0.0),
+        mlp_int8_tail=float(job.get("mlp_int8_tail", 0.0) or 0.0),
+        ckpt_every=int(job.get("ckpt_every", 0) or 0),
         resume=str(ckpt) if ckpt.is_file() else "",
         ckpt=str(ckpt),
         log_every=100,
@@ -1266,6 +1389,15 @@ def _run_claimed(
     if reason:
         raise RuntimeError(reason)
     ntc_path.write_bytes(blob)
+    bad = validate_result(row, ntc_path)
+    if bad:
+        row["done"] = False
+        row["corrupt"] = True
+        row["error"] = bad
+        dest.write_text(json.dumps(row, indent=2))
+        print("corrupt", job["name"], bad, flush=True)
+        _print_finish(job, row, wall, shard_label)
+        return row
     trained = row.get("psnr_u8_trained")
     init = row.get("psnr_u8_init")
     loop = row.get("psnr_u8_loop")
@@ -1329,6 +1461,7 @@ def _run_claimed(
                 int(job["size"]),
                 int(job["size"]),
                 target,
+                prefer_resolution=float(job["bpp"]) >= 10.0,
             )
             trained_grids = [tuple(g) for g in (row.get("grids") or [])]
             if (
@@ -1504,6 +1637,9 @@ def _cloud_ladder(root: Path, train: tuple, labels: tuple, profile: str) -> list
                 "entropy_rate": True,
                 "quant_schedule": True,
                 "quant_freeze_at": 0.90,
+                "ema_decay": 0.999,
+                "mlp_int8_tail": 0.90,
+                "ckpt_every": 500,
                 "profile": profile,
             })
     return jobs
@@ -1968,6 +2104,8 @@ def claim_next(jobs: list[dict], out: Path, stale_s: float, pack: bool, skip: se
         try:
             for job in unit:
                 if job["name"] in blocked or _job_blocked(out, job):
+                    continue
+                if _lower_rate_waiting(job, jobs, out):
                     continue
                 if not claim_job(out, job["name"], stale_s):
                     continue
