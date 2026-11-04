@@ -235,8 +235,19 @@ def test_workers_spawn_a_queue(monkeypatch, tmp_path: Path):
     calls = []
 
     class _Proc:
-        def wait(self):
+        returncode = 0
+
+        def poll(self):
             return 0
+
+        def wait(self, timeout=None):
+            return 0
+
+        def terminate(self):
+            return None
+
+        def kill(self):
+            return None
 
     def fake_popen(cmd, **kwargs):
         calls.append(list(cmd))
@@ -711,11 +722,33 @@ def test_corrupt_psnr_is_rejected_without_a_file(tmp_path: Path):
     assert validate_result({"psnr_u8": 30.0, "total_bpp": 1.2, "target_bpp": 1.0}, None) is None
 
 
+def test_export_gap_stop_file_claims_nothing(tmp_path: Path):
+    from bench.train_max_v2 import EXPORT_GAP_STOP
+
+    job = {
+        "name": "mat_b1",
+        "material": "mat",
+        "size": 32,
+        "steps": 10,
+        "bpp": 1.0,
+        "seed_pool": 1,
+        "batch_pixels": 0,
+        "grids": None,
+    }
+    (tmp_path / EXPORT_GAP_STOP).write_text("gap\n")
+    assert claim_next([job], tmp_path, 3600, pack=False) == []
+
+
 def test_run3_budget_is_finite():
-    from bench.train_max_v2 import run3_report
+    from bench.train_max_v2 import B300_STEPS_PER_S, run3_report
 
     report = run3_report()
     assert report["jobs"] == 20
-    assert report["gpu_hours"] > 1.0
+    assert report["steps_per_s_budget"] == B300_STEPS_PER_S == 4.5
+    assert report["gpu_hours"] == pytest.approx(report["wall_hours_one_gpu"])
+    assert 6 < report["gpu_hours"] < 12
+    assert "results/run4" in report["command"]
     assert "cloudfast" in report["command"]
     assert "--max-gpu" in report["command"]
+    assert report["prune_keep"] == 1.0
+    assert report["vq_latents"] is False

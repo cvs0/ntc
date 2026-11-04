@@ -769,7 +769,7 @@ What landed in this tree, and what was measured here:
 
 ## Run 3
 
-`bench/launch_run3.sh` prints the budget and starts the short cloud ladder (MetalPlates013, PavingStones070, Tiles135D, Bark001, labels 1, 2.5, 5, 10, 20). `--max-gpu` starts one chain worker per material when the GPU reports at least 80 GB. High labels train 8000 steps. The hour figure uses 20 steps/s, which is the 5070 laptop budget at a 1M batch, applied here to the 2M cloud batch. It is not a B300 measurement.
+`bench/launch_run3.sh` prints the budget and starts the short cloud ladder (MetalPlates013, PavingStones070, Tiles135D, Bark001, labels 1, 2.5, 5, 10, 20) into `results/run4`. `--max-gpu` starts one chain worker per material when the GPU reports at least 80 GB. High labels train 8000 steps. The hour figure uses 4.5 steps/s, the B300 rate measured on run 3 (the card sat between 4 and 5). Workers share that one card, so the wall clock is the whole queue, 9.88 h before early stop. The old 20 steps/s estimate was the 5070 laptop budget.
 
 ```bash
 sh bench/launch_run3.sh
@@ -780,12 +780,12 @@ The same command without the script:
 ```bash
 NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 \
   python bench/train_max_v2.py --profile cloudfast \
-  --materials data/materials --out results/run3 --max-gpu --exit-when-done
+  --materials data/materials --out results/run4 --max-gpu --exit-when-done
 ```
 
 Training changes in that run: resolution growth on the b10 and b20 warm start, EMA 0.999 exported at the end, an int8 straight-through tail for the last 10 percent of steps (the file stores the scales), TF32 when the probe picks bf16 or fp16, checkpoints written off the step thread every 500 steps, and a result check that marks a non-finite score or a bad file as an error so it is not trained again. The queue claims a cheaper label of the same material before the expensive one when that cheaper label is not already locked. `INCOMPLETE` is still replaced by `ALL_DONE` only when every planned json is terminal.
 
-On this CPU, drawing the 2,097,152 sample indices for one cloud batch took 10.2 ms with an allocate-and-copy and 6.4 ms in place (1.59x). That is the index refill, not a full 2K step. `python bench/profile_train_step.py --device cpu --steps 4` times a 32x32 step (sample, forward, backward, Adam). Two runs were 3.27 ms and 3.46 ms eager, then 3.75 ms and 3.22 ms with the run 3 switches. That ratio is inside the noise of a 3 ms step. On the second run the profiler's own time was about 0.02 ms sampling, 0.21 ms forward, 0.35 ms backward, and 0.18 ms Adam. Compile, the CUDA graph, and the Triton gather stay off on CPU, so the 2.22 GPU-hour budget is unchanged. The same script accepts `--device mps` and `--device cuda`. Run 3 also turns on a Lambert shade term, a quarter-resolution residual target, a 16-entry latent codebook snap, an 8x8 linear-head score, a shared MLP flag for packed materials, magnitude pruning that keeps half the weights, and a hidden prefix of 16. Those do not change the 2.22 GPU-hour figure. FLIP in the metrics module is the installed package when it imports, otherwise `flip_approx` is a luma and chroma error, not that package. Per-material 2K FLIP against BC7 has not been measured.
+On this CPU, drawing the 2,097,152 sample indices for one cloud batch took 10.2 ms with an allocate-and-copy and 6.4 ms in place (1.59x). That is the index refill, not a full 2K step. `python bench/profile_train_step.py --device cpu --steps 4` times a 32x32 step (sample, forward, backward, Adam). Two runs were 3.27 ms and 3.46 ms eager, then 3.75 ms and 3.22 ms with the run 3 switches. That ratio is inside the noise of a 3 ms step. On the second run the profiler's own time was about 0.02 ms sampling, 0.21 ms forward, 0.35 ms backward, and 0.18 ms Adam. Compile, the CUDA graph, and the Triton gather stay off on CPU. The same script accepts `--device mps` and `--device cuda`. The cloud profile still trains with a Lambert shade term, a quarter-resolution residual, an 8x8 linear-head score, a shared MLP flag, and a hidden prefix of 16. The prefix is written into the file as zeros. A 50 percent prune and a 16-code latent snap are off, and the export refuses either one when it would drop the saved PSNR by more than 0.5 dB. `python bench/repro_export_gap.py` prints that gap for each flag on a 16x16 CPU stand-in. FLIP in the metrics module is the installed package when it imports, otherwise `flip_approx` is a luma and chroma error, not that package. Per-material 2K FLIP against BC7 has not been measured.
 
 ## Rate curves
 
