@@ -34,7 +34,7 @@ jobs:
             -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
           cmake --build build 2>&1 | tee build.log
           if grep -E "WARNING:" build.log; then exit 1; fi
-          find build/shaders -name '*.spv' -print0 | xargs -0 -r spirv-val
+          find build/shaders -name '*.spv' -print0 | xargs -0 -r -n 1 spirv-val
           if grep -q NTC_HAVE_DOT4 build/shaders/ntc_dot_config.glsl; then
             spirv-dis build/shaders/ntc_sample_i8.comp.spv | grep -q OpSDot
           else

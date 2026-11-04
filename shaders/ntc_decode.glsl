@@ -136,7 +136,11 @@ float ntc_code(uint base, uint stride, int bits, int W, int H, int ch, int x, in
     return float((b >> (uint(x & 3) * 2u)) & 3u);
 }
 
+#ifdef NTC_GL
+float ntc_acc(float acc, float w, float x) {
+#else
 precise float ntc_acc(float acc, float w, float x) {
+#endif
 #ifdef NTC_FP16
     float16_t a = float16_t(acc) + float16_t(w) * float16_t(x);
     return float(a);
