@@ -33,6 +33,9 @@ constexpr uint32_t kFlagLatentRange = 1u << 3;
 // Not written by latent_coder "best". Offset 84 is the plain length.
 constexpr uint32_t kFlagLatentCtx = 1u << 5;
 constexpr uint32_t kFlagLatentCompressed = kFlagLatentDeflate | kFlagLatentRange | kFlagLatentCtx;
+// Reserved. Plain latent codes stay in the file. A reader that ignores
+// this bit still decodes the reference.
+constexpr uint32_t kFlagBcLatents = 1u << 7;
 
 constexpr int kActIdentity = 0;
 constexpr int kActRelu = 1;

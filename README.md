@@ -728,6 +728,53 @@ powershell -ExecutionPolicy Bypass -File bench\run_all.ps1
 
 The new rows are in `results\hw\<gpu-slug>\*_vulkan.txt`.
 
+## NTC versus BC7
+
+Numbers below are the B300 models already on disk and the BC7 baseline measured with `bc7enc_rdo` on the same 2K ambientCG materials (all channels, mip 0). They are not from a retrain of this branch. BC7 x3 is albedo, normal xyz, and the scalar textures, 24 bits per texel. The lean bundle is BC1 + BC5 + BC1, 16 to 20 bits. NTC file rates are the stored bpp of those runs. Several b10 and b20 points sat near 4 to 5 bpp because the warm start kept a 512 lattice and only added channels. MetalPlates b10 with a 2048 lattice was the exception.
+
+| Material | NTC near 1 bpp | NTC near 5 bpp | NTC best in that run | BC7 x3 at 24 bpp | Lean BC |
+| --- | --- | --- | --- | --- | --- |
+| MetalPlates013 | 32.92 at 0.98 | 37.48 at 4.99 | 39.42 at 9.21 | 43.99 | 39.82 at 20 |
+| Bark001 | 22.22 at 0.99 | 27.90 at 4.91 | 27.90 at 4.91 | 33.06 | 33.07 at 16 |
+| PavingStones070 | 24.45 at 1.0 | 27.00 at 4.36 | 27.00 at 4.36 | 35.30 | 31.54 at 16 |
+| Tiles135D | 29.56 at 1.0 | 34.62 at 4.6 | 34.62 at 4.6 | 41.73 | 32.17 at 16 |
+
+At about 1 bpp, NTC is 1.7 to 2.9 dB above quarter-resolution BC7 x3 (1.5 bpp: Metal 30.51, Bark 20.63, Paving 23.36, Tiles 28.38). At about 5 bpp it is 2.0 to 5.7 dB above half-resolution lean BC. It does not match native BC7 x3. No full-rate retrain has been run on this branch, so those gaps are the previous models, not a claim for the lattice change below.
+
+What landed in this tree, and what was measured here:
+
+| Piece | What the CPU check shows | What is not measured |
+| --- | --- | --- |
+| High-rate lattice | From b10, `grow_grids(..., prefer_resolution=True)` doubles spatial size before adding channels, then allows 8-bit. A 32 lattice at raw 20 bpp on a 64 image becomes 64x4 + 32x4. The fitted lattice is kept when it already holds the rate, and the lower checkpoint is resampled into it. | No new 2K PSNR. The accept target is each material at or above the lean bundle at half the bits. |
+| Cooperative matrix int8 | `i8_gemm` matches a plain int32 product. `ntc_decbench` skips `coopmat_i8` when `VK_KHR_cooperative_matrix` is absent, including MoltenVK, and does not fail ctest. | No 4K timing. The harness does not bind that shader's scratch buffer, so it does not dispatch even when the extension exists. |
+| BC latent planes | `FLAG_BC_LATENTS` (bit 7) round-trips. Plain codes stay in the file. Mode 6 on an 8x8 ramp restores codes within 2 bins, about 28 dB, not a 0.5 dB loss. | No texture-unit fetch in the fast shader, and no BC-in-the-loop training. |
+| Deferred tiles | `classify_tiles` marks an 8x4 tile pure or mixed. | No 4K frame time. |
+| BC7 mode hints | 4 bits per 4x4 block is 0.25 bpp. The hinted encoder is the existing mode 6 packer. | No GPU transcode timing and no 0.3 dB file comparison on a trained material. |
+| Hybrid tail | Mips 2 and coarser as three BC7 textures are 2.00 bpp extra. `lod_histogram` counts integer LODs. | No `ntc_view` frame time and no image seam check. The mode 6 error above is the tail error on a ramp. |
+| Hoisted layer 0 | `decode_mip_hoisted` matches `decode_mip` within 1e-4 on an 8x8 network with no positional encoding. | No load-time GPU timing. |
+| Weight immediates | `emit_immediate_mlp` drops exact-zero weights. The dropped product matches `mlp`. | No pipeline compile timing on LLPC, Mesa, or MoltenVK. |
+| Hidden width | `hidden_knee` keeps the smallest width within 0.15 dB of the best row. | No b10 sweep on the four materials. Command: `python bench/train_max_v2.py` is the wrong tool for a one-off width sweep; use `TrainConfig.hidden` of `()`, `(8,)`, `(16,)`, `(32,)` at a fixed grid and the b10 label. A 2K sweep of 4 widths, 4 materials, 4000 steps at the 20 steps/s budget is about 0.9 GPU-hours. |
+
+## Run 3
+
+`bench/launch_run3.sh` prints the budget and starts the short cloud ladder (MetalPlates013, PavingStones070, Tiles135D, Bark001, labels 1, 2.5, 5, 10, 20). `--max-gpu` starts one chain worker per material when the GPU reports at least 80 GB. High labels train 8000 steps. The hour figure uses 20 steps/s, which is the 5070 laptop budget at a 1M batch, applied here to the 2M cloud batch. It is not a B300 measurement.
+
+```bash
+sh bench/launch_run3.sh
+```
+
+The same command without the script:
+
+```bash
+NTC_PROFILE=cloudfast NTC_MAX_GPU=1 NTC_EXIT_WHEN_DONE=1 \
+  python bench/train_max_v2.py --profile cloudfast \
+  --materials data/materials --out results/run3 --max-gpu --exit-when-done
+```
+
+Training changes in that run: resolution growth on the b10 and b20 warm start, EMA 0.999 exported at the end, an int8 straight-through tail for the last 10 percent of steps (the file stores the scales), TF32 when the probe picks bf16 or fp16, checkpoints written off the step thread every 500 steps, and a result check that marks a non-finite score or a bad file as an error so it is not trained again. The queue claims a cheaper label of the same material before the expensive one when that cheaper label is not already locked. `INCOMPLETE` is still replaced by `ALL_DONE` only when every planned json is terminal.
+
+On this CPU, drawing the 2,097,152 sample indices for one cloud batch took 10.2 ms with an allocate-and-copy and 6.4 ms in place (1.59x). That is the index refill, not a full 2K step. A 16x16 smoke of 4 steps with the EMA and the int8 tail ran at 228 steps/s and wrote `FLAG_ACT_INT8` scales. It is not a B300 step time.
+
 ## Rate curves
 
 `bench/rd_curve.py` writes `results/rd_curve.json` and `results/rd_curve.svg`. The rate list is 2, 4, 6, 8, 10, 12, 16, 20. The SVG has three panels: `latent_bpp_mip0` (domain at least 2 to 20), `file_bpp_chain` (domain at least 2 to 20), and `bppc`. Ours is blue. BC1, BC5, and BC7 from `bench/bc_pack.py` (mode 6, DXT1, BC4) are gray. ASTC 4x4, 5x5, 6x6, and 8x8 are green when `astcenc` is on PATH; otherwise those rows keep the nominal bpp (8, 5.12, 3.555..., 2 bits per texel per texture) and a null PSNR. Black squares are Table 3, labeled as a different material set. Orange points are filled from `results/rtxntc_compare/*/report.json` after `bench/rtxntc_compare` runs on the NVIDIA laptop. Until that file exists the measured RTXNTC list is empty.

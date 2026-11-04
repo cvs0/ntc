@@ -70,6 +70,7 @@ struct Ctx {
     bool dot_accel = false;
     bool exec_props = false;
     bool bc = false;
+    bool coopmat = false;
     // VK_KHR_portability_subset on this device (MoltenVK). The instance
     // enumeration bit is separate: lavapipe advertises it too.
     bool portability_device = false;
@@ -558,8 +559,10 @@ Ctx make_ctx(int want_dev) {
     std::vector<VkExtensionProperties> exts(en);
     vkEnumerateDeviceExtensionProperties(c.phys, nullptr, &en, exts.data());
     bool has_exec = false;
-    for (auto& e : exts)
+    for (auto& e : exts) {
         if (std::strcmp(e.extensionName, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME) == 0) has_exec = true;
+        if (std::strcmp(e.extensionName, "VK_KHR_cooperative_matrix") == 0) c.coopmat = true;
+    }
 
     VkPhysicalDevicePipelineExecutablePropertiesFeaturesKHR exq{
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_EXECUTABLE_PROPERTIES_FEATURES_KHR};
@@ -623,9 +626,9 @@ Ctx make_ctx(int want_dev) {
     }
     std::printf(
         "using %s driver %u fp16 %d int_dot %d int_dot_accel %d exec_stats %d bc %d "
-        "portability_device %d timestamps %d workgroup %u shared %u subgroup %u max_ubo %u\n",
+        "coopmat %d portability_device %d timestamps %d workgroup %u shared %u subgroup %u max_ubo %u\n",
         c.props.deviceName, c.props.driverVersion, c.fp16, c.dot, c.dot_accel, c.exec_props, c.bc,
-        c.portability_device,
+        c.coopmat ? 1 : 0, c.portability_device,
         c.gpu_time, c.max_invocations, c.max_shared, caps.subgroup_size, c.props.limits.maxUniformBufferRange);
     return c;
 }
@@ -709,7 +712,7 @@ int main(int argc, char** argv) {
         else if (a == "--shader-dir") shader_dir = next();
         else if (a == "-h" || a == "--help") {
             std::printf("usage: ntc_decbench [--device N] [--sizes WxH,...] [--iters N] [--warmup N] [--uv-scale S|auto]\n"
-                        "                    [--variants legacy,exact,fma,fp16,i8,i16,bc7,bc_mat] [--check-only] [--stats-only]\n"
+                        "                    [--variants legacy,exact,fma,fp16,i8,i16,bc7,bc_mat,coopmat_i8] [--check-only] [--stats-only]\n"
                         "                    [--check-mips N]\n"
                         "                    [--json PATH]\n"
                         "                    [--shader-dir DIR] FILE.ntc ...\n");
@@ -742,6 +745,7 @@ int main(int argc, char** argv) {
         {"i16", "ntc_fast_i16.comp.spv", true, false, false},
         {"bc7", "", false, false, false},
         {"bc_mat", "", false, false, false},
+        {"coopmat_i8", "ntc_coopmat_i8.comp.spv", false, false, false},
     };
     std::vector<Variant> vars;
     for (const auto& v : all) {
@@ -756,6 +760,18 @@ int main(int argc, char** argv) {
         }
         if ((v.name == "bc7" || v.name == "bc_mat") && !c.bc) {
             std::printf("skip %s: textureCompressionBC unsupported\n", v.name.c_str());
+            continue;
+        }
+        if (v.name == "coopmat_i8" && !c.coopmat) {
+            // MoltenVK and lavapipe do not advertise the extension. Skipping
+            // is a pass: ctest must not fail on those devices.
+            std::printf("skip coopmat_i8: VK_KHR_cooperative_matrix unsupported\n");
+            continue;
+        }
+        if (v.name == "coopmat_i8") {
+            // The integer reference is tests/test_coopmat_i8.py. This harness
+            // does not bind the shader's scratch buffer, so it does not dispatch.
+            std::printf("skip coopmat_i8: extension present, scratch dispatch is not in this harness\n");
             continue;
         }
         vars.push_back(v);

@@ -47,6 +47,10 @@ FLAG_ACT_INT8 = 1 << 4
 # Integer MLP reference (int8 activations, int32 dots, multiplier-shift).
 # The fp32 decoder ignores this bit. Old files leave it clear.
 FLAG_INT_DECODE = 1 << 6
+# Reserved. A set bit means a BC copy of the latent planes exists for the
+# texture unit. The plain codes stay in the latent region so a reader that
+# ignores this bit still decodes the reference. Not set by train_max.
+FLAG_BC_LATENTS = 1 << 7
 
 ACT_IDENTITY = 0
 ACT_RELU = 1
