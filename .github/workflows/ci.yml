@@ -68,8 +68,22 @@ jobs:
         run: |
           export HOMEBREW_NO_AUTO_UPDATE=1
           brew install cmake ninja glslang molten-vk vulkan-loader vulkan-headers vulkan-tools
-          ICD="$(find "$(brew --prefix molten-vk)" "$(brew --prefix vulkan-loader)" -name 'MoltenVK_icd.json' | head -1)"
+          # MoltenVK 1.4 installs the ICD under Homebrew's etc, which is not
+          # inside the opt prefix that find used to search.
+          PREFIX="$(brew --prefix)"
+          ICD=""
+          for cand in \
+            "$PREFIX/etc/vulkan/icd.d/MoltenVK_icd.json" \
+            "$(brew --prefix molten-vk)/etc/vulkan/icd.d/MoltenVK_icd.json" \
+            "$(brew --prefix molten-vk)/share/vulkan/icd.d/MoltenVK_icd.json"
+          do
+            if [ -f "$cand" ]; then ICD="$cand"; break; fi
+          done
+          if [ -z "$ICD" ]; then
+            ICD="$(find "$(brew --prefix molten-vk)" "$PREFIX/etc/vulkan" "$(brew --prefix vulkan-loader)" -name 'MoltenVK_icd.json' 2>/dev/null | head -1)"
+          fi
           test -n "$ICD"
+          test -f "$ICD"
           echo "VK_ICD_FILENAMES=$ICD" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$ICD" >> "$GITHUB_ENV"
       - uses: actions/setup-python@v5

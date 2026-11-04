@@ -12,7 +12,7 @@ cmake --build build --target ntc_decbench
   --shader-dir build/shaders path/to/file.ntc --json results/decbench/out.json
 ```
 
-macOS, after `brew install cmake ninja glslang molten-vk vulkan-loader vulkan-headers`:
+macOS, after `brew install cmake ninja glslang molten-vk vulkan-loader vulkan-headers`. MoltenVK 1.4 puts the ICD at `$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json`. If `vulkaninfo` finds no driver, set `VK_ICD_FILENAMES` to that file.
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="$(brew --prefix)"
